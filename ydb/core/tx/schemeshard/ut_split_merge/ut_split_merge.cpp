@@ -2,6 +2,7 @@
 #include <ydb/core/protos/table_stats.pb.h>
 #include <ydb/core/tablet_flat/util_fmt_cell.h>
 #include <ydb/core/testlib/actors/block_events.h>
+#include <ydb/core/tx/schemeshard/schemeshard_private.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers.h>
 
 using namespace NKikimr;
@@ -1045,5 +1046,48 @@ Y_UNIT_TEST_SUITE(TSchemeShardSplitByLoad) {
         auto tableInfo = DescribePrivatePath(runtime, "/MyRoot/Table/by-value/indexImplTable", true, true);
         Cerr << "TEST table final state:" << Endl << tableInfo.DebugString() << Endl;
         TestDescribeResult(tableInfo, {NLs::PartitionCount(1)});
+    }
+}
+
+Y_UNIT_TEST_SUITE(TSchemeShardUserSplits) {
+    Y_UNIT_TEST(EnforcedSplitPoints) {
+        TTestBasicRuntime runtime;
+        TTestEnvOptions opts;
+        opts.EnableBackgroundCompaction(false);
+        TTestEnv env(runtime, opts);
+
+        ui64 txId = 100;
+
+        NDataShard::gDbStatsReportInterval = TDuration::Seconds(1);
+
+        TestCreateTable(runtime, ++txId, "/MyRoot", R"(
+            Name: "Foo"
+            Columns { Name: "Key"   Type: "Uint32" }
+            Columns { Name: "Value" Type: "Uint32" }
+            KeyColumnNames: ["Key"]
+            SplitBoundary { KeyPrefix: { Tuple: { Optional: { Uint32: 123 } } } }
+            SplitBoundary { KeyPrefix: { Tuple: { Optional: { Uint32: 456 } } } }
+            SplitBoundary { KeyPrefix: { Tuple: { Optional: { Uint32: 789 } } } }
+            PartitionConfig {
+                PartitioningPolicy {
+                    MinPartitionsCount: 1
+                    SizeToSplit: 100500
+                }
+            }
+        )");
+        env.TestWaitNotification(runtime, txId);
+
+        {
+            bool statsPersisted = false;
+            auto observer = runtime.AddObserver<TEvPrivate::TEvPersistTableStats>([&](auto&){
+                statsPersisted = true;
+            });
+            runtime.WaitFor("TEvPersistTableStats", [&]{ return statsPersisted; });
+        }
+
+        runtime.SimulateSleep(TDuration::Seconds(1));
+        TestDescribeResult(
+            DescribePath(runtime, "/MyRoot/Foo", true),
+            {NLs::PartitionCount(4)});
     }
 }
