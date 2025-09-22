@@ -445,6 +445,7 @@ struct TTableInfo : public TSimpleRefCount<TTableInfo> {
     ui64 PartitioningVersion = 0;
     TMap<ui32, TColumn> Columns;
     TVector<ui32> KeyColumnIds;
+    TVector<NScheme::TTypeInfo> KeyColumnTypes;
     bool IsBackup = false;
     bool IsRestore = false;
     bool IsTemporary = false;
@@ -537,6 +538,7 @@ private:
         }
     };
 
+    TVector<TSerializedCellVec> EnforcedSplitBoundaries;
     TPartitionsVec Partitions;
     THashMap<TShardIdx, ui64> Shard2PartitionIdx; // shardIdx -> index in Partitions
     TPriorityQueue<TPartitionsVec::iterator, TVector<TPartitionsVec::iterator>, TSortByNextCondErase> CondEraseSchedule;
@@ -566,16 +568,7 @@ private:
 public:
     TTableInfo() = default;
 
-    explicit TTableInfo(TAlterTableInfo&& alterData)
-        : NextColumnId(alterData.NextColumnId)
-        , AlterVersion(alterData.AlterVersion)
-        , Columns(std::move(alterData.Columns))
-        , KeyColumnIds(std::move(alterData.KeyColumnIds))
-        , IsBackup(alterData.IsBackup)
-        , IsRestore(alterData.IsRestore)
-    {
-        TableDescription.Swap(alterData.TableDescriptionFull.Get());
-    }
+    explicit TTableInfo(TAlterTableInfo&& alterData);
 
     static TTableInfo::TPtr DeepCopy(const TTableInfo& other) {
         TTableInfo::TPtr copy(new TTableInfo(other));
@@ -690,7 +683,8 @@ public:
 
     bool TryAddShardToMerge(const TSplitSettings& splitSettings,
                             const TForceShardSplitSettings& forceShardSplitSettings,
-                            TShardIdx shardIdx, TVector<TShardIdx>& shardsToMerge,
+                            const TTableShardInfo& shard,
+                            TVector<TShardIdx>& shardsToMerge, const TString* mergedBoundary,
                             THashSet<TTabletId>& partOwners, ui64& totalSize, float& totalLoad,
                             float cpuUsageThreshold, const TTableInfo* mainTableForIndex, TString& reason) const;
 

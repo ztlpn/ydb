@@ -10,6 +10,7 @@
 #include <ydb/core/engine/minikql/flat_local_tx_factory.h>
 #include <ydb/core/engine/mkql_proto.h>
 #include <ydb/core/protos/config.pb.h>
+#include <ydb/core/scheme/scheme_borders.h>
 #include <ydb/core/scheme/scheme_types_proto.h>
 #include <ydb/core/tablet/tablet_counters_aggregator.h>
 #include <ydb/core/tablet/tablet_counters_protobuf.h>
@@ -282,6 +283,34 @@ void TSubDomainInfo::AggrDiskSpaceUsage(const TTopicStats& newAggr, const TTopic
     topics.UsedReserveSize += (newAggr.UsedReserveSize - oldAggr.UsedReserveSize);
 }
 
+TTableInfo::TTableInfo(TAlterTableInfo&& alterData)
+    : NextColumnId(alterData.NextColumnId)
+    , AlterVersion(alterData.AlterVersion)
+    , Columns(std::move(alterData.Columns))
+    , KeyColumnIds(std::move(alterData.KeyColumnIds))
+    , IsBackup(alterData.IsBackup)
+    , IsRestore(alterData.IsRestore)
+{
+    KeyColumnTypes.reserve(KeyColumnIds.size());
+    for (const auto& id : KeyColumnIds) {
+        const TColumn* col = Columns.FindPtr(id);
+        Y_ENSURE(col);
+        KeyColumnTypes.push_back(col->PType);
+    }
+
+    TableDescription.Swap(alterData.TableDescriptionFull.Get());
+    for (const auto& b: TableDescription.GetSplitBoundary()) {
+        // TODO: handle GetSerializedKeyPrefix case
+        // TODO: error handling
+        TVector<TCell> cells;
+        TString errStr;
+        TVector<TString> memoryOwner;
+        NMiniKQL::CellsFromTuple(
+            nullptr, b.GetKeyPrefix(), KeyColumnTypes, {}, false, cells, errStr, memoryOwner);
+        EnforcedSplitBoundaries.emplace_back(cells);
+    }
+}
+
 TTableInfo::TAlterDataPtr TTableInfo::CreateAlterData(
     TPtr source,
     NKikimrSchemeOp::TTableDescription& op,
@@ -296,6 +325,7 @@ TTableInfo::TAlterDataPtr TTableInfo::CreateAlterData(
     alterData->TableDescriptionFull = NKikimrSchemeOp::TTableDescription();
 
     alterData->PartitionConfigFull().CopyFrom(op.GetPartitionConfig());
+    alterData->TableDescriptionFull->MutableSplitBoundary()->CopyFrom(op.GetSplitBoundary());
 
     TColumnFamiliesMerger columnFamilyMerger(alterData->PartitionConfigFull());
 
@@ -1922,7 +1952,8 @@ void TTableInfo::FinishSplitMergeOp(TOperationId opId) {
 
 bool TTableInfo::TryAddShardToMerge(const TSplitSettings& splitSettings,
                                     const TForceShardSplitSettings& forceShardSplitSettings,
-                                    TShardIdx shardIdx, TVector<TShardIdx>& shardsToMerge,
+                                    const TTableShardInfo& shard, TVector<TShardIdx>& shardsToMerge,
+                                    const TString* mergedBoundary,
                                     THashSet<TTabletId>& partOwners, ui64& totalSize, float& totalLoad,
                                     float cpuUsageThreshold, const TTableInfo* mainTableForIndex,
                                     TString& reason) const
@@ -1931,6 +1962,7 @@ bool TTableInfo::TryAddShardToMerge(const TSplitSettings& splitSettings,
         return false;
     }
 
+    auto shardIdx = shard.ShardIdx;
     if (IsShardInSplitMergeOp(shardIdx)) {
         return false;
     }
@@ -1952,6 +1984,35 @@ bool TTableInfo::TryAddShardToMerge(const TSplitSettings& splitSettings,
     // We don't want to merge shards that have borrowed non-compacted data
     if (stats->HasBorrowedData)
         return false;
+
+    if (mergedBoundary) {
+        // try finding it in prefixes
+        TSerializedCellVec merged(*mergedBoundary);
+        auto comparator = [this](const TSerializedCellVec& prefix, const TConstArrayRef<TCell>& val) {
+            return ComparePrefixBorders(
+                KeyColumnTypes,
+                prefix.GetCells(), PrefixModeLeftBorderInclusive,
+                val, PrefixModeLeftBorderInclusive) < 0;
+        };
+        for (const auto& sb : EnforcedSplitBoundaries) {
+            auto t1 = TDbTupleRef(KeyColumnTypes.data(), sb.GetCells().data(), sb.GetCells().size());
+            auto t2 = TDbTupleRef(KeyColumnTypes.data(), merged.GetCells().data(), merged.GetCells().size());
+            const auto& tr = *AppData()->TypeRegistry;
+
+            ALOG_DEBUG(NKikimrServices::FLAT_TX_SCHEMESHARD,
+                "CHECK " << DbgPrintTuple(t1, tr) << " "
+                << DbgPrintTuple(t2, tr) << ": "
+                << comparator(sb, merged.GetCells()));
+        }
+        ALOG_DEBUG(NKikimrServices::FLAT_TX_SCHEMESHARD, "----");
+        auto it = std::lower_bound(
+            EnforcedSplitBoundaries.begin(), EnforcedSplitBoundaries.end(), merged.GetCells(),
+            comparator);
+        if (it != EnforcedSplitBoundaries.end() && comparator(*it, merged.GetCells()) == 0) {
+            ALOG_DEBUG(NKikimrServices::FLAT_TX_SCHEMESHARD, "CAN'T MERGE through");
+            return false;
+        }
+    }
 
     bool canMerge = false;
 
@@ -2049,9 +2110,12 @@ bool TTableInfo::CheckCanMergePartitions(const TSplitSettings& splitSettings,
 
     THashSet<TTabletId> partOwners;
     TString shardMergeReason;
+    const TString* mergedBoundary = nullptr;
 
     // Make sure we can actually merge current shard first
-    if (!TryAddShardToMerge(splitSettings, forceShardSplitSettings, shardIdx, shardsToMerge, partOwners, totalSize, totalLoad, cpuMergeThreshold, mainTableForIndex, shardMergeReason)) {
+    if (!TryAddShardToMerge(
+        splitSettings, forceShardSplitSettings, GetPartitions()[partitionIdx], shardsToMerge, mergedBoundary,
+        partOwners, totalSize, totalLoad, cpuMergeThreshold, mainTableForIndex, shardMergeReason)) {
         return false;
     }
 
@@ -2059,17 +2123,24 @@ bool TTableInfo::CheckCanMergePartitions(const TSplitSettings& splitSettings,
         << " " << shardMergeReason;
 
     for (i64 pi = partitionIdx - 1; pi >= 0; --pi) {
-        if (!TryAddShardToMerge(splitSettings, forceShardSplitSettings, GetPartitions()[pi].ShardIdx, shardsToMerge, partOwners, totalSize, totalLoad, cpuMergeThreshold, mainTableForIndex, shardMergeReason)) {
+        mergedBoundary = &GetPartitions()[pi].EndOfRange;
+        if (!TryAddShardToMerge(
+            splitSettings, forceShardSplitSettings, GetPartitions()[pi], shardsToMerge, mergedBoundary,
+            partOwners, totalSize, totalLoad, cpuMergeThreshold, mainTableForIndex, shardMergeReason)) {
             break;
         }
     }
     // make shardsToMerge ordered by partition index
     Reverse(shardsToMerge.begin(), shardsToMerge.end());
 
+    mergedBoundary = &GetPartitions()[partitionIdx].EndOfRange;
     for (ui64 pi = partitionIdx + 1; pi < GetPartitions().size(); ++pi) {
-        if (!TryAddShardToMerge(splitSettings, forceShardSplitSettings, GetPartitions()[pi].ShardIdx, shardsToMerge, partOwners, totalSize, totalLoad, cpuMergeThreshold, mainTableForIndex, shardMergeReason)) {
+        if (!TryAddShardToMerge(
+            splitSettings, forceShardSplitSettings, GetPartitions()[pi], shardsToMerge, mergedBoundary,
+            partOwners, totalSize, totalLoad, cpuMergeThreshold, mainTableForIndex, shardMergeReason)) {
             break;
         }
+        mergedBoundary = &GetPartitions()[pi].EndOfRange;
     }
 
     reason += TStringBuilder()
