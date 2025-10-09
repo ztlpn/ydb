@@ -14,7 +14,10 @@ struct TStatisticsAggregator::TTxAnalyzeShardRequest : public TTxBase {
 
     TTxType GetTxType() const override { return TXTYPE_ANALYZE_SHARD_REQUEST; }
 
-    static std::unique_ptr<TEvStatistics::TEvAnalyzeShard> MakeRequest(const TString& operationId, const TForceTraversalTable& operationTable) {
+    static std::unique_ptr<TEvStatistics::TEvAnalyzeShard> MakeRequest(
+            const TString& operationId,
+            const TForceTraversalTable& operationTable,
+            const TVector<ui32>& operationTypes) {
         auto request = std::make_unique<TEvStatistics::TEvAnalyzeShard>();
         auto& record = request->Record;
         record.SetOperationId(operationId);
@@ -22,6 +25,8 @@ struct TStatisticsAggregator::TTxAnalyzeShardRequest : public TTxBase {
         operationTable.PathId.ToProto(table.MutablePathId());
         table.MutableColumnTags()->Add(
             operationTable.ColumnTags.begin(), operationTable.ColumnTags.end());
+        record.MutableTypes()->Add(operationTypes.begin(), operationTypes.end());
+
         return request;
     }
 
@@ -35,7 +40,8 @@ struct TStatisticsAggregator::TTxAnalyzeShardRequest : public TTxBase {
                         if (analyzedShard.Status == TAnalyzedShard::EStatus::None) {
                             analyzedShard.Status = TAnalyzedShard::EStatus::AnalyzeStarted;
 
-                            auto request = MakeRequest(operation.OperationId, operationTable);
+                            auto request = MakeRequest(
+                                operation.OperationId, operationTable, operation.Types);
                             Events.push_back(std::make_unique<TEvPipeCache::TEvForward>(request.release(), analyzedShard.ShardTabletId, true));
                             
                             if (Events.size() == SendAnalyzeCount)

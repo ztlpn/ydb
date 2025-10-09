@@ -199,7 +199,7 @@ struct TStatisticsAggregator::TTxInit : public TTxBase {
 
             while (!rowset.EndOfSet()) {
                 TString operationId = rowset.GetValue<Schema::ForceTraversalOperations::OperationId>();
-                TString types = rowset.GetValue<Schema::ForceTraversalOperations::Types>();
+                TString typesStr = rowset.GetValue<Schema::ForceTraversalOperations::Types>();
                 ui64 createdAt = rowset.GetValue<Schema::ForceTraversalOperations::CreatedAt>();
                 TString databaseName = rowset.GetValue<Schema::ForceTraversalOperations::DatabaseName>();
 
@@ -207,7 +207,7 @@ struct TStatisticsAggregator::TTxInit : public TTxBase {
                     .OperationId = operationId,
                     .DatabaseName = databaseName,
                     .Tables = {},
-                    .Types = types,
+                    .Types = Scan<ui32>(SplitString(typesStr, ",")),
                     .ReplyToActorId = {},
                     .CreatedAt = TInstant::FromValue(createdAt)
                 };

@@ -1041,7 +1041,7 @@ bool TStatisticsAggregator::OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr ev
                 auto forceTraversal = CurrentForceTraversalOperation();
                 str << "  CreatedAt: " << forceTraversal->CreatedAt << Endl;
                 str << ", ReplyToActorId: " << forceTraversal->ReplyToActorId << Endl;
-                str << ", Types: " << forceTraversal->Types << Endl;
+                str << ", Types: " << JoinVectorIntoString(forceTraversal->Types, ",") << Endl;
                 str << ", Tables size: " << forceTraversal->Tables.size() << Endl;
                 str << ", Tables: " << Endl;
 

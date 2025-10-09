@@ -46,13 +46,14 @@ struct TStatisticsAggregator::TTxAnalyze : public TTxBase {
             }
         }
 
-        const TString types = JoinVectorIntoString(TVector<ui32>(Record().GetTypes().begin(), Record().GetTypes().end()), ",");
+        TVector<ui32> types(Record().GetTypes().begin(), Record().GetTypes().end());
+        const TString typesStr = JoinVectorIntoString(types, ",");
         const TString& databaseName = Record().GetDatabase();
 
         SA_LOG_D("[" << Self->TabletID() << "] TTxAnalyze::Execute. Create new force traversal operation"
             << ", OperationId: `" << operationId << "'"
             << ", DatabaseName: `" << databaseName << "'"
-            << ", Types: " << types);
+            << ", Types: " << typesStr);
 
         // create new force traversal
         auto createdAt = ctx.Now();
@@ -60,7 +61,7 @@ struct TStatisticsAggregator::TTxAnalyze : public TTxBase {
             .OperationId = operationId,
             .DatabaseName = databaseName,
             .Tables = {},
-            .Types = types,
+            .Types = std::move(types),
             .ReplyToActorId = ReplyToActorId,
             .CreatedAt = createdAt
         };
@@ -99,7 +100,7 @@ struct TStatisticsAggregator::TTxAnalyze : public TTxBase {
 
         db.Table<Schema::ForceTraversalOperations>().Key(operationId).Update(
             NIceDb::TUpdate<Schema::ForceTraversalOperations::OperationId>(operationId),
-            NIceDb::TUpdate<Schema::ForceTraversalOperations::Types>(types),
+            NIceDb::TUpdate<Schema::ForceTraversalOperations::Types>(typesStr),
             NIceDb::TUpdate<Schema::ForceTraversalOperations::CreatedAt>(createdAt.GetValue()),
             NIceDb::TUpdate<Schema::ForceTraversalOperations::DatabaseName>(databaseName)
         );

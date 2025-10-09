@@ -405,7 +405,7 @@ private: // stored in local db
         TString OperationId;
         TString DatabaseName;
         std::vector<TForceTraversalTable> Tables;
-        TString Types;
+        TVector<ui32> Types;
         TActorId ReplyToActorId;
         TInstant CreatedAt;
     };
