@@ -100,7 +100,9 @@ struct TAggregationStatistics {
     std::unordered_map<ui32, ColumnStatistics> CountMinSketches;
     ui32 TotalStatisticsResponse{ 0 };
 
+    std::vector<NKikimrStat::EColumnStatisticType> Types;
     std::vector<ui32> ColumnTags;
+
     TLocalTablets LocalTablets;
     std::vector<TFailedTablet> FailedTablets;
 
@@ -552,9 +554,10 @@ private:
         request->Record.MutableNodes()->Reserve(node.Tablets.size());
 
         const auto& columnTags = record.GetColumnTags();
-        if (!columnTags.empty()) {
-            request->Record.MutableColumnTags()->Assign(columnTags.begin(), columnTags.end());
-        }
+        request->Record.MutableColumnTags()->Assign(columnTags.begin(), columnTags.end());
+
+        const auto& types = record.GetTypes();
+        request->Record.MutableTypes()->Assign(types.begin(), types.end());
 
         auto pathId = request->Record.MutablePathId();
         pathId->SetOwnerId(AggregationStatistics.PathId.OwnerId);
@@ -607,6 +610,16 @@ private:
 
         for (const auto tag : record.GetColumnTags()) {
             AggregationStatistics.ColumnTags.emplace_back(tag);
+        }
+
+        if (record.GetTypes().empty()) {
+            // Legacy msg, assume count-min sketch.
+            AggregationStatistics.Types.push_back(NKikimrStat::TYPE_COUNT_MIN_SKETCH);
+        } else {
+            for (const auto& type : record.GetTypes()) {
+                AggregationStatistics.Types.push_back(
+                    static_cast<NKikimrStat::EColumnStatisticType>(type));
+            }
         }
 
         const auto currentNodeId = ev->Recipient.NodeId();
@@ -1045,16 +1058,16 @@ private:
     void SendStatisticsRequest(const TActorId& clientId, ui64 tabletId) {
         auto request = std::make_unique<TEvStatistics::TEvStatisticsRequest>();
         auto& record = request->Record;
-        record.MutableTypes()->Add(NKikimrStat::TYPE_COUNT_MIN_SKETCH);
 
         auto* path = record.MutableTable()->MutablePathId();
         path->SetOwnerId(AggregationStatistics.PathId.OwnerId);
         path->SetLocalId(AggregationStatistics.PathId.LocalPathId);
 
-        auto* columnTags = record.MutableTable()->MutableColumnTags();
-        for (const auto& tag : AggregationStatistics.ColumnTags) {
-            columnTags->Add(tag);
-        }
+        record.MutableTable()->MutableColumnTags()->Assign(
+            AggregationStatistics.ColumnTags.begin(),
+            AggregationStatistics.ColumnTags.end());
+        record.MutableTypes()->Assign(
+            AggregationStatistics.Types.begin(), AggregationStatistics.Types.end());
 
         SA_LOG_D("TEvStatisticsRequest send"
             << ", client id = " << clientId

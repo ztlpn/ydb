@@ -94,9 +94,12 @@ struct TStatisticsAggregator::TTxAggregateStatisticsResponse : public TTxBase {
             return true;
         }
 
-        Request = std::make_unique<TEvStatistics::TEvAggregateStatistics>();
-        auto& outRecord = Request->Record;
+        ++Self->TraversalRound;
+        ++Self->GlobalTraversalRound;
+        Self->PersistGlobalTraversalRound(db);
 
+        Request = Self->PrepareAggregateStatisticsRequest();
+        auto& outRecord = Request->Record;
         for (auto& [nodeId, tabletIds] : nonLocalTablets) {
             auto& outNode = *outRecord.AddNodes();
             outNode.SetNodeId(nodeId);
@@ -106,10 +109,6 @@ struct TStatisticsAggregator::TTxAggregateStatisticsResponse : public TTxBase {
             }
         }
 
-        ++Self->TraversalRound;
-        ++Self->GlobalTraversalRound;
-        Self->PersistGlobalTraversalRound(db);
-        outRecord.SetRound(Self->GlobalTraversalRound);
         Action = EAction::SendAggregate;
 
         return true;

@@ -175,6 +175,8 @@ message TEvAggregateStatistics {
     repeated TNodeMap Nodes = 2;
     optional NKikimrProto.TPathID PathId = 3;
     repeated uint32 ColumnTags = 4;
+
+    repeated EColumnStatisticType Types = 5;
 }
 
 message TEvAggregateKeepAlive {

@@ -32,17 +32,8 @@ struct TStatisticsAggregator::TTxResponseTabletDistribution : public TTxBase {
         NIceDb::TNiceDb db(txc.DB);
         Self->PersistGlobalTraversalRound(db);
 
-        AggregateStatisticsRequest = std::make_unique<TEvStatistics::TEvAggregateStatistics>();
+        AggregateStatisticsRequest = Self->PrepareAggregateStatisticsRequest();
         auto& outRecord = AggregateStatisticsRequest->Record;
-        outRecord.SetRound(Self->GlobalTraversalRound);
-        Self->TraversalPathId.ToProto(outRecord.MutablePathId());
-
-        const auto forceTraversalTable = Self->CurrentForceTraversalTable();
-        if (forceTraversalTable) {
-            outRecord.MutableColumnTags()->Add(
-                forceTraversalTable->ColumnTags.begin(), forceTraversalTable->ColumnTags.end());
-        }
-
         for (auto& inNode : HiveRecord.GetNodes()) {
             auto& outNode = *outRecord.AddNodes();
             outNode.SetNodeId(inNode.GetNodeId());

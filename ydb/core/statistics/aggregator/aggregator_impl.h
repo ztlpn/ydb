@@ -352,6 +352,8 @@ private:
     // alternate between forced and scheduled traversals
     bool LastTraversalWasForce = false;
 
+    std::unique_ptr<TEvStatistics::TEvAggregateStatistics> PrepareAggregateStatisticsRequest();
+
 private: // stored in local db
 
     TString ForceTraversalOperationId;

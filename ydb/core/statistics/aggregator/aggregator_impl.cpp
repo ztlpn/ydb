@@ -1090,4 +1090,33 @@ bool TStatisticsAggregator::OnRenderAppHtmlPage(NMon::TEvRemoteHttpInfo::TPtr ev
     TabletCounters->Simple()[COUNTER_BASE_STATISTICS_TOTAL_BYTES_SIZE].Set(totalBytesSize);
  }
 
+std::unique_ptr<TEvStatistics::TEvAggregateStatistics>
+TStatisticsAggregator::PrepareAggregateStatisticsRequest() {
+    auto ret = std::make_unique<TEvStatistics::TEvAggregateStatistics>();
+    auto& outRecord = ret->Record;
+    outRecord.SetRound(GlobalTraversalRound);
+    TraversalPathId.ToProto(outRecord.MutablePathId());
+
+    const auto forceTraversalTable = CurrentForceTraversalTable();
+    if (forceTraversalTable) {
+        outRecord.MutableColumnTags()->Add(
+            forceTraversalTable->ColumnTags.begin(), forceTraversalTable->ColumnTags.end());
+        const auto* forceTraversalOp = CurrentForceTraversalOperation();
+        Y_ABORT_UNLESS(forceTraversalOp);
+        if (!forceTraversalOp->Types.empty()) {
+            outRecord.MutableTypes()->Assign(
+                forceTraversalOp->Types.begin(), forceTraversalOp->Types.end());
+        } else {
+            // Default for force traversal
+            outRecord.AddTypes(NKikimrStat::EColumnStatisticType::TYPE_COUNT_MIN_SKETCH);
+        }
+    } else {
+        // Default for background traversal
+        outRecord.AddTypes(NKikimrStat::EColumnStatisticType::TYPE_COUNT_MIN_SKETCH);
+    }
+
+    return ret;
+}
+
+
 } // NKikimr::NStat
