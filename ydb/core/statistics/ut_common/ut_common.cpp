@@ -525,7 +525,8 @@ std::unique_ptr<TEvStatistics::TEvAnalyze> MakeAnalyzeRequest(
     NKikimrStat::TEvAnalyze& record = ev->Record;
     record.SetOperationId(operationId);
     record.SetDatabase(std::move(databaseName));
-    record.AddTypes(NKikimrStat::EColumnStatisticType::TYPE_COUNT_MIN_SKETCH);
+    // record.AddTypes(NKikimrStat::EColumnStatisticType::TYPE_COUNT_MIN_SKETCH);
+    // record.AddTypes(NKikimrStat::EColumnStatisticType::TYPE_BASE_APPROXIMATE);
     for (const TAnalyzedTable& table : tables)
         table.ToProto(*record.AddTables());
     return ev;

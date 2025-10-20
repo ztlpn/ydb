@@ -40,9 +40,30 @@ struct TStatisticsAggregator::TTxResolve : public TTxBase {
 
         if (Self->TraversalIsColumnTable) {
             Self->TabletsForReqDistribution.clear();
-            Self->CountMinSketches.clear();
+            // Self->CountMinSketches.clear();
         } else {
             Self->DatashardRanges.clear();
+        }
+
+        // Prepare empty aggregated results
+        Self->CountMinSketches.clear();
+        TVector<ui32> requestedColumnTags;
+        const auto forceTraversalTable = Self->CurrentForceTraversalTable();
+        if (forceTraversalTable) {
+            SA_LOG_D("[" << Self->TabletID() << "] TTxResolve::Execute FTT pathId:"
+                << forceTraversalTable->PathId
+                << ", ct: " << forceTraversalTable->ColumnTags.size());
+            requestedColumnTags = forceTraversalTable->ColumnTags;
+        }
+        if (requestedColumnTags.empty()) {
+            for (const auto& col : Self->Columns) {
+                requestedColumnTags.push_back(col.Column);
+            }
+        }
+        SA_LOG_D("[" << Self->TabletID() << "] TTxResolve::Execute FFF2 rct:"
+            << requestedColumnTags.size());
+        for (const auto& tag : requestedColumnTags) {
+            Self->CountMinSketches[tag].reset(TCountMinSketch::Create());
         }
 
         for (auto& part : partitioning) {

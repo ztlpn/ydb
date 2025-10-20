@@ -618,6 +618,10 @@ void TStatisticsAggregator::SaveStatisticsToTable() {
         items.emplace_back(tag, EStatType::COUNT_MIN_SKETCH, std::move(strSketch));
     }
 
+    if (CurBaseStatistics) {
+        items.emplace_back(std::nullopt, EStatType::SIMPLE, ToString(*CurBaseStatistics));
+    }
+
     if (items.empty()) {
         Send(SelfId(), new TEvStatistics::TEvSaveStatisticsQueryResponse(
             Ydb::StatusIds::SUCCESS, {}, TraversalPathId));
@@ -903,6 +907,7 @@ void TStatisticsAggregator::ResetTraversalState(NIceDb::TNiceDb& db) {
         db.Table<Schema::ColumnStatistics>().Key(tag).Delete();
     }
     CountMinSketches.clear();
+    CurBaseStatistics.reset();
 
     DatashardRanges.clear();
 
@@ -1109,6 +1114,7 @@ TStatisticsAggregator::PrepareAggregateStatisticsRequest() {
         } else {
             // Default for force traversal
             outRecord.AddTypes(NKikimrStat::EColumnStatisticType::TYPE_COUNT_MIN_SKETCH);
+            outRecord.AddTypes(NKikimrStat::EColumnStatisticType::TYPE_BASE_APPROXIMATE);
         }
     } else {
         // Default for background traversal

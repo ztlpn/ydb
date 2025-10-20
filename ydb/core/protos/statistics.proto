@@ -74,6 +74,8 @@ message TEvStatisticsIsDisabled {
 enum EColumnStatisticType {
     TYPE_UNSPECIFIED = 0;
     TYPE_COUNT_MIN_SKETCH = 1;
+    TYPE_ALSO_COUNT_MIN_SKETCH = 2;
+    TYPE_BASE_APPROXIMATE = 3;
 }
 
 // table to gather statistics from

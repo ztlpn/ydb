@@ -36,7 +36,9 @@ struct TStatisticsAggregator::TTxAggregateStatisticsResponse : public TTxBase {
         for (auto& column : Record.GetColumns()) {
             auto tag = column.GetTag();
             for (auto& statistic : column.GetStatistics()) {
-                if (statistic.GetType() == NKikimr::NStat::COUNT_MIN_SKETCH) {
+                switch (statistic.GetType()) {
+                case NKikimrStat::TYPE_COUNT_MIN_SKETCH:
+                case NKikimrStat::TYPE_ALSO_COUNT_MIN_SKETCH: {
                     if (!Self->ColumnNames.contains(tag)) {
                         continue;
                     }
@@ -50,6 +52,16 @@ struct TStatisticsAggregator::TTxAggregateStatisticsResponse : public TTxBase {
                     } else {
                         *(currentIt->second) += *cms;
                     }
+                    break;
+                }
+                case NKikimrStat::TYPE_BASE_APPROXIMATE:
+                    auto val = FromString<ui64>(statistic.GetData());
+                    if (!Self->CurBaseStatistics) {
+                        Self->CurBaseStatistics = val;
+                    } else {
+                        *Self->CurBaseStatistics += val;
+                    }
+                    break;
                 }
             }
         }

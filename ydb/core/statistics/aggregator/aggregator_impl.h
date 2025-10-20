@@ -367,6 +367,7 @@ private: // stored in local db
     size_t GlobalTraversalRound = 1;
 
     std::unordered_map<ui32, std::unique_ptr<TCountMinSketch>> CountMinSketches;
+    std::optional<ui64> CurBaseStatistics;
 
     std::unordered_map<TPathId, TScheduleTraversal> ScheduleTraversals;
     std::unordered_map<ui64, std::unordered_set<TPathId>> ScheduleTraversalsBySchemeShard;

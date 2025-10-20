@@ -28,6 +28,9 @@ void TColumnShard::Handle(NStat::TEvStatistics::TEvAnalyzeShard::TPtr& ev, const
 
 class TResultAccumulator {
 private:
+    bool CmsRequested = false;
+    bool BaseStatsRequested = false;
+
     TMutex Mutex;
     THashMap<ui32, std::unique_ptr<TCountMinSketch>> Calculated;
     TAtomicCounter ResultsCount = 0;
@@ -44,16 +47,26 @@ private:
         auto& respRecord = Response->Record;
         respRecord.SetStatus(NKikimrStat::TEvStatisticsResponse::STATUS_SUCCESS);
 
-        for (auto&& [columnTag, sketch] : Calculated) {
-            if (!sketch) {
-                continue;
-            }
-
-            auto* column = respRecord.AddColumns();
-            column->SetTag(columnTag);
+        if (BaseStatsRequested) {
+            // TODO: base stats protobuf
+            auto* column = respRecord.AddColumns(); // column without a tag
             auto* statistic = column->AddStatistics();
-            statistic->SetType(NStat::COUNT_MIN_SKETCH);
-            statistic->SetData(TString(sketch->AsStringBuf()));
+            statistic->SetType(NKikimrStat::EColumnStatisticType::TYPE_BASE_APPROXIMATE);
+            statistic->SetData("123");
+        }
+
+        if (CmsRequested) {
+            for (auto&& [columnTag, sketch] : Calculated) {
+                if (!sketch) {
+                    continue;
+                }
+
+                auto* column = respRecord.AddColumns();
+                column->SetTag(columnTag);
+                auto* statistic = column->AddStatistics();
+                statistic->SetType(NKikimrStat::EColumnStatisticType::TYPE_ALSO_COUNT_MIN_SKETCH);
+                statistic->SetData(TString(sketch->AsStringBuf()));
+            }
         }
 
         NActors::TActivationContext::Send(RequestSenderActorId, std::move(Response), 0, Cookie);
@@ -70,7 +83,19 @@ public:
         }
     }
 
-    void AddResult(THashMap<ui32, std::unique_ptr<TCountMinSketch>>&& sketch) {
+    void SetCmsRequested(bool value) {
+        AFL_VERIFY(!Started);
+        CmsRequested = value;
+    }
+
+    void SetBaseStatsRequested(bool value) {
+        AFL_VERIFY(!Started);
+        BaseStatsRequested = value;
+    }
+
+    void AddCountMinSketches(THashMap<ui32, std::unique_ptr<TCountMinSketch>>&& sketch) {
+        ALOG_DEBUG(NKikimrServices::STATISTICS, "FFF add res");
+
         {
             TGuard<TMutex> g(Mutex);
             for (auto&& i : sketch) {
@@ -128,6 +153,10 @@ public:
         , VersionedIndex(vIndex) {
     }
 
+    ~TColumnPortionsAccumulator() {
+        ALOG_DEBUG(NKikimrServices::STATISTICS, "FFF destroy");
+    }
+
     class TIndexReadTask: public NOlap::NBlobOperations::NRead::ITask {
     private:
         using TBase = NOlap::NBlobOperations::NRead::ITask;
@@ -149,7 +178,7 @@ public:
                     }
                 }
             }
-            Result->AddResult(std::move(SketchesByColumns));
+            Result->AddCountMinSketches(std::move(SketchesByColumns));
         }
 
         virtual bool DoOnError(
@@ -235,7 +264,7 @@ public:
                 TActorContext::AsActorContext().Register(new NOlap::NBlobOperations::NRead::TActor(std::make_shared<TIndexReadTask>(
                     Result, blobsAction.GetReadingActions(), std::move(rangesByColumnLocal), std::move(sketchesByColumns))));
             } else {
-                Result->AddResult(std::move(sketchesByColumns));
+                Result->AddCountMinSketches(std::move(sketchesByColumns));
             }
         }
 
@@ -262,6 +291,7 @@ public:
         request->RegisterSubscriber(std::make_shared<TMetadataSubscriber>(StoragesManager, Result, VersionedIndex, ColumnTagsRequested));
         Portions.clear();
         DataAccessors->AskData(request);
+        ALOG_DEBUG(NKikimrServices::STATISTICS, "FFF flush");
     }
 
     void AddTask(const NOlap::TPortionInfo::TConstPtr& portion) {
@@ -269,6 +299,7 @@ public:
         if (Portions.size() >= PortionsCountLimit) {
             Flush();
         }
+        ALOG_DEBUG(NKikimrServices::STATISTICS, "FFF add task");
     }
 };
 
@@ -279,13 +310,24 @@ void TColumnShard::Handle(NStat::TEvStatistics::TEvStatisticsRequest::TPtr& ev, 
     auto& respRecord = response->Record;
     respRecord.SetShardTabletId(TabletID());
 
-    if (record.TypesSize() > 0 && (record.TypesSize() > 1 || record.GetTypes(0) != NKikimrStat::TYPE_COUNT_MIN_SKETCH)) {
-        AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("error", "Unsupported statistic type in statistics request");
+    bool cmsRequested = false;
+    bool baseStatRequested = false;
+    for (auto type : record.GetTypes()) {
+        switch (type) {
+        case NKikimrStat::TYPE_COUNT_MIN_SKETCH:
+        case NKikimrStat::TYPE_ALSO_COUNT_MIN_SKETCH:
+            cmsRequested = true;
+            break;
+        case NKikimrStat::TYPE_BASE_APPROXIMATE:
+            baseStatRequested = true;
+            break;
+        default:
+            AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("error", "Unsupported statistic type in statistics request")("type", type);
 
-        respRecord.SetStatus(NKikimrStat::TEvStatisticsResponse::STATUS_ERROR);
-
-        Send(ev->Sender, response.release(), 0, ev->Cookie);
-        return;
+            respRecord.SetStatus(NKikimrStat::TEvStatisticsResponse::STATUS_ERROR);
+            Send(ev->Sender, response.release(), 0, ev->Cookie);
+            return;
+        }
     }
 
     AFL_VERIFY(HasIndex());
@@ -307,8 +349,12 @@ void TColumnShard::Handle(NStat::TEvStatistics::TEvStatisticsRequest::TPtr& ev, 
     }
 
     NOlap::TDataAccessorsRequest request(NOlap::NGeneralCache::TPortionsMetadataCachePolicy::EConsumer::STATISTICS);
+
     std::shared_ptr<TResultAccumulator> resultAccumulator =
         std::make_shared<TResultAccumulator>(columnTagsRequested, ev->Sender, ev->Cookie, std::move(response));
+    resultAccumulator->SetBaseStatsRequested(baseStatRequested);
+    resultAccumulator->SetCmsRequested(cmsRequested);
+
     auto versionedIndex = index.GetVersionedIndexReadonlyCopy();
     TColumnPortionsAccumulator portionsPack(
         StoragesManager, resultAccumulator, 1000, columnTagsRequested, versionedIndex, DataAccessorsManager.GetObjectPtrVerified());
@@ -321,6 +367,8 @@ void TColumnShard::Handle(NStat::TEvStatistics::TEvStatisticsRequest::TPtr& ev, 
     }
     portionsPack.Flush();
     resultAccumulator->Start();
+
+    ALOG_DEBUG(NKikimrServices::STATISTICS, "FFF end req");
 }
 
 }   // namespace NKikimr::NColumnShard

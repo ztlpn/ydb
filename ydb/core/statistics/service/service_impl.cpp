@@ -98,6 +98,7 @@ struct TAggregationStatistics {
     size_t PprocessedNodes{ 0 };
 
     std::unordered_map<ui32, ColumnStatistics> CountMinSketches;
+    ui64 BaseStats = 0;
     ui32 TotalStatisticsResponse{ 0 };
 
     std::vector<NKikimrStat::EColumnStatisticType> Types;
@@ -289,6 +290,7 @@ private:
 
         TAggregationStatistics aggregationStatistics(Settings.FanOutFactor);
         std::swap(AggregationStatistics, aggregationStatistics);
+        SA_LOG_D("[TStatService::AGGR] FFF RESET asct:" << aggregationStatistics.ColumnTags.size());
     }
 
     void AggregateStatistics(const TAggregationStatistics::TColumnsStatistics& columnsStatistics) {
@@ -298,7 +300,9 @@ private:
             const auto tag = column.GetTag();
 
             for (auto& statistic : column.GetStatistics()) {
-                if (statistic.GetType() == NKikimr::NStat::COUNT_MIN_SKETCH) {
+                switch (statistic.GetType()) {
+                case NKikimrStat::EColumnStatisticType::TYPE_COUNT_MIN_SKETCH:
+                case NKikimrStat::EColumnStatisticType::TYPE_ALSO_COUNT_MIN_SKETCH: {
                     auto data = statistic.GetData().data();
                     auto sketch = reinterpret_cast<const TCountMinSketch*>(data);
                     auto& current = AggregationStatistics.CountMinSketches[tag];
@@ -309,6 +313,13 @@ private:
 
                     ++current.ContainedInResponse;
                     *current.Statistics += *sketch;
+                    break;
+                }
+                case NKikimrStat::EColumnStatisticType::TYPE_BASE_APPROXIMATE: {
+                    SA_LOG_D("FFF base stats: " << statistic.GetData());
+                    AggregationStatistics.BaseStats += FromString<ui64>(statistic.GetData());
+                    break;
+                }
                 }
             }
         }
@@ -513,6 +524,7 @@ private:
 
         for (auto it = countMinSketches.begin(); it != countMinSketches.end(); ++it) {
             if (it->second.ContainedInResponse != AggregationStatistics.TotalStatisticsResponse) {
+                // TODO: wrong if empty table
                 continue;
             }
 
@@ -521,7 +533,15 @@ private:
 
             auto data = it->second.Statistics->AsStringBuf();
             auto statistics = column->AddStatistics();
-            statistics->SetType(NKikimr::NStat::COUNT_MIN_SKETCH);
+            statistics->SetType(NKikimrStat::EColumnStatisticType::TYPE_ALSO_COUNT_MIN_SKETCH);
+            statistics->SetData(data.data(), data.size());
+        }
+
+        if (AggregationStatistics.BaseStats) {
+            auto column = record.AddColumns();
+            auto data = ToString(AggregationStatistics.BaseStats);
+            auto statistics = column->AddStatistics();
+            statistics->SetType(NKikimrStat::EColumnStatisticType::TYPE_BASE_APPROXIMATE);
             statistics->SetData(data.data(), data.size());
         }
 
@@ -621,6 +641,8 @@ private:
                     static_cast<NKikimrStat::EColumnStatisticType>(type));
             }
         }
+        SA_LOG_D("[TStatService::AGGR] FFF asct:" << AggregationStatistics.ColumnTags.size()
+            << " ast:"<< AggregationStatistics.Types.size());
 
         const auto currentNodeId = ev->Recipient.NodeId();
         const auto& nodes = record.GetNodes();
