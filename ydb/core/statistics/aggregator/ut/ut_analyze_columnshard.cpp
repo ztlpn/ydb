@@ -1,5 +1,8 @@
 #include <ydb/core/statistics/ut_common/ut_common.h>
 
+#include <ydb/core/tx/datashard/datashard.h>
+#include <ydb/core/kqp/compute_actor/kqp_compute_events.h>
+#include <ydb/core/tx/long_tx_service/public/events.h>
 #include <ydb/library/actors/testlib/test_runtime.h>
 
 #include <ydb/core/tx/datashard/datashard.h>
@@ -17,9 +20,114 @@ TTableInfo PrepareDatabaseAndTable(TTestEnv& env) {
     return PrepareColumnTable(env, "Database", "Table", 1);
 }
 
+void PrintEvent(const IEventHandle& ev) {
+    Cerr << "FFF EV from:" << ev.Sender << " to:" << ev.Recipient
+        << " t:" << ev.Type
+        << " tn:" << ev.GetTypeName()
+        << " tr:" << ev.GetTypeRewrite()
+        << " str: " << ev.ToString() << Endl;
+}
+
 } // namespace
 
 Y_UNIT_TEST_SUITE(AnalyzeColumnshard) {
+    Y_UNIT_TEST(ManualScan) {
+        TTestEnv env(1, 1);
+        auto& runtime = *env.GetServer().GetRuntime();
+        CreateDatabase(env, "Database");
+        CreateColumnTable(env, "Database", "Table", 4);
+        InsertDataIntoTable(env, "Database", "Table", RowsWithFewDistinctValues(1000));
+
+        ui64 saTabletId = 0;
+        auto pathId = ResolvePathId(runtime, "/Root/Database/Table", nullptr, &saTabletId);
+        Y_UNUSED(pathId);
+
+        auto shards = GetColumnTableShards(runtime, runtime.AllocateEdgeActor(), "/Root/Database/Table");
+        for (auto s : shards) {
+            Cerr << "FFF " << s << Endl;
+        }
+
+        TActorId scanActorId;
+        TActorId scanFetcherId;
+        auto observer1 = runtime.AddObserver<NKqp::TEvKqpCompute::TEvScanInitActor>([&](auto& ev) {
+            PrintEvent(*ev);
+            scanActorId = ActorIdFromProto(ev->Get()->Record.GetScanActorId());
+            scanFetcherId = ev->Recipient;
+        });
+
+        auto observer2 = runtime.AddObserver<NKqp::TEvKqpCompute::TEvScanData>(
+            [&](NKqp::TEvKqpCompute::TEvScanData::TPtr& ev) {
+            PrintEvent(*ev);
+            Cerr << "FFF DATA nr:" << ev->Get()->GetRowsCount() << Endl;
+        });
+
+        auto observer3 = runtime.AddObserver([&](IEventHandle::TPtr& ev) {
+            if (ev->Sender == scanFetcherId && ev->Recipient == scanActorId) {
+                PrintEvent(*ev);
+            }
+        });
+
+        // ExecuteYqlScript(env, Sprintf(R"(
+        //     SELECT count(*) FROM `%s`
+        // )", "/Root/Database/Table"));
+        // return;
+
+        // Acquire read snapshot
+        NKikimrKqp::TKqpSnapshot snapshot;
+        {
+            auto sender = runtime.AllocateEdgeActor(1);
+            runtime.Send(
+                NLongTxService::MakeLongTxServiceID(runtime.GetNodeId(1)), sender,
+                new NLongTxService::TEvLongTxService::TEvAcquireReadSnapshot(),
+                1);
+            auto ev = runtime.GrabEdgeEventRethrow<
+                NLongTxService::TEvLongTxService::TEvAcquireReadSnapshotResult>(sender);
+            const auto& record = ev->Get()->Record;
+            UNIT_ASSERT_VALUES_EQUAL(record.GetStatus(), Ydb::StatusIds::SUCCESS);
+            snapshot.SetStep(record.GetSnapshotStep());
+            snapshot.SetTxId(record.GetSnapshotTxId());
+            Cerr << "FFF SNAPSHOT " << snapshot.AsJSON() << Endl;
+        }
+
+        ui64 shardId = shards[0];
+        {
+            auto evScan = std::make_unique<TEvDataShard::TEvKqpScan>();
+            auto& record = evScan->Record;
+            record.SetDataFormat(NKikimrDataEvents::FORMAT_ARROW);
+            record.MutableSnapshot()->CopyFrom(snapshot);
+            record.SetLocalPathId(pathId.LocalPathId);
+            record.AddColumnTags(2);
+
+            auto sender = runtime.AllocateEdgeActor(1);
+            runtime.SendToPipe(shardId, sender, evScan.release(), 1);
+
+            TAutoPtr<IEventHandle> handle;
+            auto* initEv = runtime.GrabEdgeEvent<NKqp::TEvKqpCompute::TEvScanInitActor>(
+                handle);
+            PrintEvent(*handle);
+
+            auto scanActorId = ActorIdFromProto(initEv->Record.GetScanActorId());
+            while (true) {
+                ui32 resultLimit = 1024 * 1024;
+                runtime.Send(scanActorId, sender,
+                    new NKqp::TEvKqpCompute::TEvScanDataAck(resultLimit, 0, 1),
+                    1);
+
+                auto* scan = runtime.GrabEdgeEvent<NKqp::TEvKqpCompute::TEvScanData>(handle);
+                PrintEvent(*handle);
+                if (scan->Finished) {
+                    UNIT_ASSERT(!scan->ArrowBatch || !scan->ArrowBatch->num_rows());
+                    break;
+                }
+                UNIT_ASSERT(scan->ArrowBatch);
+                auto batch = NArrow::ToBatch(scan->ArrowBatch);
+                Cerr << "FFF BATCH rs:" << batch->num_rows() << Endl;
+            }
+
+            runtime.SimulateSleep(TDuration::Seconds(5));
+        }
+    }
+
     Y_UNIT_TEST(AnalyzeShard) {
         TTestEnv env(1, 1);
         auto& runtime = *env.GetServer().GetRuntime();
