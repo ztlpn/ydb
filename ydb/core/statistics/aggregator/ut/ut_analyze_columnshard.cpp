@@ -9,6 +9,7 @@
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
 
 #include <ydb/core/testlib/actors/block_events.h>
+#include <ydb/library/query_actor/query_actor.h>
 
 namespace NKikimr {
 namespace NStat {
@@ -35,6 +36,7 @@ Y_UNIT_TEST_SUITE(AnalyzeColumnshard) {
         TTestEnv env(1, 1);
         auto& runtime = *env.GetServer().GetRuntime();
         CreateDatabase(env, "Database");
+        // CreateUniformTable(env, "Database", "Table");
         CreateColumnTable(env, "Database", "Table", 4);
         InsertDataIntoTable(env, "Database", "Table", RowsWithFewDistinctValues(1000));
 
@@ -47,30 +49,160 @@ Y_UNIT_TEST_SUITE(AnalyzeColumnshard) {
             Cerr << "FFF " << s << Endl;
         }
 
-        TActorId scanActorId;
-        TActorId scanFetcherId;
-        auto observer1 = runtime.AddObserver<NKqp::TEvKqpCompute::TEvScanInitActor>([&](auto& ev) {
+        // TActorId scanActorId;
+        // TActorId scanFetcherId;
+        // auto observer1 = runtime.AddObserver<NKqp::TEvKqpCompute::TEvScanInitActor>([&](auto& ev) {
+        //     PrintEvent(*ev);
+        //     scanActorId = ActorIdFromProto(ev->Get()->Record.GetScanActorId());
+        //     scanFetcherId = ev->Recipient;
+        // });
+
+        // auto observer2 = runtime.AddObserver<NKqp::TEvKqpCompute::TEvScanData>(
+        //     [&](NKqp::TEvKqpCompute::TEvScanData::TPtr& ev) {
+        //     PrintEvent(*ev);
+        //     Cerr << "FFF DATA nr:" << ev->Get()->GetRowsCount() << Endl;
+        // });
+
+        // auto observer3 = runtime.AddObserver([&](IEventHandle::TPtr& ev) {
+        //     if (ev->Sender == scanFetcherId && ev->Recipient == scanActorId) {
+        //         PrintEvent(*ev);
+        //     }
+        // });
+
+        auto observer4 = runtime.AddObserver<TEvDataShard::TEvKqpScan>(
+            [&](TEvDataShard::TEvKqpScan::TPtr& ev) {
             PrintEvent(*ev);
-            scanActorId = ActorIdFromProto(ev->Get()->Record.GetScanActorId());
-            scanFetcherId = ev->Recipient;
         });
 
-        auto observer2 = runtime.AddObserver<NKqp::TEvKqpCompute::TEvScanData>(
-            [&](NKqp::TEvKqpCompute::TEvScanData::TPtr& ev) {
-            PrintEvent(*ev);
-            Cerr << "FFF DATA nr:" << ev->Get()->GetRowsCount() << Endl;
-        });
+        // {
+        //     runtime.SimulateSleep(TDuration::Seconds(1));
 
-        auto observer3 = runtime.AddObserver([&](IEventHandle::TPtr& ev) {
-            if (ev->Sender == scanFetcherId && ev->Recipient == scanActorId) {
-                PrintEvent(*ev);
-            }
-        });
+        //     int nodeIdx = 1;
 
-        // ExecuteYqlScript(env, Sprintf(R"(
-        //     SELECT count(*) FROM `%s`
-        // )", "/Root/Database/Table"));
-        // return;
+        //     TString sessionId;
+        //     {
+        //         using TEvCreateSessionRequest = NGRpcService::TGrpcRequestOperationCall<
+        //             Ydb::Table::CreateSessionRequest,
+        //             Ydb::Table::CreateSessionResponse>;
+        //         Ydb::Table::CreateSessionRequest request;
+        //         // request.mutable_operation_params()
+        //         auto future = NRpcService::DoLocalRpc<TEvCreateSessionRequest>(
+        //             std::move(request), "", "", runtime.GetActorSystem(nodeIdx));
+        //         auto response = runtime.WaitFuture(std::move(future));
+        //         UNIT_ASSERT(response.operation().ready());
+        //         UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
+
+        //         Ydb::Table::CreateSessionResult result;
+        //         response.operation().result().UnpackTo(&result);
+        //         sessionId = result.session_id();
+        //     }
+
+        //     using TEvRequest = NGRpcService::TGrpcRequestOperationCall<
+        //         Ydb::Table::ExecuteDataQueryRequest,
+        //         Ydb::Table::ExecuteDataQueryResponse>;
+
+        //     Ydb::Table::ExecuteDataQueryRequest request;
+        //     request.set_session_id(sessionId);
+        //     request.mutable_tx_control()->mutable_begin_tx()->mutable_snapshot_read_only();
+        //     request.mutable_tx_control()->set_commit_tx(true);
+        //     request.mutable_query()->set_yql_text("SELECT count(*) FROM `/Root/Database/Table`");
+
+        //     auto future = NRpcService::DoLocalRpc<TEvRequest>(
+        //         std::move(request), "", "", runtime.GetActorSystem(nodeIdx));
+        //     auto response = runtime.WaitFuture(std::move(future));
+
+        //     UNIT_ASSERT(response.operation().ready());
+        //     for (const auto& issue : response.operation().issues()) {
+        //         Cerr << "FFF ISSUE " << issue << Endl;
+        //     }
+
+        //     UNIT_ASSERT_VALUES_EQUAL(response.operation().status(), Ydb::StatusIds::SUCCESS);
+        // }
+
+        {
+            runtime.SimulateSleep(TDuration::Seconds(1));
+
+            int nodeIdx = 1;
+            auto sender = runtime.AllocateEdgeActor(nodeIdx);
+
+            class TScanActor : public TQueryBase {
+                TActorId Parent;
+            public:
+                TScanActor(TActorId parent)
+                : TQueryBase(NKikimrServices::STATISTICS)
+                , Parent(parent) {}
+
+                void OnRunQuery() override {
+                    RunStreamQuery(R"(
+                        $cms_factory = AggregationFactory(
+                            "UDAF",
+                            ($item, $parent) -> { return StatisticsInternal::CountMinSketchCreate($item) },
+                            ($state, $item, $parent) -> { return StatisticsInternal::CountMinSketchAddValue($state, $item) },
+                            StatisticsInternal::CountMinSketchMerge,
+                            StatisticsInternal::CountMinSketchSerialize,
+                            StatisticsInternal::CountMinSketchSerialize,
+                            StatisticsInternal::CountMinSketchDeserialize,
+                            StatisticsInternal::CountMinSketchDefault(),
+                        );
+
+                        SELECT AGGREGATE_BY(Value, $cms_factory) from `/Root/Database/Table`;
+                    )");
+                }
+
+                void OnStreamResult(NYdb::TResultSet&& resultSet) override {
+                    NYdb::TResultSetParser result(std::move(resultSet));
+                    UNIT_ASSERT(result.TryNextRow());
+                    const auto& cmsData = NYdb::TValueParser(result.GetValue(0)).GetBytes();
+                    std::unique_ptr<TCountMinSketch> cms(
+                        TCountMinSketch::FromString(cmsData.data(), cmsData.size()));
+                    Cerr << "FFF RES count:" << cms->GetElementCount() << Endl;
+                    Finish();
+                }
+
+                void OnFinish(Ydb::StatusIds::StatusCode status, NYql::TIssues&& issues) override {
+                    Cerr << "FFF STATUS " << status << Endl;
+                    for (const auto& issue : issues) {
+                        Cerr << "FFF ISSUE " << issue << Endl;
+                    }
+
+                    UNIT_ASSERT_VALUES_EQUAL(status, Ydb::StatusIds::SUCCESS);
+                    Send(Parent, new TEvStatistics::TEvAnalyzeResponse());
+                }
+            };
+
+            runtime.Register(new TScanActor(sender), nodeIdx);
+
+            size_t scanCount = 0;
+            std::optional<TActorId> blockedActor;
+            TBlockEvents<TEvDataShard::TEvKqpScan> block(runtime,
+                [&](const TEvDataShard::TEvKqpScan::TPtr& ev) {
+                if (ev->Get()->Record.GetLocalPathId() != pathId.LocalPathId) {
+                    return false;
+                }
+
+                ++scanCount;
+                if (!blockedActor) {
+                    blockedActor = ev->Recipient;
+                    return true;
+                } else if (ev->Recipient == blockedActor) {
+                    return true;
+                } else {
+                    return false;
+                }
+            });
+            runtime.WaitFor("scans sent", [&]{ return scanCount >= 4; });
+
+            RebootTablet(runtime, shards[0], runtime.AllocateEdgeActor());
+            Cerr << "FFF tablet " << shards[0] << " rebooted" << Endl;
+            runtime.SimulateSleep(TDuration::Seconds(1));
+
+            block.Unblock();
+            block.Stop();
+
+            runtime.GrabEdgeEvent<TEvStatistics::TEvAnalyzeResponse>();
+        }
+
+        return;
 
         // Acquire read snapshot
         NKikimrKqp::TKqpSnapshot snapshot;
