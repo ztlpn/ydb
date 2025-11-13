@@ -106,6 +106,8 @@ TString CreateDatabase(TTestEnv& env, const TString& databaseName,
 
     if (!env.GetServer().GetSettings().UseRealThreads) {
         runtime.SimulateSleep(TDuration::Seconds(1));
+    } else {
+        Sleep(TDuration::Seconds(1));
     }
 
     return fullDbName;
@@ -310,7 +312,9 @@ TTableInfo CreateColumnTable(TTestEnv& env, const TString& databaseName, const T
         << "WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = " << shardCount << ");";
 
     ExecuteYqlScript(env, createTable);
-    runtime.SimulateSleep(TDuration::Seconds(1));
+    if (!env.GetServer().GetSettings().UseRealThreads) {
+        runtime.SimulateSleep(TDuration::Seconds(1));
+    }
 
     TTableInfo tableInfo;
     tableInfo.Path = Sprintf("/Root/%s/%s", databaseName.c_str(), tableName.c_str());
@@ -383,18 +387,24 @@ TTableInfo PrepareColumnTableWithIndexes(TTestEnv& env, const TString& databaseN
         ALTER OBJECT `%s` (TYPE TABLE) SET (ACTION=UPSERT_INDEX, NAME=cms_key, TYPE=COUNT_MIN_SKETCH,
                     FEATURES=`{"column_names" : ['Key']}`);
     )", fullTableName.c_str()));
-    runtime.SimulateSleep(TDuration::Seconds(1));
+    if (!env.GetServer().GetSettings().UseRealThreads) {
+        runtime.SimulateSleep(TDuration::Seconds(1));
+    }
 
     ExecuteYqlScript(env, Sprintf(R"(
         ALTER OBJECT `%s` (TYPE TABLE) SET (ACTION=UPSERT_OPTIONS, `COMPACTION_PLANNER.CLASS_NAME`=`l-buckets`);
     )", fullTableName.c_str()));
-    runtime.SimulateSleep(TDuration::Seconds(1));
+    if (!env.GetServer().GetSettings().UseRealThreads) {
+        runtime.SimulateSleep(TDuration::Seconds(1));
+    }
 
     ExecuteYqlScript(env, Sprintf(R"(
         ALTER OBJECT `%s` (TYPE TABLE) SET (ACTION=UPSERT_INDEX, NAME=cms_value, TYPE=COUNT_MIN_SKETCH,
                     FEATURES=`{"column_names" : ['Value']}`);
     )", fullTableName.c_str()));
-    runtime.SimulateSleep(TDuration::Seconds(1));
+    if (!env.GetServer().GetSettings().UseRealThreads) {
+        runtime.SimulateSleep(TDuration::Seconds(1));
+    }
 
     using TEvBulkUpsertRequest = NGRpcService::TGrpcRequestOperationCall<
         Ydb::Table::BulkUpsertRequest,
