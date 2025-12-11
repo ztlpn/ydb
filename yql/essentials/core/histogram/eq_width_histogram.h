@@ -119,30 +119,19 @@ public:
 #pragma pack(pop)
 
     // Have to specify the number of buckets and type of the values.
-    TEqWidthHistogram(ui32 numBuckets = 1, EHistogramValueType type = EHistogramValueType::Int32);
+    TEqWidthHistogram(ui64 numBuckets = 1, EHistogramValueType type = EHistogramValueType::Int32);
     // From serialized data.
     TEqWidthHistogram(const char* str, size_t size);
 
-    // Adds the given `val` to a histogram.
-    template <typename T>
-    void AddElement(T val) {
-        const auto index = FindBucketIndex(val);
-        // The given `index` in range [0, numBuckets - 1].
-        const T bucketValue = LoadFrom<T>(Buckets_[index].Start);
-        if (!index || (CmpEqual<T>(bucketValue, val) || CmpLess<T>(bucketValue, val))) {
-            Buckets_[index].Count++;
-        } else {
-            Buckets_[index - 1].Count++;
-        }
-    }
+    void AddElement(const char* data, size_t size);
 
     // Returns an index of the bucket which stores the given `val`.
     // Returned index in range [0, numBuckets - 1].
     // Not using `std::lower_bound()` here because need an index to map to `suffix` and `prefix` sum.
     template <typename T>
-    ui32 FindBucketIndex(T val) const {
-        ui32 start = 0;
-        ui32 end = GetNumBuckets() - 1;
+    ui64 FindBucketIndex(T val) const {
+        ui64 start = 0;
+        ui64 end = GetNumBuckets() - 1;
         while (start < end) {
             auto it = start + (end - start + 1) / 2;
             if (CmpLess<T>(val, LoadFrom<T>(Buckets_[it].Start))) {
@@ -155,21 +144,24 @@ public:
     }
 
     // Returns a number of buckets in a histogram.
-    ui32 GetNumBuckets() const {
+    ui64 GetNumBuckets() const {
         return Buckets_.size();
     }
 
     template <typename T>
-    ui32 GetBucketWidth() const {
-        if (ValueType_ == EHistogramValueType::Double) {
+    ui64 GetBucketWidth() const {
+        if (ValueType_ == EHistogramValueType::NotSupported) {
+            Y_ABORT("Unsupported histogram type");
+        } else if (ValueType_ == EHistogramValueType::Double) {
             return 1;
         }
+        Y_ASSERT(GetNumBuckets());
         if (GetNumBuckets() == 1) {
             auto val = LoadFrom<T>(Buckets_.front().Start);
             // to avoid returning zero value and casting negative values
-            return val > 0 ? static_cast<ui32>(val) : 1;
+            return val > 0 ? static_cast<ui64>(val) : 1;
         } else {
-            return static_cast<ui32>(LoadFrom<T>(Buckets_[1].Start) - LoadFrom<T>(Buckets_[0].Start));
+            return static_cast<ui64>(LoadFrom<T>(Buckets_[1].Start) - LoadFrom<T>(Buckets_[0].Start));
         }
     }
 
@@ -179,15 +171,15 @@ public:
     }
 
     // Returns a number of elements in a bucket by the given `index`.
-    ui64 GetNumElementsInBucket(ui32 index) const {
-        Y_ENSURE(index < GetNumBuckets());
+    ui64 GetNumElementsInBucket(ui64 index) const {
+        Y_ASSERT(index < GetNumBuckets());
         return Buckets_[index].Count;
     }
 
     // Returns the start boundary value of a bucket by the given `index`.
     template <typename T>
-    T GetBucketStartBoundary(ui32 index) const {
-        Y_ENSURE(index < GetNumBuckets());
+    T GetBucketStartBoundary(ui64 index) const {
+        Y_ASSERT(index < GetNumBuckets());
         return LoadFrom<T>(Buckets_[index].Start);
     }
 
@@ -197,19 +189,17 @@ public:
         TEqWidthHistogram::TBucketRange range;
         StoreTo<T>(range.Start, rangeStart);
         StoreTo<T>(range.End, rangeEnd);
-        const T start = LoadFrom<T>(range.Start);
-        const T end = LoadFrom<T>(range.End);
-        Y_ENSURE(CmpLess<T>(start, end));
-        const T rangeLen = end - start;
-        WriteUnaligned<ui8[EqWidthHistogramBucketStorageSize]>(Buckets_[0].Start, range.Start);
-        for (ui32 i = 1; i < GetNumBuckets(); ++i) {
+        Y_ASSERT(CmpLess<T>(LoadFrom<T>(range.Start), LoadFrom<T>(range.End)));
+        T rangeLen = LoadFrom<T>(range.End) - LoadFrom<T>(range.Start);
+        std::memcpy(Buckets_[0].Start, range.Start, sizeof(range.Start));
+        for (ui64 i = 1; i < GetNumBuckets(); ++i) {
             const T prevStart = LoadFrom<T>(Buckets_[i - 1].Start);
             StoreTo<T>(Buckets_[i].Start, prevStart + rangeLen);
         }
     }
 
     // Seriailizes to a binary representation
-    TString Serialize() const;
+    std::pair<std::unique_ptr<char>, ui64> Serialize() const;
 
     void Aggregate(const TEqWidthHistogram& other);
 
@@ -223,7 +213,7 @@ private:
         } else if (GetBucketWidth<T>() != other.GetBucketWidth<T>()) {
             return false;
         }
-        for (ui32 i = 0; i < Buckets_.size(); ++i) {
+        for (ui64 i = 0; i < Buckets_.size(); ++i) {
             if (!CmpEqual<T>(LoadFrom<T>(Buckets_[i].Start), other.GetBucketStartBoundary<T>(i))) {
                 return false;
             }
@@ -231,8 +221,21 @@ private:
         return true;
     }
 
+    // Adds the given `val` to a histogram.
+    template <typename T>
+    void AddElementTyped(T val) {
+        const auto index = FindBucketIndex(val);
+        // The given `index` in range [0, numBuckets - 1].
+        const T bucketValue = LoadFrom<T>(Buckets_[index].Start);
+        if (!index || (CmpEqual<T>(bucketValue, val) || CmpLess<T>(bucketValue, val))) {
+            Buckets_[index].Count++;
+        } else {
+            Buckets_[index - 1].Count++;
+        }
+    }
+
     // Returns binary size of the histogram.
-    ui64 GetBinarySize(ui32 nBuckets) const;
+    ui64 GetBinarySize(ui64 nBuckets) const;
     EHistogramValueType ValueType_;
     TVector<TBucket> Buckets_;
 };
@@ -293,8 +296,8 @@ private:
         return sumArray[index - 1];
     }
 
-    void CreatePrefixSum(ui32 numBuckets);
-    void CreateSuffixSum(ui32 numBuckets);
+    void CreatePrefixSum(ui64 numBuckets);
+    void CreateSuffixSum(ui64 numBuckets);
     std::shared_ptr<TEqWidthHistogram> Histogram_;
     TVector<ui64> PrefixSum_;
     TVector<ui64> SuffixSum_;
