@@ -197,7 +197,7 @@ public:
     }
 
     // Seriailizes to a binary representation
-    std::pair<std::unique_ptr<char>, ui64> Serialize() const;
+    TString Serialize() const;
 
     void Aggregate(const TEqWidthHistogram& other);
 
