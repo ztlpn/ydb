@@ -110,6 +110,7 @@ void TEqWidthHistogramEstimator::CreatePrefixSum(ui32 numBuckets) {
     for (ui32 i = 1; i < numBuckets; ++i) {
         PrefixSum_[i] = PrefixSum_[i - 1] + Histogram_->GetNumElementsInBucket(i);
     }
+    Cerr << "PS[-1]:" << PrefixSum_[numBuckets - 1] << " last:" << Histogram_->GetNumElementsInBucket(numBuckets - 1) << Endl;
 }
 
 void TEqWidthHistogramEstimator::CreateSuffixSum(ui32 numBuckets) {
@@ -117,5 +118,6 @@ void TEqWidthHistogramEstimator::CreateSuffixSum(ui32 numBuckets) {
     for (ui32 i = numBuckets - 1; i > 0; --i) {
         SuffixSum_[i - 1] = SuffixSum_[i] + Histogram_->GetNumElementsInBucket(i - 1);
     };
+    Cerr << "SS[0]:" << SuffixSum_[0] << Endl;
 }
 } // namespace NKikimr

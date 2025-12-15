@@ -273,6 +273,7 @@ double NYql::NDq::TPredicateSelectivityComputer::ComputeInequalitySelectivity(co
             }
 
             if (auto histogramEstimator = Stats->ColumnStatistics->Data[attributeName].EqWidthHistogramEstimator) {
+                YQL_CLOG(NOTICE, CoreDq) << "AAA estimating on: " << attributeName;
                 const auto columnType = Stats->ColumnStatistics->Data[attributeName].Type;
                 std::optional<ui64> estimation = EstimateInequalityPredicateByHistogram(right, columnType, histogramEstimator, predicate);
                 if (!estimation.has_value()) {

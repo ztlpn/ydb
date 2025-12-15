@@ -207,6 +207,8 @@ void TAnalyzeActor::HandleStage1(TEvPrivate::TEvAnalyzeScanResult::TPtr& ev) {
             NKikimr::NStat::SIMPLE_COLUMN,
             simpleStats.SerializeAsString());
 
+        SA_LOG_D("FFF COL n:" << col.Name << ", t:" << col.Tag);
+
         for (auto type : supportedStatTypes) {
             auto statEval = IColumnStatisticEval::MaybeCreate(type, simpleStats, col.Type);
             if (!statEval) {

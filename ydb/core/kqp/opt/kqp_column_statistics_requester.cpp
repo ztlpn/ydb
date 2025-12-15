@@ -138,9 +138,19 @@ IGraphTransformer::TStatus TKqpColumnStatisticsRequester::DoTransform(TExprNode:
                 auto columnName = meta.ColumnNameByTag[stat.Req.ColumnTag.value()];
                 auto& columnStatistics = columnStatisticsByTableName[meta.TableName].Data[columnName];
                 if (stat.CountMinSketch.CountMin) {
+                    Cerr << "FFF COLSTAT "
+                        << "p:" << stat.Req.PathId.LocalPathId
+                        << ", cn:" << columnName
+                        << ", cmsElc:" << stat.CountMinSketch.CountMin->GetElementCount()
+                        << Endl;
                     columnStatistics.CountMinSketch = std::move(stat.CountMinSketch.CountMin);
                 }
                 if (stat.EqWidthHistogram.Data) {
+                    Cerr << "FFF COLSTAT "
+                        << "p:" << stat.Req.PathId.LocalPathId
+                        << ", cn:" << columnName
+                        << ", histNumB:" << stat.EqWidthHistogram.Data->GetNumBuckets()
+                        << Endl;
                     columnStatistics.EqWidthHistogramEstimator = std::make_shared<NKikimr::TEqWidthHistogramEstimator>(stat.EqWidthHistogram.Data);
                 }
             }
