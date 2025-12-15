@@ -448,9 +448,8 @@ std::vector<TResponse> GetStatistics(
     auto statServiceId = NStat::MakeStatServiceID(runtime.GetNodeId(nodeIdx));
 
     auto evGet = std::make_unique<TEvStatistics::TEvGetStatistics>();
-    evGet->StatType = statType;
     for (auto tag : columnTags) {
-        evGet->StatRequests.push_back(TRequest{ .PathId = pathId, .ColumnTag = tag });
+        evGet->StatRequests.push_back(TRequest{ .PathId = pathId, .ColumnTag = tag, .Type = statType });
     }
 
     auto sender = runtime.AllocateEdgeActor(nodeIdx);
@@ -580,9 +579,9 @@ ui64 GetRowCount(TTestActorRuntime& runtime, ui32 nodeIndex, TPathId pathId) {
     auto statServiceId = NStat::MakeStatServiceID(runtime.GetNodeId(nodeIndex));
     NStat::TRequest req;
     req.PathId = pathId;
+    req.Type = NStat::EStatType::SIMPLE;
 
     auto evGet = std::make_unique<TEvStatistics::TEvGetStatistics>();
-    evGet->StatType = NStat::EStatType::SIMPLE;
     evGet->StatRequests.push_back(req);
 
     auto sender = runtime.AllocateEdgeActor(nodeIndex);

@@ -42,6 +42,7 @@ enum EStatType {
 struct TRequest {
     TPathId PathId;
     std::optional<ui32> ColumnTag; // not used for simple stat
+    EStatType Type = EStatType::SIMPLE;
 };
 
 struct TResponse {
@@ -142,7 +143,6 @@ struct TEvStatistics {
 
     struct TEvGetStatistics : public TEventLocal<TEvGetStatistics, EvGetStatistics> {
         TString Database;
-        EStatType StatType;
         std::vector<TRequest> StatRequests;
     };
 

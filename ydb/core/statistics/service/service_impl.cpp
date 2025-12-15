@@ -738,7 +738,7 @@ private:
             ui64 queryId = NextLoadQueryCookie++;
             LoadQueriesInFlight[queryId] = std::make_pair(requestId, reqIndex);
 
-            LoadStatistics(database, tablePath, req.PathId, request.StatType, *req.ColumnTag, queryId);
+            LoadStatistics(database, tablePath, req.PathId, req.Type, *req.ColumnTag, queryId);
 
             ++request.ReplyCounter;
             ++reqIndex;
@@ -759,7 +759,6 @@ private:
         auto& request = InFlight[requestId];
         request.ReplyToActorId = ev->Sender;
         request.EvCookie = ev->Cookie;
-        request.StatType = ev->Get()->StatType;
         request.StatRequests.swap(ev->Get()->StatRequests);
 
         if (!EnableStatistics || IsStatisticsDisabledInSA) {
@@ -769,18 +768,30 @@ private:
 
         SA_LOG_D("[TStatService::TEvGetStatistics] RequestId[ " << requestId
             << " ], ReplyToActorId[ " << request.ReplyToActorId
-            << "], StatType[ " << static_cast<ui32>(request.StatType)
             << " ], StatRequestsCount[ " << request.StatRequests.size() << " ]");
 
-        auto navigate = std::make_unique<TNavigate>();
-        navigate->DatabaseName = ev->Get()->Database;
-        navigate->Cookie = requestId;
+        TNavigate::TResultSet baseStatsNavigateItems;
+        TNavigate::TResultSet columnStatsNavigateItems;
         for (const auto& req : request.StatRequests) {
-            AddNavigateEntry(navigate->ResultSet, req.PathId, true);
+            AddNavigateEntry(
+                req.Type == EStatType::SIMPLE ? baseStatsNavigateItems : columnStatsNavigateItems,
+                req.PathId, true);
         }
 
-        ui64 cookie = request.StatType == EStatType::SIMPLE ? 0 : requestId;
-        Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(navigate.release()), 0, cookie);
+        auto sendNavigate = [&](TNavigate::TResultSet& resultSet, ui64 evCookie) {
+            auto navigate = std::make_unique<TNavigate>();
+            navigate->DatabaseName = ev->Get()->Database;
+            navigate->Cookie = requestId;
+            navigate->ResultSet = std::move(resultSet);
+            Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(navigate.release()), 0, evCookie);
+        };
+
+        if (!baseStatsNavigateItems.empty()) {
+            sendNavigate(baseStatsNavigateItems, 0);
+        }
+        if (!columnStatsNavigateItems.empty()) {
+            sendNavigate(columnStatsNavigateItems, requestId);
+        }
     }
 
     void Handle(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
@@ -840,12 +851,19 @@ private:
                 // In case of StatisticsAggregator tablet could not be found,
                 // we need to cancel the current requests. No need to delete column statistic requests.
                 for (auto it = InFlight.begin(); it != InFlight.end();) {
-                    if (it->second.StatType != EStatType::SIMPLE) {
-                        ++it;
-                        continue;
+                    for (size_t i = 0; i < it->second.StatRequests.size(); ++i) {
+                        const auto& req = it->second.StatRequests[i];
+                        auto& resp = it->second.StatResponses.at(i);
+                        if (req.Type == EStatType::SIMPLE) {
+                            resp.Success = false;
+                            --it->second.ReplyCounter;
+                        }
                     }
-                    ReplyFailed(it->first, false);
-                    it = InFlight.erase(it);
+
+                    if (it->second.ReplyCounter == 0) {
+                        ReplyFailed(it->first, false);
+                        it = InFlight.erase(it);
+                    }
                 }
             }
             return;
@@ -1164,11 +1182,12 @@ private:
             return;
         }
         auto& request = itRequest->second;
+        const auto& statRequest = request.StatRequests[requestIndex];
         auto& response = request.StatResponses[requestIndex];
 
         const auto msg = ev->Get();
         if (msg->Success && msg->Data) {
-            switch (request.StatType) {
+            switch (statRequest.Type) {
             case EStatType::SIMPLE_COLUMN: {
                 NKikimrStat::TSimpleColumnStatistics data;
                 response.Success = data.ParseFromString(*msg->Data);
@@ -1189,7 +1208,7 @@ private:
                 break;
             default:
                 SA_LOG_E("TEvLoadStatisticsQueryResponse, request id = " << requestId
-                    << ". Unexpected stat type: " << static_cast<int>(request.StatType));
+                    << ". Unexpected stat type: " << static_cast<int>(statRequest.Type));
                 response.Success = false;
                 break;
             }
@@ -1376,7 +1395,9 @@ private:
             {
                 std::unordered_map<EStatType, size_t> counts;
                 for (const auto& [id, req] : InFlight) {
-                    ++counts[req.StatType];
+                    for (const auto& statReq : req.StatRequests) {
+                        ++counts[statReq.Type];
+                    }
                 }
                 str << "[SIMPLE: " << counts[EStatType::SIMPLE]
                     << ", SIMPLE_COLUMN: " << counts[EStatType::SIMPLE_COLUMN]
@@ -1698,7 +1719,6 @@ private:
         NActors::TActorId ReplyToActorId;
         ui64 EvCookie = 0;
         ui64 SchemeShardId = 0;
-        EStatType StatType = EStatType::SIMPLE;
         std::vector<TRequest> StatRequests;
         std::vector<TResponse> StatResponses;
         size_t ReplyCounter = 0;

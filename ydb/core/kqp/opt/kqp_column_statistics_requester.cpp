@@ -104,13 +104,15 @@ IGraphTransformer::TStatus TKqpColumnStatisticsRequester::DoTransform(TExprNode:
                     continue;
                 }
 
-                NKikimr::NStat::TRequest req;
-                req.ColumnTag = columnsMeta[column].Id;
-                req.PathId = pathId;
-                statRequests.push_back(req);
-
+                auto columnId = columnsMeta[column].Id;
+                statRequests.push_back(
+                    NStat::TRequest{
+                        .PathId = pathId,
+                        .ColumnTag = columnId,
+                        .Type = type,
+                    });
                 tableMetaByPathId[pathId].TableName = table;
-                tableMetaByPathId[pathId].ColumnNameByTag[req.ColumnTag.value()] = column;
+                tableMetaByPathId[pathId].ColumnNameByTag[columnId] = column;
             }
         }
 
@@ -120,7 +122,6 @@ IGraphTransformer::TStatus TKqpColumnStatisticsRequester::DoTransform(TExprNode:
 
         auto request = MakeHolder<NStat::TEvStatistics::TEvGetStatistics>();
         request->Database = Database;
-        request->StatType = type;
         request->StatRequests = std::move(statRequests);
 
         auto callback = [tableMetaByPathId = std::move(tableMetaByPathId)]
