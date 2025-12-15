@@ -263,6 +263,12 @@ double NYql::NDq::TPredicateSelectivityComputer::ComputeInequalitySelectivity(co
             }
 
             if (!Stats || !Stats->ColumnStatistics) {
+                if (CollectColumnsStatUsedMembers) {
+                    if (auto maybeMember = IsMember(left)) {
+                        ColumnStatsUsedMembers.AddEquality(*maybeMember.Get());
+                    }
+                }
+
                 return DefaultSelectivity(Stats, attributeName);
             }
 

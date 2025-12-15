@@ -99,11 +99,15 @@ IGraphTransformer::TStatus TKqpColumnStatisticsRequester::DoTransform(TExprNode:
             }
 
             auto columnId = columnsMeta[column].Id;
-            getStatisticsRequest->StatRequests.push_back(
-                NStat::TRequest{
-                    .PathId = pathId, .ColumnTag = columnId,
-                    .Type = NStat::EStatType::COUNT_MIN_SKETCH,
-                });
+            for (auto statType : { NStat::EStatType::SIMPLE_COLUMN
+                                 , NStat::EStatType::COUNT_MIN_SKETCH
+                                 , NStat::EStatType::EQ_WIDTH_HISTOGRAM}) {
+                getStatisticsRequest->StatRequests.push_back(
+                    NStat::TRequest{
+                        .PathId = pathId, .ColumnTag = columnId,
+                        .Type = statType,
+                    });
+            }
             tableMetaByPathId[pathId].TableName = table;
             tableMetaByPathId[pathId].ColumnNameByTag[columnId] = column;
         }
@@ -131,7 +135,16 @@ IGraphTransformer::TStatus TKqpColumnStatisticsRequester::DoTransform(TExprNode:
             auto meta = tableMetaByPathId[stat.Req.PathId];
             auto columnName = meta.ColumnNameByTag[stat.Req.ColumnTag.value()];
             auto& columnStatistics = columnStatisticsByTableName[meta.TableName].Data[columnName];
-            columnStatistics.CountMinSketch = std::move(stat.CountMinSketch.CountMin);
+            if (stat.SimpleColumn.Data && stat.SimpleColumn.Data->HasCountDistinct()) {
+                columnStatistics.NumUniqueVals = stat.SimpleColumn.Data->GetCountDistinct();
+            }
+            if (stat.CountMinSketch.CountMin) {
+                columnStatistics.CountMinSketch = std::move(stat.CountMinSketch.CountMin);
+            }
+            if (stat.EqWidthHistogram.Data) {
+                columnStatistics.EqWidthHistogramEstimator =
+                    std::make_shared<TEqWidthHistogramEstimator>(std::move(stat.EqWidthHistogram.Data));
+            }
         }
 
         promise.SetValue(TColumnStatisticsResponse{.ColumnStatisticsByTableName = std::move(columnStatisticsByTableName)});
