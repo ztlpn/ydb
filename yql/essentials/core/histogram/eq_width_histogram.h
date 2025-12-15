@@ -333,6 +333,7 @@ private:
     template <typename T>
     ui64 EstimateOrEqual(T val, const TVector<ui64>& sumArray) const {
         const auto index = Histogram_->FindBucketIndex(val);
+        Cerr << "FFF EST v:" << val << " i:" << index << " sa:" << sumArray[index] << Endl;
         return sumArray[index];
     }
 

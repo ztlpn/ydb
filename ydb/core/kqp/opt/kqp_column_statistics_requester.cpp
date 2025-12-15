@@ -136,12 +136,27 @@ IGraphTransformer::TStatus TKqpColumnStatisticsRequester::DoTransform(TExprNode:
             auto columnName = meta.ColumnNameByTag[stat.Req.ColumnTag.value()];
             auto& columnStatistics = columnStatisticsByTableName[meta.TableName].Data[columnName];
             if (stat.SimpleColumn.Data && stat.SimpleColumn.Data->HasCountDistinct()) {
+                Cerr << "FFF COLSTAT "
+                    << "p:" << stat.Req.PathId.LocalPathId
+                    << ", cn:" << columnName
+                    << ", cd:" << stat.SimpleColumn.Data->GetCountDistinct()
+                    << Endl;
                 columnStatistics.NumUniqueVals = stat.SimpleColumn.Data->GetCountDistinct();
             }
             if (stat.CountMinSketch.CountMin) {
+                Cerr << "FFF COLSTAT "
+                    << "p:" << stat.Req.PathId.LocalPathId
+                    << ", cn:" << columnName
+                    << ", cmsElc:" << stat.CountMinSketch.CountMin->GetElementCount()
+                    << Endl;
                 columnStatistics.CountMinSketch = std::move(stat.CountMinSketch.CountMin);
             }
             if (stat.EqWidthHistogram.Data) {
+                Cerr << "FFF COLSTAT "
+                    << "p:" << stat.Req.PathId.LocalPathId
+                    << ", cn:" << columnName
+                    << ", histNumB:" << stat.EqWidthHistogram.Data->GetNumBuckets()
+                    << Endl;
                 columnStatistics.EqWidthHistogramEstimator =
                     std::make_shared<TEqWidthHistogramEstimator>(std::move(stat.EqWidthHistogram.Data));
             }
