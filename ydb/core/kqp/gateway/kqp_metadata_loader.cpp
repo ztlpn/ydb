@@ -1164,10 +1164,10 @@ NThreading::TFuture<TTableMetadataResult> TKqpTableMetadataLoader::LoadTableMeta
 
         NKikimr::NStat::TRequest t;
         t.PathId = NKikimr::TPathId(result.Metadata->PathId.OwnerId(), result.Metadata->PathId.TableId());
+        t.Type = NStat::EStatType::SIMPLE;
 
         auto event = MakeHolder<NStat::TEvStatistics::TEvGetStatistics>();
         event->Database = database;
-        event->StatType = NKikimr::NStat::EStatType::SIMPLE;
         event->StatRequests.push_back(t);
 
         auto statServiceId = NStat::MakeStatServiceID(actorSystem->NodeId);

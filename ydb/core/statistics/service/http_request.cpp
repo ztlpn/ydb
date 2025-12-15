@@ -259,10 +259,10 @@ void THttpRequest::DoProbeDoCountMinSketch(const TNavigate::TEntry& entry) {
     for (const auto& [_, tableInfo]: entry.Columns) {
         if (tableInfo.Name == columnName) {
             auto request = std::make_unique<TEvStatistics::TEvGetStatistics>();
-            request->StatType = EStatType::COUNT_MIN_SKETCH;
             TRequest req;
             req.PathId = entry.TableId.PathId;
             req.ColumnTag = tableInfo.Id;
+            req.Type = EStatType::COUNT_MIN_SKETCH;
             request->StatRequests.emplace_back(std::move(req));
 
             const auto typeId = tableInfo.PType.GetTypeId();
@@ -277,9 +277,9 @@ void THttpRequest::DoProbeDoCountMinSketch(const TNavigate::TEntry& entry) {
 
 void THttpRequest::DoProbeBaseStats(const TNavigate::TEntry& entry) {
     auto request = std::make_unique<TEvStatistics::TEvGetStatistics>();
-    request->StatType = EStatType::SIMPLE;
     TRequest req;
     req.PathId = entry.TableId.PathId;
+    req.Type = EStatType::SIMPLE;
     request->StatRequests.emplace_back(std::move(req));
     const auto statService = MakeStatServiceID(SelfId().NodeId());
     Send(statService, request.release());

@@ -82,7 +82,6 @@ IGraphTransformer::TStatus TKqpColumnStatisticsRequester::DoTransform(TExprNode:
     // TODO: Add other statistics, not only COUNT_MIN_SKETCH.
     auto getStatisticsRequest = MakeHolder<NStat::TEvStatistics::TEvGetStatistics>();
     getStatisticsRequest->Database = Database;
-    getStatisticsRequest->StatType = NKikimr::NStat::EStatType::COUNT_MIN_SKETCH;
 
     for (const auto& [table, columns]: ColumnsByTableName) {
         auto tableMeta = Tables.GetTable(Cluster, table).Metadata;
@@ -99,13 +98,14 @@ IGraphTransformer::TStatus TKqpColumnStatisticsRequester::DoTransform(TExprNode:
                 continue;
             }
 
-            NKikimr::NStat::TRequest req;
-            req.ColumnTag = columnsMeta[column].Id;
-            req.PathId = pathId;
-            getStatisticsRequest->StatRequests.push_back(std::move(req));
-
+            auto columnId = columnsMeta[column].Id;
+            getStatisticsRequest->StatRequests.push_back(
+                NStat::TRequest{
+                    .PathId = pathId, .ColumnTag = columnId,
+                    .Type = NStat::EStatType::COUNT_MIN_SKETCH,
+                });
             tableMetaByPathId[pathId].TableName = table;
-            tableMetaByPathId[pathId].ColumnNameByTag[req.ColumnTag.value()] = column;
+            tableMetaByPathId[pathId].ColumnNameByTag[columnId] = column;
         }
     }
 
