@@ -26,8 +26,16 @@ inline bool CmpEqual(T left, T right) {
     return left == right;
 }
 template <>
+inline bool CmpEqual(float left, float right) {
+    float diff = std::fabs(left - right);
+    float scale = std::max({1.0f, std::fabs(left), std::fabs(right)});
+    return diff <= std::numeric_limits<float>::epsilon() * scale;
+}
+template <>
 inline bool CmpEqual(double left, double right) {
-    return std::fabs(left - right) < std::numeric_limits<double>::epsilon();
+    double diff = std::fabs(left - right);
+    double scale = std::max({1.0, std::fabs(left), std::fabs(right)});
+    return diff <= std::numeric_limits<double>::epsilon() * scale;
 }
 template <typename T>
 inline bool CmpLess(T left, T right) {
@@ -35,29 +43,40 @@ inline bool CmpLess(T left, T right) {
 }
 
 // Represents value types supported by histogram.
-enum class EHistogramValueType: ui8 { Int16,
+enum class EHistogramValueType: ui8 { Int8,
+                                      Int16,
                                       Int32,
                                       Int64,
+                                      Uint8,
                                       Uint16,
                                       Uint32,
                                       Uint64,
+                                      Float,
                                       Double,
                                       NotSupported };
 
 // clang-format off
 #define KNOWN_FIXED_HISTOGRAM_TYPES(xx) \
+xx(Int8, i8)                            \
 xx(Int16, i16)                          \
 xx(Int32, i32)                          \
 xx(Int64, i64)                          \
+xx(Uint8, ui8)                          \
 xx(Uint16, ui16)                        \
 xx(Uint32, ui32)                        \
 xx(Uint64, ui64)                        \
+xx(Float, float)                        \
 xx(Double, double)
 // clang-format on
 
 template <typename T>
 inline std::optional<EHistogramValueType> GetHistogramValueType() {
     return std::nullopt;
+}
+
+template <>
+inline std::optional<EHistogramValueType> GetHistogramValueType<i8>() {
+    return EHistogramValueType::Int8;
 }
 
 template <>
@@ -76,6 +95,11 @@ inline std::optional<EHistogramValueType> GetHistogramValueType<i64>() {
 }
 
 template <>
+inline std::optional<EHistogramValueType> GetHistogramValueType<ui8>() {
+    return EHistogramValueType::Uint8;
+}
+
+template <>
 inline std::optional<EHistogramValueType> GetHistogramValueType<ui16>() {
     return EHistogramValueType::Uint16;
 }
@@ -88,6 +112,11 @@ inline std::optional<EHistogramValueType> GetHistogramValueType<ui32>() {
 template <>
 inline std::optional<EHistogramValueType> GetHistogramValueType<ui64>() {
     return EHistogramValueType::Uint64;
+}
+
+template <>
+inline std::optional<EHistogramValueType> GetHistogramValueType<float>() {
+    return EHistogramValueType::Float;
 }
 
 template <>
@@ -161,7 +190,7 @@ public:
 
     template <typename T>
     ui32 GetBucketWidth() const {
-        if (ValueType_ == EHistogramValueType::Double) {
+        if (ValueType_ == EHistogramValueType::Float || ValueType_ == EHistogramValueType::Double) {
             return 1;
         }
         if (GetNumBuckets() == 1) {
@@ -201,10 +230,12 @@ public:
         const T end = LoadFrom<T>(range.End);
         Y_ENSURE(CmpLess<T>(start, end));
         const T rangeLen = end - start;
+        T bucketWidth = rangeLen / static_cast<T>(GetNumBuckets());
+        Y_ENSURE(start + bucketWidth > start); // non-zero positive width of each bucket
         WriteUnaligned<ui8[EqWidthHistogramBucketStorageSize]>(Buckets_[0].Start, range.Start);
         for (ui32 i = 1; i < GetNumBuckets(); ++i) {
             const T prevStart = LoadFrom<T>(Buckets_[i - 1].Start);
-            StoreTo<T>(Buckets_[i].Start, prevStart + rangeLen);
+            StoreTo<T>(Buckets_[i].Start, prevStart + bucketWidth);
         }
     }
 
