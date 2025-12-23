@@ -724,12 +724,10 @@ private:
         }
 
         auto& request = it->second;
-        request.StatResponses.reserve(request.StatRequests.size());
         ui32 reqIndex = 0;
 
         for (const auto& req : request.StatRequests) {
-            auto& response = request.StatResponses.emplace_back();
-            response.Req = req;
+            auto& response = request.StatResponses.at(reqIndex);
             if (!req.ColumnTag) {
                 response.Success = false;
                 ++reqIndex;
@@ -760,6 +758,7 @@ private:
         request.ReplyToActorId = ev->Sender;
         request.EvCookie = ev->Cookie;
         request.StatRequests.swap(ev->Get()->StatRequests);
+        request.InitResponses();
 
         if (!EnableStatistics || IsStatisticsDisabledInSA) {
             ReplyFailed(requestId, true);
@@ -1722,6 +1721,17 @@ private:
         std::vector<TRequest> StatRequests;
         std::vector<TResponse> StatResponses;
         size_t ReplyCounter = 0;
+
+        void InitResponses() {
+            Y_ENSURE(StatResponses.empty());
+            StatResponses.reserve(StatRequests.size());
+            for (const auto& req: StatRequests) {
+                StatResponses.push_back(TResponse{
+                    .Success = false,
+                    .Req = req,
+                });
+            }
+        }
     };
     std::unordered_map<ui64, TRequestState> InFlight; // request id -> state
     ui64 NextRequestId = 1;
