@@ -211,13 +211,19 @@ void TKqpComputeActor::HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecutio
         TStringBuf runStatus =
             ProcessOutputsState.LastRunStatus == ERunStatus::Finished ? "Finished" :
             ProcessOutputsState.LastRunStatus == ERunStatus::PendingInput ? "PendingInput" : "PendingOutput";
+        TStringBuf computeState =
+            State == NDqProto::COMPUTE_STATE_FINISHED ? "Finished" :
+            State == NDqProto::COMPUTE_STATE_EXECUTING ? "Executing" : "Unknown";
         CA_LOG_W("Slow compute actor"
             << ", self=" << this->SelfId()
             << ", task=" << GetTask().GetId()
             << ", elapsed=" << elapsed
+            << ", compute_state=" << computeState
             << ", run_status=" << runStatus
             << ", last_run_time=" << ProcessOutputsState.LastRunTime
             << ", inflight=" << ProcessOutputsState.Inflight
+            << ", has_data_to_send=" << ProcessOutputsState.HasDataToSend
+            << ", channels_ready=" << ProcessOutputsState.ChannelsReady
             << (sources.empty() ? "" : (TStringBuilder() << ", sources=[" << sources << "]").data())
             << (channels.empty() ? "" : (TStringBuilder() << ", channels=[" << channels << "]").data()));
     }
