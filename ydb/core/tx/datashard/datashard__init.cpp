@@ -709,6 +709,8 @@ bool TDataShard::TTxInit::ReadEverything(TTransactionContext &txc) {
         }
     }
 
+    LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+        "FFF " << Self->TabletID() << " GEN " << Self->Generation() << " SubscribeNewLocks");
     Self->SubscribeNewLocks();
 
     Self->ScheduleRemoveAbandonedLockChanges();

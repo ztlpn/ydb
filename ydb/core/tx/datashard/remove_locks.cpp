@@ -48,6 +48,28 @@ void TDataShard::Handle(TEvLongTxService::TEvLockStatus::TPtr& ev, const TActorC
     }
 }
 
+void TDataShard::HandleInactive(TEvLongTxService::TEvLockStatus::TPtr& ev) {
+    auto* msg = ev->Get();
+    LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+        "Handle TEvLockStatus: at tablet# " << TabletID()
+        << " (inactive gen: " << Generation() << ")"
+        << ", sender: " << ev->Sender
+        << ", LockId: " << msg->Record.GetLockId()
+        << ", LockNode: " << msg->Record.GetLockNode()
+        << ", Status: " << msg->Record.GetStatus());
+
+    const ui64 lockId = msg->Record.GetLockId();
+    switch (msg->Record.GetStatus()) {
+        case NKikimrLongTxService::TEvLockStatus::STATUS_NOT_FOUND:
+        case NKikimrLongTxService::TEvLockStatus::STATUS_UNAVAILABLE:
+            Execute(new TTxRemoveLock(this, lockId));
+            break;
+
+        default:
+            break;
+    }
+}
+
 void TDataShard::SubscribeNewLocks(const TActorContext&) {
     SubscribeNewLocks();
 }

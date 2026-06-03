@@ -1468,6 +1468,7 @@ class TDataShard
     void Handle(TEvDataShard::TEvApplyReplicationChanges::TPtr& ev, const TActorContext& ctx);
 
     void Handle(TEvLongTxService::TEvLockStatus::TPtr& ev, const TActorContext& ctx);
+    void HandleInactive(TEvLongTxService::TEvLockStatus::TPtr& ev);
 
     void Handle(TEvDataShard::TEvGetOpenTxs::TPtr& ev, const TActorContext& ctx);
 
@@ -3306,7 +3307,7 @@ protected:
             HFuncTraced(TEvPrivate::TEvRemoveSchemaSnapshots, Handle);
             HFunc(TEvPrivate::TEvBuildTableStatsResult, Handle);
             HFunc(TEvPrivate::TEvBuildTableStatsError, Handle);
-            HFunc(TEvLongTxService::TEvLockStatus, Handle);
+            hFunc(TEvLongTxService::TEvLockStatus, HandleInactive);
         default:
             if (!HandleDefaultEvents(ev, SelfId())) {
                 ALOG_WARN(NKikimrServices::TX_DATASHARD, "TDataShard::StateInactive unhandled event type: " << ev->GetTypeRewrite()
