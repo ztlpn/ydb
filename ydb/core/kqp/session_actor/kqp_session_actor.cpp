@@ -209,6 +209,13 @@ private:
 
 class TKqpSessionActor : public TActorBootstrapped<TKqpSessionActor>, IActorExceptionHandler {
 
+    struct TEvPrivate {
+        enum EEv {
+            EvCheckSlowTransactions = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
+        };
+        struct TEvCheckSlowTransactions : public TEventLocal<TEvCheckSlowTransactions, EvCheckSlowTransactions> {};
+    };
+
     class TTimerGuard {
     public:
         TTimerGuard(TKqpSessionActor* this_)
@@ -293,6 +300,7 @@ public:
 
         RequestControls.Reqister(TlsActivationContext->AsActorContext());
         Become(&TKqpSessionActor::ReadyState);
+        Schedule(SlowTxCheckInterval, new TEvPrivate::TEvCheckSlowTransactions());
     }
 
     TString LogPrefix() const {
@@ -3551,6 +3559,7 @@ public:
                 hFunc(TEvKqp::TEvContinueShutdown, Handle);
                 hFunc(TEvKqpSnapshot::TEvCreateSnapshotResponse, Handle);
                 hFunc(TEvKqp::TEvQueryRequest, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowTransactions, HandleCheckSlowTransactions);
 
                 hFunc(TEvKqp::TEvCloseSessionRequest, HandleReady);
                 hFunc(TEvKqp::TEvCancelQueryRequest, Handle);
@@ -3590,6 +3599,7 @@ public:
                 hFunc(TEvKqpSnapshot::TEvCreateSnapshotResponse, Handle);
                 hFunc(TEvKqp::TEvQueryRequest, Handle);
                 hFunc(TEvTxUserProxy::TEvAllocateTxIdResult, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowTransactions, HandleCheckSlowTransactions);
 
                 hFunc(TEvents::TEvUndelivered, Handle);
                 hFunc(NWorkload::TEvContinueRequest, Handle);
@@ -3659,6 +3669,7 @@ public:
                 hFunc(TEvKqp::TEvCloseSessionResponse, HandleCleanup);
                 hFunc(TEvKqp::TEvQueryResponse, HandleNoop);
                 hFunc(TEvKqpExecuter::TEvExecuterProgress, HandleNoop)
+                hFunc(TEvPrivate::TEvCheckSlowTransactions, HandleCheckSlowTransactions);
             default:
                 UnexpectedEvent("CleanupState", ev);
             }
@@ -3678,6 +3689,7 @@ public:
                 hFunc(TEvKqpSnapshot::TEvCreateSnapshotResponse, Handle);
                 hFunc(NWorkload::TEvContinueRequest, HandleNoop);
                 hFunc(TEvKqp::TEvQueryRequest, HandleFinalCleanup);
+                hFunc(TEvPrivate::TEvCheckSlowTransactions, HandleCheckSlowTransactions);
             }
         } catch (const yexception& ex) {
             InternalError(ex.what());
@@ -3688,6 +3700,51 @@ public:
     }
 
 private:
+
+    void HandleCheckSlowTransactions(TEvPrivate::TEvCheckSlowTransactions::TPtr&) {
+        TInstant now = AppData()->TimeProvider->Now();
+        Transactions.ForEachActive([&](const TTxId& txId, const TKqpTransactionContext& txCtx) {
+            if (!txCtx.LockHandle.GetLockId()) {
+                return;
+            }
+
+            bool isCurrentTx = QueryState && QueryState->TxCtx.Get() == &txCtx;
+
+            TString waitingOn;
+            if (isCurrentTx) {
+                TDuration queryDuration = now - txCtx.BeginQueryTime;
+                if (queryDuration < SlowTxThreshold) {
+                    return;
+                }
+                if (ExecuterId) {
+                    waitingOn = TStringBuilder() << "executer " << ExecuterId
+                        << ", query_duration=" << queryDuration;
+                } else {
+                    waitingOn = TStringBuilder() << "pre-execution (session_state=" << CurrentStateFuncName()
+                        << "), query_duration=" << queryDuration;
+                }
+            } else {
+                TDuration idleDuration = now - txCtx.LastAccessTime;
+                if (idleDuration < SlowTxThreshold) {
+                    return;
+                }
+                waitingOn = TStringBuilder() << "idle between statements, idle_duration=" << idleDuration;
+            }
+
+            STLOG_W("Slow transaction",
+                (tx_id, txId),
+                (lock_id, txCtx.LockHandle.GetLockId()),
+                (isolation_level, txCtx.EffectiveIsolationLevel ? NKqpProto::EIsolationLevel_Name(*txCtx.EffectiveIsolationLevel) : TString("unset")),
+                (queries_count, txCtx.QueriesCount),
+                (tx_age, now - txCtx.CreationTime),
+                (waiting_on, waitingOn),
+                (trace_id, TraceId()));
+        });
+        Schedule(SlowTxCheckInterval, new TEvPrivate::TEvCheckSlowTransactions());
+    }
+
+    static constexpr TDuration SlowTxThreshold = TDuration::Seconds(5);
+    static constexpr TDuration SlowTxCheckInterval = TDuration::Seconds(5);
 
     TString CurrentStateFuncName() const {
         const auto& func = CurrentStateFunc();

@@ -467,6 +467,13 @@ public:
         Active.clear();
     }
 
+    template<typename TFunc>
+    void ForEachActive(TFunc&& func) const {
+        for (const auto& [txId, txCtx] : Active) {
+            func(txId, *txCtx);
+        }
+    }
+
     size_t ToBeAbortedSize() {
         return ToBeAborted.size();
     }

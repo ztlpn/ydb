@@ -276,6 +276,7 @@ public:
                 IgnoreFunc(TEvInterconnect::TEvNodeConnected);
                 IgnoreFunc(NFq::TEvCheckpointCoordinator::TEvZeroCheckpointDone);
                 IgnoreFunc(NFq::TEvCheckpointCoordinator::TEvRaiseTransientIssues);
+                IgnoreFunc(TEvPrivate::TEvCheckSlowExecution);
                 default:
                     UnexpectedEvent("FinalizeState", ev->GetTypeRewrite());
             }
@@ -363,6 +364,7 @@ public:
                 hFunc(NSchemeShard::TEvSchemeShard::TEvDescribeSchemeResult, HandlePartitionStats);
                 hFunc(TEvKqp::TEvAbortExecution, HandleAbortExecution);
                 hFunc(TEvKqpBuffer::TEvError, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
                 default:
                     UnexpectedEvent("WaitResolveState", ev->GetTypeRewrite());
             }
@@ -375,9 +377,38 @@ public:
         ReportEventElapsedTime();
     }
 
+public:
+    void OnHandleReady() {
+        Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
+    }
+
 private:
     bool IsCancelAfterAllowed(const TEvKqp::TEvAbortExecution::TPtr& ev) const {
         return ReadOnlyTx || ev->Get()->Record.GetStatusCode() != NYql::NDqProto::StatusIds::CANCELLED;
+    }
+
+    void HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecution::TPtr&) {
+        TDuration elapsed = TAppData::TimeProvider->Now() - StartTime;
+        if (elapsed >= SlowExecutionThreshold) {
+            TStringBuilder pendingActors;
+            TStringBuilder pendingTasks;
+            if (Planner) {
+                for (const auto& [actorId, _] : Planner->GetPendingComputeActors()) {
+                    pendingActors << actorId << " ";
+                }
+                for (const auto taskId : Planner->GetPendingComputeTasks()) {
+                    pendingTasks << taskId << " ";
+                }
+            }
+            KQP_STLOG_W(KQPDATA, "Slow execution",
+                (state, CurrentStateFuncName()),
+                (elapsed, elapsed),
+                (lock_tx_id, Request.AcquireLocksTxId),
+                (pending_compute_actors, pendingActors),
+                (pending_compute_tasks, pendingTasks),
+                (trace_id, TraceId()));
+        }
+        Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
     }
 
     TString CurrentStateFuncName() const override {
@@ -415,6 +446,7 @@ private:
                 hFunc(NFq::TEvCheckpointCoordinator::TEvZeroCheckpointDone, Handle);
                 hFunc(NFq::TEvCheckpointCoordinator::TEvRaiseTransientIssues, Handle);
                 hFunc(NActors::NMon::TEvHttpInfo, HandleHttpInfo);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
                 IgnoreFunc(TEvInterconnect::TEvNodeConnected);
                 default:
                     UnexpectedEvent("ExecuteState", ev->GetTypeRewrite());
@@ -833,6 +865,7 @@ private:
                 hFunc(NLongTxService::TEvLongTxService::TEvAcquireReadSnapshotResult, Handle);
                 hFunc(TEvKqp::TEvAbortExecution, HandleAbortExecution);
                 hFunc(TEvKqpBuffer::TEvError, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
                 default:
                     UnexpectedEvent("WaitSnapshotState", ev->GetTypeRewrite());
             }
@@ -976,6 +1009,7 @@ private:
             hFunc(TEvInterconnect::TEvNodeDisconnected, HandleShutdown);
             hFunc(TEvents::TEvPoison, HandleShutdown);
             hFunc(TEvDq::TEvAbortExecution, HandleShutdown);
+            IgnoreFunc(TEvPrivate::TEvCheckSlowExecution);
             default:
                 KQP_STLOG_E(KQPDATA, "Unexpected event while waiting for shutdown",
                     (event_type, ev->GetTypeName()), // ignore all other events
@@ -1256,6 +1290,9 @@ private:
 
     NKikimrConfig::TQueryServiceConfig QueryServiceConfig;
     ui64 Generation = 0;
+
+    static constexpr TDuration SlowExecutionThreshold = TDuration::Seconds(5);
+    static constexpr TDuration SlowExecutionCheckInterval = TDuration::Seconds(5);
 };
 
 } // namespace

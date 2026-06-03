@@ -85,7 +85,10 @@ struct TEvPrivate {
         EvRetry = EventSpaceBegin(TEvents::ES_PRIVATE),
         EvResourcesSnapshot,
         EvReattachToShard,
+        EvCheckSlowExecution,
     };
+
+    struct TEvCheckSlowExecution : public TEventLocal<TEvCheckSlowExecution, EEv::EvCheckSlowExecution> {};
 
     struct TEvRetry : public TEventLocal<TEvRetry, EEv::EvRetry> {
         ui32 RequestId;
@@ -1107,7 +1110,12 @@ protected:
         YQL_ENSURE(Stats);
 
         Stats->StartTs = now;
+
+        static_cast<TDerived*>(this)->OnHandleReady();
     }
+
+    // Override in derived class to perform additional initialization after HandleReady.
+    void OnHandleReady() {}
 
 protected:
     bool CheckExecutionComplete() {
