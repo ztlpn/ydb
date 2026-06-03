@@ -24,6 +24,7 @@ private:
     struct TEvPrivate {
         enum EEv {
             EvRetryLock = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
+            EvCheckSlowLocks,
         };
 
         struct TEvRetryLock : public TEventLocal<TEvRetryLock, EvRetryLock> {
@@ -33,6 +34,8 @@ private:
 
             const ui64 RequestId;
         };
+
+        struct TEvCheckSlowLocks : public TEventLocal<TEvCheckSlowLocks, EvCheckSlowLocks> {};
     };
 
     struct TLockState {
@@ -71,6 +74,7 @@ public:
 
         Settings.Counters->StreamLookupActorsCount->Inc();
         Become(&TKqpBufferLockActor::StateFunc);
+        Schedule(SlowLockCheckInterval, new TEvPrivate::TEvCheckSlowLocks());
     }
 
     static constexpr char ActorName[] = "KQP_BUFFER_LOCK_ACTOR";
@@ -130,6 +134,7 @@ public:
                 hFunc(NEvents::TDataEvents::TEvLockRowsResult, Handle);
                 hFunc(TEvPipeCache::TEvDeliveryProblem, Handle);
                 hFunc(TEvPrivate::TEvRetryLock, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowLocks, Handle);
             default:
                 RuntimeError(
                     NYql::NDqProto::StatusIds::INTERNAL_ERROR,
@@ -488,6 +493,22 @@ public:
         LockIdToState.erase(failedRequestId);
     }
 
+    void Handle(TEvPrivate::TEvCheckSlowLocks::TPtr&) {
+        TInstant now = AppData()->TimeProvider->Now();
+        for (const auto& [requestId, sendTime] : LockSendTime) {
+            TDuration elapsed = now - sendTime;
+            if (elapsed >= SlowLockThreshold) {
+                const auto& requestState = LockIdToState.at(requestId);
+                CA_LOG_W("Slow lock request: table=" << Settings.TablePath
+                    << ", requestId=" << requestId
+                    << ", shardId=" << requestState.ShardId
+                    << ", lockId=" << Settings.LockTxId
+                    << ", elapsed=" << elapsed);
+            }
+        }
+        Schedule(SlowLockCheckInterval, new TEvPrivate::TEvCheckSlowLocks());
+    }
+
     void RuntimeError(
             NYql::NDqProto::StatusIds::StatusCode statusCode,
             NYql::EYqlIssueCode id,
@@ -528,6 +549,9 @@ public:
     }
 
 private:
+    static constexpr TDuration SlowLockThreshold = TDuration::Seconds(5);
+    static constexpr TDuration SlowLockCheckInterval = TDuration::Seconds(5);
+
     TKqpBufferLockSettings Settings;
     TPartitioning::TCPtr Partitioning;
     const TString LogPrefix;

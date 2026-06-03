@@ -124,6 +124,9 @@ public:
         Counters->StreamLookupActorsCount->Inc();
         ResolveTableShards();
         Become(&TKqpStreamLookupActor::StateFunc);
+        if (StreamLockWorker) {
+            Schedule(SlowLockCheckInterval, new TEvPrivate::TEvCheckSlowLocks());
+        }
     }
 
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
@@ -392,11 +395,14 @@ private:
         enum EEv {
             EvRetryRead = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
             EvRetryLock,
-            EvSchemeCacheRequestTimeout
+            EvSchemeCacheRequestTimeout,
+            EvCheckSlowLocks,
         };
 
         struct TEvSchemeCacheRequestTimeout : public TEventLocal<TEvSchemeCacheRequestTimeout, EvSchemeCacheRequestTimeout> {
         };
+
+        struct TEvCheckSlowLocks : public TEventLocal<TEvCheckSlowLocks, EvCheckSlowLocks> {};
 
         struct TEvRetryRead : public TEventLocal<TEvRetryRead, EvRetryRead> {
             explicit TEvRetryRead(ui64 readId, ui64 lastSeqNo, bool instantStart = false)
@@ -552,6 +558,7 @@ private:
                 hFunc(TEvPrivate::TEvSchemeCacheRequestTimeout, Handle);
                 hFunc(TEvPrivate::TEvRetryRead, Handle);
                 hFunc(TEvPrivate::TEvRetryLock, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowLocks, Handle);
                 hFunc(NEvents::TDataEvents::TEvLockRowsResult, Handle);
                 IgnoreFunc(TEvTxProxySchemeCache::TEvInvalidateTableResult);
                 default:
@@ -1229,6 +1236,23 @@ private:
         }
     }
 
+    void Handle(TEvPrivate::TEvCheckSlowLocks::TPtr&) {
+        TInstant now = AppData()->TimeProvider->Now();
+        for (const auto& [requestId, sendTime] : LockSendTime) {
+            TDuration elapsed = now - sendTime;
+            if (elapsed >= SlowLockThreshold) {
+                auto lockIt = Reads.findLock(requestId);
+                ui64 shardId = (lockIt != Reads.endLocks()) ? lockIt->second.ShardId : 0;
+                CA_LOG_W("Slow lock request: table=" << StreamLookupWorker->GetTablePath()
+                    << ", requestId=" << requestId
+                    << ", shardId=" << shardId
+                    << ", lockId=" << LockTxId
+                    << ", elapsed=" << elapsed);
+            }
+        }
+        Schedule(SlowLockCheckInterval, new TEvPrivate::TEvCheckSlowLocks());
+    }
+
     void ResolveTableShards() {
         if (ResolveShardsInProgress) {
             return;
@@ -1348,6 +1372,9 @@ private:
     NWilson::TSpan LookupActorStateSpan;
 
     THashMap<ui64, TInstant> LockSendTime;
+
+    static constexpr TDuration SlowLockThreshold = TDuration::Seconds(5);
+    static constexpr TDuration SlowLockCheckInterval = TDuration::Seconds(5);
 };
 
 } // namespace
