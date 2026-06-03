@@ -503,7 +503,7 @@ void TLongTxServiceActor::Handle(TEvLongTxService::TEvRegisterLock::TPtr& ev) {
     auto* msg = ev->Get();
     ui64 lockId = msg->LockId;
     TInstant lockTimestamp = msg->LockTimestamp;
-    TXLOG_DEBUG("Received TEvRegisterLock for LockId# " << lockId << " LockTimestamp# " << lockTimestamp);
+    TXLOG_NOTICE("FFF Received TEvRegisterLock for LockId# " << lockId << " LockTimestamp# " << lockTimestamp);
 
     Y_ABORT_UNLESS(lockId, "Unexpected registration of a zero LockId");
 
@@ -517,7 +517,7 @@ void TLongTxServiceActor::Handle(TEvLongTxService::TEvRegisterLock::TPtr& ev) {
 void TLongTxServiceActor::Handle(TEvLongTxService::TEvUnregisterLock::TPtr& ev) {
     auto* msg = ev->Get();
     ui64 lockId = msg->LockId;
-    TXLOG_DEBUG("Received TEvUnregisterLock for LockId# " << lockId);
+    TXLOG_NOTICE("FFF Received TEvUnregisterLock for LockId# " << lockId);
 
     auto it = Locks.find(lockId);
     if (it == Locks.end()) {
@@ -1221,12 +1221,21 @@ void TLongTxServiceActor::UpdateLockWaitEdges(
         if (addedEdge.Blocker.LockNodeId == SelfId().NodeId()) {
             auto lockIt = Locks.find(addedEdge.Blocker.LockId);
             if (lockIt == Locks.end()) {
+                TXLOG_WARN("adding edge, awaiter: " << awaiterInfo
+                    << ", blocker: " << addedEdge.Blocker
+                    << ", edge id: " << addedEdge.Id
+                    << " FFF LOCAL BLOCKER NOT FOUND");
+
                 continue;
             }
             blocker = TLockStateHandle{lockIt->second};
         } else {
             auto& node = ConnectProxyNode(addedEdge.Blocker.LockNodeId);
             if (node.State == EProxyState::Disconnected) {
+                TXLOG_WARN("adding edge, awaiter: " << awaiterInfo
+                    << ", blocker: " << addedEdge.Blocker
+                    << ", edge id: " << addedEdge.Id
+                    << " FFF BLOCKER NODE DISCONNECTED");
                 continue;
             }
 
@@ -1453,9 +1462,17 @@ void TLongTxServiceActor::UnlinkWaitNode(TWaitNode& waitNode) {
         WaitEdges.erase(edge.Id);
     };
     while (!waitNode.Awaiters.Empty()) {
+        // TXLOG_WARN("unlinking edge, awaiter: " << waitNode.Awaiters.Back()->Awaiter.LockInfo(SelfId())
+        //     << ", blocker: " << waitNode.Awaiters.Back()->Blocker.LockInfo(SelfId())
+        //     << ", edge id: " << waitNode.Awaiters.Back()->Id
+        //     << " FFF UNLINK AWAITER");
         remove(*waitNode.Awaiters.Back());
     }
     while (!waitNode.Blockers.Empty()) {
+        // TXLOG_WARN("unlinking edge, awaiter: " << waitNode.Blockers.Back()->Awaiter.LockInfo(SelfId())
+        //     << ", blocker: " << waitNode.Blockers.Back()->Blocker.LockInfo(SelfId())
+        //     << ", edge id: " << waitNode.Blockers.Back()->Id
+        //     << " FFF UNLINK BLOCKER");
         remove(*waitNode.Blockers.Back());
     }
     // waitNode.Island unlinked by UnlinkWaitEdge
@@ -1463,12 +1480,16 @@ void TLongTxServiceActor::UnlinkWaitNode(TWaitNode& waitNode) {
 
 void TLongTxServiceActor::Handle(TEvLongTxService::TEvWaitingLockAdd::TPtr& ev) {
     auto edgeId = TWaitEdgeId(ev->Sender, ev->Get()->RequestId);
-    TXLOG_DEBUG("Received TEvWaitingLockAdd for awaiter: " << ev->Get()->Lock
+    TXLOG_NOTICE("Received TEvWaitingLockAdd for awaiter: " << ev->Get()->Lock
         << ", blocker: " << ev->Get()->OtherLock
         << ", edge id: " << edgeId);
 
     auto awaiter = GetAwaiterHandle(ev->Get()->Lock);
     if (!awaiter) {
+        TXLOG_WARN("TEvWaitingLockAdd awaiter: " << ev->Get()->Lock
+            << ", blocker: " << ev->Get()->OtherLock
+            << ", edge id: " << edgeId
+            << " FFF AWAITER NOT FOUND");
         return;
     }
 
@@ -1483,7 +1504,7 @@ void TLongTxServiceActor::Handle(TEvLongTxService::TEvWaitingLockAdd::TPtr& ev) 
 
 void TLongTxServiceActor::Handle(TEvLongTxService::TEvWaitingLockRemove::TPtr& ev) {
     auto edgeId = TWaitEdgeId(ev->Sender, ev->Get()->RequestId);
-    TXLOG_DEBUG("Received TEvWaitingLockRemove for edge id: " << edgeId);
+    TXLOG_NOTICE("Received TEvWaitingLockRemove for edge id: " << edgeId);
 
     auto edgeIt = WaitEdges.find(edgeId);
     if (edgeIt == WaitEdges.end()) {
