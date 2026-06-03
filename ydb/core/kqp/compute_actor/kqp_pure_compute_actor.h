@@ -20,6 +20,13 @@ using namespace NYql::NDq;
 class TKqpComputeActor : public NScheduler::TSchedulableComputeActorBase<TKqpComputeActor> {
     using TBase = TSchedulableComputeActorBase<TKqpComputeActor>;
 
+    struct TEvPrivate {
+        enum EEv {
+            EvCheckSlowExecution = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
+        };
+        struct TEvCheckSlowExecution : public TEventLocal<TEvCheckSlowExecution, EvCheckSlowExecution> {};
+    };
+
 public:
     static constexpr NKikimrServices::TActivity::EType ActorActivityType() {
         return NKikimrServices::TActivity::KQP_COMPUTE_ACTOR;
@@ -62,6 +69,8 @@ private:
 
     void HandleExecute(TEvKqpCompute::TEvScanError::TPtr& ev);
 
+    void HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecution::TPtr&);
+
     bool IsDebugLogEnabled(const TActorSystem* actorSystem);
 
     ui64 CalculateFreeSpace() const;
@@ -77,6 +86,10 @@ private:
     const TMaybe<ui8> ArrayBufferMinFillPercentage;
     TIntrusiveConstPtr<NACLib::TUserToken> UserToken;
     const TString Database;
+    TInstant BootstrapTime;
+
+    static constexpr TDuration SlowExecutionThreshold = TDuration::Seconds(5);
+    static constexpr TDuration SlowExecutionCheckInterval = TDuration::Seconds(5);
 };
 
 } // namespace NKikimr::NKqp

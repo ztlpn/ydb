@@ -153,6 +153,9 @@ void TKqpComputeActor::DoBootstrap() {
     ContinueExecute();
     Become(&TKqpComputeActor::StateFunc);
 
+    BootstrapTime = TAppData::TimeProvider->Now();
+    Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
+
     TBase::DoBootstrap();
 }
 
@@ -163,6 +166,7 @@ STFUNC(TKqpComputeActor::StateFunc) {
             hFunc(TEvKqpCompute::TEvScanInitActor, HandleExecute);
             hFunc(TEvKqpCompute::TEvScanData, HandleExecute);
             hFunc(TEvKqpCompute::TEvScanError, HandleExecute);
+            hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
             default:
                 BaseStateFuncBody(ev);
         }
@@ -175,6 +179,49 @@ STFUNC(TKqpComputeActor::StateFunc) {
     }
 
     ReportEventElapsedTime();
+}
+
+void TKqpComputeActor::HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecution::TPtr&) {
+    TDuration elapsed = TAppData::TimeProvider->Now() - BootstrapTime;
+    if (elapsed >= SlowExecutionThreshold) {
+        TStringBuilder sources;
+        for (const auto& [index, source] : SourcesMap) {
+            sources << "{index=" << index
+                << ",type=" << source.Type
+                << ",finished=" << source.Finished
+                << ",free_space=" << source.GetFreeSpace();
+            if (source.Actor) {
+                sources << ",actor=" << source.Actor->SelfId();
+            }
+            sources << "} ";
+        }
+        TStringBuilder channels;
+        for (const auto& [channelId, channel] : InputChannelsMap) {
+            channels << "{channel=" << channelId
+                << ",stage=" << channel.SrcStageId;
+            if (channel.HasPeer) {
+                channels << ",peer=" << channel.PeerId;
+            }
+            if (channel.Channel) {
+                channels << ",stored_bytes=" << channel.Channel->GetStoredBytes()
+                    << ",finished=" << channel.Channel->IsFinished();
+            }
+            channels << "} ";
+        }
+        TStringBuf runStatus =
+            ProcessOutputsState.LastRunStatus == ERunStatus::Finished ? "Finished" :
+            ProcessOutputsState.LastRunStatus == ERunStatus::PendingInput ? "PendingInput" : "PendingOutput";
+        CA_LOG_W("Slow compute actor"
+            << ", self=" << this->SelfId()
+            << ", task=" << GetTask().GetId()
+            << ", elapsed=" << elapsed
+            << ", run_status=" << runStatus
+            << ", last_run_time=" << ProcessOutputsState.LastRunTime
+            << ", inflight=" << ProcessOutputsState.Inflight
+            << (sources.empty() ? "" : (TStringBuilder() << ", sources=[" << sources << "]").data())
+            << (channels.empty() ? "" : (TStringBuilder() << ", channels=[" << channels << "]").data()));
+    }
+    Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
 }
 
 ui64 TKqpComputeActor::CalcMkqlMemoryLimit() {
