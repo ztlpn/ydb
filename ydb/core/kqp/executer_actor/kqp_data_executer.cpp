@@ -387,17 +387,45 @@ private:
         return ReadOnlyTx || ev->Get()->Record.GetStatusCode() != NYql::NDqProto::StatusIds::CANCELLED;
     }
 
+    static TStringBuf TaskTypeName(TTaskMeta::ETaskType type) {
+        switch (type) {
+            case TTaskMeta::Compute: return "Compute";
+            case TTaskMeta::Scan:    return "Scan";
+            default:                 return "Unknown";
+        }
+    }
+
     void HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecution::TPtr&) {
         TDuration elapsed = TAppData::TimeProvider->Now() - StartTime;
         if (elapsed >= SlowExecutionThreshold) {
             TStringBuilder pendingActors;
             TStringBuilder pendingTasks;
             if (Planner) {
+                // Build reverse map: actor id -> task
+                THashMap<TActorId, const TTask*> actorToTask;
+                for (const auto& task : TasksGraph.GetTasks()) {
+                    if (task.ComputeActorId) {
+                        actorToTask.emplace(task.ComputeActorId, &task);
+                    }
+                }
                 for (const auto& [actorId, _] : Planner->GetPendingComputeActors()) {
-                    pendingActors << actorId << " ";
+                    pendingActors << "{actor=" << actorId;
+                    if (auto it = actorToTask.find(actorId); it != actorToTask.end()) {
+                        pendingActors << ",type=" << TaskTypeName(it->second->Meta.Type);
+                        if (it->second->Meta.ShardId) {
+                            pendingActors << ",shard=" << it->second->Meta.ShardId;
+                        }
+                    }
+                    pendingActors << "} ";
                 }
                 for (const auto taskId : Planner->GetPendingComputeTasks()) {
-                    pendingTasks << taskId << " ";
+                    const auto& task = TasksGraph.GetTask(taskId);
+                    pendingTasks << "{task=" << taskId
+                        << ",type=" << TaskTypeName(task.Meta.Type);
+                    if (task.Meta.ShardId) {
+                        pendingTasks << ",shard=" << task.Meta.ShardId;
+                    }
+                    pendingTasks << "} ";
                 }
             }
             KQP_STLOG_W(KQPDATA, "Slow execution",

@@ -3732,7 +3732,7 @@ private:
             }
 
             STLOG_W("Slow transaction",
-                (tx_id, txId),
+                (tx_id, txId.HumanStr),
                 (lock_id, txCtx.LockHandle.GetLockId()),
                 (isolation_level, txCtx.EffectiveIsolationLevel ? NKqpProto::EIsolationLevel_Name(*txCtx.EffectiveIsolationLevel) : TString("unset")),
                 (queries_count, txCtx.QueriesCount),
