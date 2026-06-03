@@ -208,6 +208,22 @@ void TKqpComputeActor::HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecutio
             }
             channels << "} ";
         }
+        TStringBuilder outputChannels;
+        for (const auto& [channelId, channel] : OutputChannelsMap) {
+            outputChannels << "{channel=" << channelId
+                << ",stage=" << channel.DstStageId
+                << ",finished=" << channel.Finished
+                << ",early_finish=" << channel.EarlyFinish;
+            if (channel.HasPeer) {
+                outputChannels << ",peer=" << channel.PeerId;
+            }
+            if (channel.Channel) {
+                outputChannels << ",has_data=" << channel.Channel->HasData()
+                    << ",values_count=" << channel.Channel->GetValuesCount()
+                    << ",pop_started=" << channel.PopStarted;
+            }
+            outputChannels << "} ";
+        }
         TStringBuf runStatus =
             ProcessOutputsState.LastRunStatus == ERunStatus::Finished ? "Finished" :
             ProcessOutputsState.LastRunStatus == ERunStatus::PendingInput ? "PendingInput" : "PendingOutput";
@@ -224,8 +240,9 @@ void TKqpComputeActor::HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecutio
             << ", inflight=" << ProcessOutputsState.Inflight
             << ", has_data_to_send=" << ProcessOutputsState.HasDataToSend
             << ", channels_ready=" << ProcessOutputsState.ChannelsReady
-            << (sources.empty() ? "" : (TStringBuilder() << ", sources=[" << sources << "]").data())
-            << (channels.empty() ? "" : (TStringBuilder() << ", channels=[" << channels << "]").data()));
+            << ", sources=[" << sources << "]"
+            << ", channels=[" << channels << "]"
+            << ", output_channels=[" << outputChannels << "]");
     }
     Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
 }
