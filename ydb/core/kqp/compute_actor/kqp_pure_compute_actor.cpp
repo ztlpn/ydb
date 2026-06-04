@@ -211,8 +211,13 @@ void TKqpComputeActor::HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecutio
         TStringBuilder sinks;
         for (const auto& [index, sink] : SinksMap) {
             sinks << "{index=" << index
+                << ",type=" << sink.Type
                 << ",finished=" << sink.Finished
-                << "} ";
+                << ",finish_ack=" << sink.FinishIsAcknowledged;
+            if (sink.Actor) {
+                sinks << ",actor=" << sink.Actor->SelfId();
+            }
+            sinks << "} ";
         }
         TStringBuilder outputChannels;
         for (const auto& [channelId, channel] : OutputChannelsMap) {
@@ -224,11 +229,26 @@ void TKqpComputeActor::HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecutio
                 outputChannels << ",peer=" << channel.PeerId;
             }
             if (channel.Channel) {
-                outputChannels << ",has_data=" << channel.Channel->HasData()
-                    << ",values_count=" << channel.Channel->GetValuesCount()
+                const auto& pushStats = channel.Channel->GetPushStats();
+                const auto& popStats = channel.Channel->GetPopStats();
+                outputChannels << ",push_rows=" << pushStats.Rows
+                    << ",pop_rows=" << popStats.Rows
+                    << ",fill_level=" << FillLevelToString(channel.Channel->GetFillLevel())
                     << ",pop_started=" << channel.PopStarted;
             }
             outputChannels << "} ";
+        }
+        TStringBuilder effectsInfo;
+        if (HasEffectsOutputs) {
+            NKikimrTxDataShard::TKqpTransaction::TDataTaskMeta dataMeta;
+            if (GetTask().GetMeta().Is<NKikimrTxDataShard::TKqpTransaction::TDataTaskMeta>() &&
+                GetTask().GetMeta().UnpackTo(&dataMeta))
+            {
+                effectsInfo << "table=" << dataMeta.GetTable().GetTablePath()
+                    << ",has_writes=" << dataMeta.HasWrites()
+                    << ",has_reads=" << (dataMeta.ReadsSize() > 0)
+                    << ",reads_count=" << dataMeta.ReadsSize();
+            }
         }
         TStringBuf runStatus =
             ProcessOutputsState.LastRunStatus == ERunStatus::Finished ? "Finished" :
@@ -245,7 +265,11 @@ void TKqpComputeActor::HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecutio
             << ", last_run_time=" << ProcessOutputsState.LastRunTime
             << ", inflight=" << ProcessOutputsState.Inflight
             << ", has_data_to_send=" << ProcessOutputsState.HasDataToSend
+            << ", data_was_sent=" << ProcessOutputsState.DataWasSent
             << ", channels_ready=" << ProcessOutputsState.ChannelsReady
+            << ", all_outputs_finished=" << ProcessOutputsState.AllOutputsFinished
+            << ", has_effects=" << HasEffectsOutputs
+            << ", effects=[" << effectsInfo << "]"
             << ", sources=[" << sources << "]"
             << ", channels=[" << channels << "]"
             << ", sinks=[" << sinks << "]"
