@@ -392,6 +392,7 @@ class TKqpTableWriteActor : public TActorBootstrapped<TKqpTableWriteActor> {
             EvShardRequestTimeout = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
             EvResolveRequestPlanned,
             EvReattachToShard,
+            EvCheckSlowExecution,
         };
 
         struct TEvShardRequestTimeout : public TEventLocal<TEvShardRequestTimeout, EvShardRequestTimeout> {
@@ -411,6 +412,8 @@ class TKqpTableWriteActor : public TActorBootstrapped<TKqpTableWriteActor> {
             explicit TEvReattachToShard(ui64 tabletId)
                 : TabletId(tabletId) {}
         };
+
+        struct TEvCheckSlowExecution : public TEventLocal<TEvCheckSlowExecution, EvCheckSlowExecution> {};
     };
 
     enum class EMode {
@@ -501,6 +504,8 @@ public:
             return;
         }
 
+        BootstrapTime = TAppData::TimeProvider->Now();
+        Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
         Become(&TKqpTableWriteActor::StateProcessing);
     }
 
@@ -625,6 +630,7 @@ public:
                 hFunc(TEvPrivate::TEvResolveRequestPlanned, Handle);
                 hFunc(TEvDataShard::TEvOverloadReady, Handle);
                 hFunc(TEvColumnShard::TEvOverloadReady, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
                 IgnoreFunc(TEvInterconnect::TEvNodeConnected);
                 IgnoreFunc(TEvTxProxySchemeCache::TEvInvalidateTableResult);
             default:
@@ -1386,6 +1392,16 @@ public:
         RetryShard(ev->Get()->ShardId, ev->Cookie);
     }
 
+    void HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecution::TPtr&) {
+        TDuration elapsed = TAppData::TimeProvider->Now() - BootstrapTime;
+        if (elapsed >= SlowExecutionThreshold) {
+            CA_LOG_W("Slow table write actor"
+                << ", elapsed=" << elapsed
+                << ", " << GetStateDebugString());
+        }
+        Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
+    }
+
     void Handle(TEvPipeCache::TEvDeliveryProblem::TPtr& ev) {
         CA_LOG_W("TEvDeliveryProblem was received from tablet: " << ev->Get()->TabletId
             << ", " << GetStateDebugString());
@@ -1622,6 +1638,10 @@ private:
     NWilson::TSpan TableWriteActorSpan;
     // Current query's SpanId, set before each batch via SetCurrentQuerySpanId.
     ui64 CurrentQuerySpanId = 0;
+
+    TInstant BootstrapTime;
+    static constexpr TDuration SlowExecutionThreshold = TDuration::Seconds(5);
+    static constexpr TDuration SlowExecutionCheckInterval = TDuration::Seconds(5);
 };
 
 
@@ -2987,6 +3007,7 @@ class TKqpBufferWriteActor : public TActorBootstrapped<TKqpBufferWriteActor>, pu
     struct TEvPrivate {
         enum EEv {
             EvReattachToShard = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
+            EvCheckSlowExecution,
         };
 
         struct TEvReattachToShard : public TEventLocal<TEvReattachToShard, EvReattachToShard> {
@@ -2995,6 +3016,8 @@ class TKqpBufferWriteActor : public TActorBootstrapped<TKqpBufferWriteActor>, pu
             explicit TEvReattachToShard(ui64 tabletId)
                 : TabletId(tabletId) {}
         };
+
+        struct TEvCheckSlowExecution : public TEventLocal<TEvCheckSlowExecution, EvCheckSlowExecution> {};
     };
 
 public:
@@ -3020,6 +3043,8 @@ public:
 
     void Bootstrap() {
         LogPrefix = TStringBuilder() << "SelfId: " << this->SelfId() << ", SessionActorId: " << SessionActorId << ", " << LogPrefix;
+        BootstrapTime = TAppData::TimeProvider->Now();
+        Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
         Become(&TThis::StateWrite);
     }
 
@@ -3033,6 +3058,7 @@ public:
                 hFunc(TEvKqpBuffer::TEvCommit, Handle);
                 hFunc(TEvKqpBuffer::TEvRollback, Handle);
                 hFunc(TEvBufferWrite, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
             default:
                 AFL_ENSURE(false)("StateWrite: unknown message", ev->GetTypeRewrite());
             }
@@ -3048,6 +3074,7 @@ public:
             switch (ev->GetTypeRewrite()) {
                 hFunc(TEvKqpBuffer::TEvTerminate, Handle);
                 hFunc(TEvKqpBuffer::TEvRollback, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
             default:
                 AFL_ENSURE(false)("StateWaitTasks: unknown message", ev->GetTypeRewrite());
             }
@@ -3063,6 +3090,7 @@ public:
             switch (ev->GetTypeRewrite()) {
                 hFunc(TEvKqpBuffer::TEvTerminate, Handle);
                 hFunc(TEvKqpBuffer::TEvRollback, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
             default:
                 AFL_ENSURE(false)("StateFlush: unknown message", ev->GetTypeRewrite());
             }
@@ -3087,6 +3115,7 @@ public:
                 hFunc(TEvDataShard::TEvProposeTransactionAttachResult, HandlePrepare);
                 hFunc(TEvPrivate::TEvReattachToShard, Handle);
                 hFunc(TEvDataShard::TEvProposeTransactionRestart, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
             default:
                 AFL_ENSURE(false)("StatePrepare: unknown message", ev->GetTypeRewrite());
             }
@@ -3110,6 +3139,7 @@ public:
                 hFunc(TEvDataShard::TEvProposeTransactionAttachResult, HandleCommit);
                 hFunc(TEvPrivate::TEvReattachToShard, Handle);
                 hFunc(TEvDataShard::TEvProposeTransactionRestart, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
             default:
                 AFL_ENSURE(false)("StateCommit: unknown message", ev->GetTypeRewrite());
             }
@@ -3126,6 +3156,7 @@ public:
                 hFunc(TEvKqpBuffer::TEvTerminate, Handle);
                 hFunc(NKikimr::NEvents::TDataEvents::TEvWriteResult, HandleRollback);
                 hFunc(TEvPipeCache::TEvDeliveryProblem, HandleRollback);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
 
             default:
                 CA_LOG_W("StateRollback: unknown message " << ev->GetTypeRewrite());
@@ -3142,13 +3173,51 @@ public:
             switch (ev->GetTypeRewrite()) {
                 hFunc(TEvKqpBuffer::TEvTerminate, Handle);
                 hFunc(TEvKqpBuffer::TEvRollback, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
 
             default:
-                CA_LOG_W("StateRollback: unknown message " << ev->GetTypeRewrite());
+                CA_LOG_W("StateError: unknown message " << ev->GetTypeRewrite());
             }
         } catch (...) {
             ReplyCurrentExceptionError();
         }
+    }
+
+    void HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecution::TPtr&) {
+        TDuration elapsed = TAppData::TimeProvider->Now() - BootstrapTime;
+        if (elapsed >= SlowExecutionThreshold) {
+            TStringBuilder writeActors;
+            for (const auto& [pathId, writeInfo] : WriteInfos) {
+                for (const auto& [_, actorInfo] : writeInfo.Actors) {
+                    writeActors << "{actor=" << actorInfo.Id;
+                    if (actorInfo.WriteActor) {
+                        writeActors << "," << actorInfo.WriteActor->GetStateDebugString();
+                    }
+                    writeActors << "} ";
+                }
+            }
+            CA_LOG_W("Slow buffer write actor"
+                << ", elapsed=" << elapsed
+                << ", state=" << CurrentStateName()
+                << ", ack_queue=" << AckQueue.size()
+                << ", write_tasks=" << WriteTasks.size()
+                << ", pending_prepare=" << PendingPrepareShards
+                << ", pending_commit=" << PendingCommitShards
+                << ", write_actors=[" << writeActors << "]");
+        }
+        Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
+    }
+
+    TStringBuf CurrentStateName() const {
+        const auto func = CurrentStateFunc();
+        if (func == static_cast<TReceiveFunc>(&TThis::StateWrite)) return "Write";
+        if (func == static_cast<TReceiveFunc>(&TThis::StateWaitTasks)) return "WaitTasks";
+        if (func == static_cast<TReceiveFunc>(&TThis::StateFlush)) return "Flush";
+        if (func == static_cast<TReceiveFunc>(&TThis::StatePrepare)) return "Prepare";
+        if (func == static_cast<TReceiveFunc>(&TThis::StateCommit)) return "Commit";
+        if (func == static_cast<TReceiveFunc>(&TThis::StateRollback)) return "Rollback";
+        if (func == static_cast<TReceiveFunc>(&TThis::StateError)) return "Error";
+        return "Unknown";
     }
 
     void ReplyMemoryLimitError() {
@@ -5547,6 +5616,10 @@ private:
     NWilson::TSpan BufferWriteActorStateSpan;
     TIntrusivePtr<NACLib::TUserContext> UserCtx;
     ui64 QuerySpanId = 0;
+
+    TInstant BootstrapTime;
+    static constexpr TDuration SlowExecutionThreshold = TDuration::Seconds(5);
+    static constexpr TDuration SlowExecutionCheckInterval = TDuration::Seconds(5);
 };
 
 class TKqpForwardWriteActor : public TActorBootstrapped<TKqpForwardWriteActor>, public NYql::NDq::IDqComputeActorAsyncOutput {
@@ -5608,18 +5681,28 @@ public:
 
     void Bootstrap() {
         LogPrefix = TStringBuilder() << "SelfId: " << this->SelfId() << ", " << LogPrefix;
+        BootstrapTime = TAppData::TimeProvider->Now();
+        Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
         Become(&TKqpForwardWriteActor::StateFuncFwd);
     }
 
     static constexpr char ActorName[] = "KQP_FORWARD_WRITE_ACTOR";
 
 private:
+    struct TEvPrivate {
+        enum EEv {
+            EvCheckSlowExecution = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
+        };
+        struct TEvCheckSlowExecution : public TEventLocal<TEvCheckSlowExecution, EvCheckSlowExecution> {};
+    };
+
     STFUNC(StateFuncFwd) {
         try {
             switch (ev->GetTypeRewrite()) {
                 hFunc(TEvBufferWriteResult, Handle);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
             default:
-                AFL_ENSURE(false)("unknown message", ev->GetTypeRewrite());
+                TBase::StateBootstrap(ev);
             }
         } catch (...) {
             RuntimeError(
@@ -5627,6 +5710,19 @@ private:
                 NYql::NDqProto::StatusIds::INTERNAL_ERROR);
             return;
         }
+    }
+
+    void HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecution::TPtr&) {
+        TDuration elapsed = TAppData::TimeProvider->Now() - BootstrapTime;
+        if (elapsed >= SlowExecutionThreshold) {
+            CA_LOG_W("Slow forward write actor"
+                << ", elapsed=" << elapsed
+                << ", closed=" << Closed
+                << ", in_flight=" << InFlight
+                << ", data_size=" << DataSize
+                << ", buffer_actor=" << BufferActorId);
+        }
+        Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());
     }
 
     void Handle(TEvBufferWriteResult::TPtr& result) {
@@ -5862,6 +5958,10 @@ private:
     TWriteToken WriteToken;
     NWilson::TSpan ForwardWriteActorSpan;
     NYql::NDq::IDqOutputConsumer::TPtr TransformOutput;
+
+    TInstant BootstrapTime;
+    static constexpr TDuration SlowExecutionThreshold = TDuration::Seconds(5);
+    static constexpr TDuration SlowExecutionCheckInterval = TDuration::Seconds(5);
 
 private:
     template<typename TArgs>
