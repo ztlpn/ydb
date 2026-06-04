@@ -1840,6 +1840,25 @@ public:
         return ShardsInfo.IsEmpty();
     }
 
+    TString GetShardsDebugString() const override {
+        TStringBuilder sb;
+        sb << "all_closed=" << IsAllWritesClosed()
+           << ",all_finished=" << IsAllWritesFinished()
+           << ",mem=" << GetMemory()
+           << ",shards=[";
+        for (const auto& [id, shard] : ShardsInfo.GetShards()) {
+            sb << "{shard=" << id
+               << ",batches=" << shard.Size()
+               << ",in_flight=" << shard.GetBatchesInFlight()
+               << ",attempts=" << shard.GetSendAttempts()
+               << ",closed=" << shard.IsClosed()
+               << ",finished=" << shard.IsFinished()
+               << "} ";
+        }
+        sb << "]";
+        return sb;
+    }
+
     ui64 GetShardsCount() const override {
         return ShardsInfo.GetShards().size();
     }

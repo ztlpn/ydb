@@ -223,6 +223,8 @@ public:
 
     virtual bool IsReady() const = 0;
     virtual bool IsEmpty() const = 0;
+
+    virtual TString GetShardsDebugString() const = 0;
 };
 
 using IShardedWriteControllerPtr = TIntrusivePtr<IShardedWriteController>;

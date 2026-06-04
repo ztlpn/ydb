@@ -1139,6 +1139,11 @@ public:
             AFL_ENSURE(Mode == EMode::WRITE);
             UpdateStats(ev->Get()->Record.GetTxStats());
             Callbacks->OnMessageAcknowledged(result->DataSize);
+        } else {
+            CA_LOG_W("Stale TEvWriteResult ignored"
+                << ": ShardId=" << ev->Get()->Record.GetOrigin()
+                << ", Cookie=" << ev->Cookie
+                << ", " << GetStateDebugString());
         }
     }
 
@@ -1375,13 +1380,15 @@ public:
     }
 
     void Handle(TEvPrivate::TEvShardRequestTimeout::TPtr& ev) {
-        CA_LOG_I("Timeout shardID=" << ev->Get()->ShardId);
+        CA_LOG_I("Timeout shardID=" << ev->Get()->ShardId
+            << ", " << GetStateDebugString());
         YQL_ENSURE(InconsistentTx);
         RetryShard(ev->Get()->ShardId, ev->Cookie);
     }
 
     void Handle(TEvPipeCache::TEvDeliveryProblem::TPtr& ev) {
-        CA_LOG_W("TEvDeliveryProblem was received from tablet: " << ev->Get()->TabletId);
+        CA_LOG_W("TEvDeliveryProblem was received from tablet: " << ev->Get()->TabletId
+            << ", " << GetStateDebugString());
         if (InconsistentTx) {
             RetryShard(ev->Get()->TabletId, std::nullopt);
             return;
@@ -1549,6 +1556,18 @@ public:
 
     bool FlushBeforeCommit() const {
         return NeedToFlushBeforeCommit;
+    }
+
+    TString GetStateDebugString() const {
+        TStringBuilder sb;
+        sb << "closed=" << Closed
+           << ",finished=" << IsFinished()
+           << ",resolving=" << IsResolving()
+           << ",resolve_attempts=" << ResolveAttempts;
+        if (ShardedWriteController) {
+            sb << "," << ShardedWriteController->GetShardsDebugString();
+        }
+        return sb;
     }
 
 private:
@@ -2748,6 +2767,11 @@ private:
 
             if (Closed || outOfMemory || CheckpointInProgress) {
                 if (!WriteTableActor->FlushToShards()) {
+                    CA_LOG_W("Write actor waiting for shards to flush"
+                        << ": closed=" << Closed
+                        << ", oom=" << outOfMemory
+                        << ", checkpoint=" << CheckpointInProgress.has_value()
+                        << ", " << WriteTableActor->GetStateDebugString());
                     return;
                 }
             }
@@ -2755,6 +2779,9 @@ private:
             if (Closed && WriteTableActor->IsFinished()) {
                 CA_LOG_D("Write actor finished");
                 Callbacks->OnAsyncOutputFinished(GetOutputIndex());
+            } else if (Closed) {
+                CA_LOG_W("Write actor closed but not finished"
+                    << ": " << WriteTableActor->GetStateDebugString());
             }
         } catch (const TMemoryLimitExceededException&) {
             RuntimeError(
