@@ -1583,6 +1583,14 @@ public:
         if (ShardedWriteController) {
             sb << "," << ShardedWriteController->GetShardsDebugString();
         }
+        if (!SendTime.empty()) {
+            const auto now = TAppData::TimeProvider->Now();
+            sb << ",in_flight_shards=[";
+            for (const auto& [shardId, sendTime] : SendTime) {
+                sb << "{shard=" << shardId << ",elapsed=" << (now - sendTime) << "} ";
+            }
+            sb << "]";
+        }
         return sb;
     }
 
@@ -2995,6 +3003,12 @@ struct TEvBufferWrite : public TEventLocal<TEvBufferWrite, TKqpEvents::EvBufferW
 struct TEvBufferWriteResult : public TEventLocal<TEvBufferWriteResult, TKqpEvents::EvBufferWriteResult> {
     TWriteToken Token;
     std::vector<IDataBatchPtr> Data;
+
+    // Set on error path to notify TKqpForwardWriteActor that the buffer actor failed.
+    NYql::NDqProto::StatusIds::StatusCode StatusCode = NYql::NDqProto::StatusIds::SUCCESS;
+    NYql::TIssues Issues;
+
+    bool IsError() const { return StatusCode != NYql::NDqProto::StatusIds::SUCCESS; }
 };
 
 }
@@ -5364,6 +5378,19 @@ public:
         CancelProposal();
         Become(&TKqpBufferWriteActor::StateError);
 
+        // Notify all pending forward write actors so they can propagate the error
+        // to their compute actor via OnAsyncOutputError. Without this the forward
+        // write actor waits for TEvBufferWriteResult forever, keeping finish_ack=0
+        // and deadlocking the compute actor.
+        while (!AckQueue.empty()) {
+            auto& item = AckQueue.front();
+            auto result = std::make_unique<TEvBufferWriteResult>();
+            result->StatusCode = statusCode;
+            result->Issues = issues;
+            Send(item.ForwardActorId, result.release());
+            AckQueue.pop();
+        }
+
         Send<ESendingType::Tail>(SessionActorId, new TEvKqpBuffer::TEvError{
             statusCode,
             std::move(issues),
@@ -5727,6 +5754,14 @@ private:
 
     void Handle(TEvBufferWriteResult::TPtr& result) {
         CA_LOG_D("TKqpForwardWriteActor receive EvBufferWriteResult from " << BufferActorId);
+
+        if (result->Get()->IsError()) {
+            CA_LOG_E("TKqpForwardWriteActor received error from buffer actor"
+                << ": statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(result->Get()->StatusCode)
+                << ", issues=" << result->Get()->Issues.ToOneLineString());
+            RuntimeError(result->Get()->Issues.ToOneLineString(), result->Get()->StatusCode, result->Get()->Issues);
+            return;
+        }
 
         WriteToken = result->Get()->Token;
 
