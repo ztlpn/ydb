@@ -3187,6 +3187,9 @@ public:
             switch (ev->GetTypeRewrite()) {
                 hFunc(TEvKqpBuffer::TEvTerminate, Handle);
                 hFunc(TEvKqpBuffer::TEvRollback, Handle);
+                hFunc(TEvKqpBuffer::TEvCommit, HandleCommitInError);
+                hFunc(TEvKqpBuffer::TEvFlush, HandleFlushInError);
+                hFunc(TEvBufferWrite, HandleBufferWriteInError);
                 hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
 
             default:
@@ -3195,6 +3198,29 @@ public:
         } catch (...) {
             ReplyCurrentExceptionError();
         }
+    }
+
+    void HandleCommitInError(TEvKqpBuffer::TEvCommit::TPtr& ev) {
+        AFL_ENSURE(SavedError.has_value());
+        CA_LOG_W("Got Commit in StateError, replying with error to executer " << ev->Get()->ExecuterActorId);
+        NYql::TIssues issuesCopy = SavedError->second;
+        Send(ev->Get()->ExecuterActorId, new TEvKqpBuffer::TEvError{SavedError->first, std::move(issuesCopy), std::nullopt});
+    }
+
+    void HandleFlushInError(TEvKqpBuffer::TEvFlush::TPtr& ev) {
+        AFL_ENSURE(SavedError.has_value());
+        CA_LOG_W("Got Flush in StateError, replying with error to executer " << ev->Get()->ExecuterActorId);
+        NYql::TIssues issuesCopy = SavedError->second;
+        Send(ev->Get()->ExecuterActorId, new TEvKqpBuffer::TEvError{SavedError->first, std::move(issuesCopy), std::nullopt});
+    }
+
+    void HandleBufferWriteInError(TEvBufferWrite::TPtr& ev) {
+        AFL_ENSURE(SavedError.has_value());
+        CA_LOG_W("Got BufferWrite in StateError, replying with error to " << ev->Sender);
+        auto result = std::make_unique<TEvBufferWriteResult>();
+        result->StatusCode = SavedError->first;
+        result->Issues = SavedError->second;
+        Send(ev->Sender, result.release());
     }
 
     void HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecution::TPtr&) {
@@ -5374,6 +5400,8 @@ public:
     void ReplyErrorImpl(NYql::NDqProto::StatusIds::StatusCode statusCode, NYql::TIssues&& issues) {
         CA_LOG_E("statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(statusCode) << ". Issue=" << issues.ToString() << ". sessionActorId=" << SessionActorId << ".");
 
+        SavedError = {statusCode, issues};
+
         TxManager->SetError();
         CancelProposal();
         Become(&TKqpBufferWriteActor::StateError);
@@ -5520,6 +5548,9 @@ private:
     TVector<ui64> BreakerQuerySpanIds;
     TVector<ui64> DeferredBreakerQuerySpanIds;
     TVector<ui32> DeferredBreakerNodeIds;
+
+    // Saved error info when in StateError, used to reply to late Commit/Flush requests.
+    std::optional<std::pair<NYql::NDqProto::StatusIds::StatusCode, NYql::TIssues>> SavedError;
 
     // Deferred error for STATUS_LOCKS_BROKEN during distributed prepare/commit.
     // Allows remaining shards to respond (with breaker TLI stats) before
