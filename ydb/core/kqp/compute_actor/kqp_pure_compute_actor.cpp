@@ -208,6 +208,12 @@ void TKqpComputeActor::HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecutio
             }
             channels << "} ";
         }
+        TStringBuilder sinks;
+        for (const auto& [index, sink] : SinksMap) {
+            sinks << "{index=" << index
+                << ",finished=" << sink.Finished
+                << "} ";
+        }
         TStringBuilder outputChannels;
         for (const auto& [channelId, channel] : OutputChannelsMap) {
             outputChannels << "{channel=" << channelId
@@ -242,6 +248,7 @@ void TKqpComputeActor::HandleCheckSlowExecution(TEvPrivate::TEvCheckSlowExecutio
             << ", channels_ready=" << ProcessOutputsState.ChannelsReady
             << ", sources=[" << sources << "]"
             << ", channels=[" << channels << "]"
+            << ", sinks=[" << sinks << "]"
             << ", output_channels=[" << outputChannels << "]");
     }
     Schedule(SlowExecutionCheckInterval, new TEvPrivate::TEvCheckSlowExecution());

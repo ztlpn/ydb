@@ -22,7 +22,7 @@ class TKqpComputeActor : public NScheduler::TSchedulableComputeActorBase<TKqpCom
 
     struct TEvPrivate {
         enum EEv {
-            EvCheckSlowExecution = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
+            EvCheckSlowExecution = EventSpaceBegin(TKikimrEvents::ES_KQP) + 1000,
         };
         struct TEvCheckSlowExecution : public TEventLocal<TEvCheckSlowExecution, EvCheckSlowExecution> {};
     };
