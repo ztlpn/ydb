@@ -276,7 +276,7 @@ public:
                 IgnoreFunc(TEvInterconnect::TEvNodeConnected);
                 IgnoreFunc(NFq::TEvCheckpointCoordinator::TEvZeroCheckpointDone);
                 IgnoreFunc(NFq::TEvCheckpointCoordinator::TEvRaiseTransientIssues);
-                IgnoreFunc(TEvPrivate::TEvCheckSlowExecution);
+                hFunc(TEvPrivate::TEvCheckSlowExecution, HandleCheckSlowExecution);
                 default:
                     UnexpectedEvent("FinalizeState", ev->GetTypeRewrite());
             }
