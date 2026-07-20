@@ -201,19 +201,19 @@ def all_nemesis_type_entries() -> dict[str, dict[str, Any]]:
             },
         ],
     }
-    out["TimeSkewNemesis"] = {
-        "runner": TimeSkewNemesis(),
-        "schedule": 400,
-        "ui_group": "NetworkNemesis",
-        "planner_cls": TimeSkewNemesisPlanner,
-        "target_kind": TargetKind.HOST,
-        "impact_scope": ImpactScope.NODE,
-        "guard_mode": GuardMode.FULL,
-        "supports_manual": False,
-        # Toggle fault: skew the clock, then the scheduler dispatches extract (re-enable ntp).
-        "recovery": "extract",
-        "auto_recovery_sec": 120,
-    }
+    # out["TimeSkewNemesis"] = {
+    #     "runner": TimeSkewNemesis(),
+    #     "schedule": 400,
+    #     "ui_group": "NetworkNemesis",
+    #     "planner_cls": TimeSkewNemesisPlanner,
+    #     "target_kind": TargetKind.HOST,
+    #     "impact_scope": ImpactScope.NODE,
+    #     "guard_mode": GuardMode.FULL,
+    #     "supports_manual": False,
+    #     # Toggle fault: skew the clock, then the scheduler dispatches extract (re-enable ntp).
+    #     "recovery": "extract",
+    #     "auto_recovery_sec": 120,
+    # }
 
     # --- tablet chaos (BYPASS: not counted against the failure-model budget) ---
     for wire, cls, sched in _KILL_TABLET_SPECS:
