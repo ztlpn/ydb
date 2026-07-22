@@ -82,12 +82,15 @@ public:
     {}
 
     void OnSkipUncommitted(ui64 txId) override {
+        Cerr << "FFF " << txId << Endl;
         if (auto* info = Self.GetVolatileTxManager().FindByCommitTxId(txId)) {
             if (info->State != EVolatileTxState::Aborting) {
+                Cerr << "FFF1 " << txId << Endl;
                 VolatileVersion = Max(VolatileVersion, info->Version);
                 Self.SysLocksTable().AddVolatileDependency(txId);
             }
         } else {
+            Cerr << "FFF2 " << txId << Endl;
             ReadConflicts.push_back(txId);
         }
     }
@@ -619,6 +622,10 @@ void TDataShard::HandleLockRowsRequest(NEvents::TDataEvents::TEvLockRows::TPtr e
             bool advanced = false;
 
             while (processedKeys < matrix.GetRowCount()) {
+                LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+                    "FFF TEvLockRows: at tablet# " << TabletID()
+                    << ", key: " << processedKeys);
+
                 TConstArrayRef<TCell> key = matrix.GetRow(processedKeys);
 
                 // TODO: Check if there are operations writing to the current
@@ -640,6 +647,16 @@ void TDataShard::HandleLockRowsRequest(NEvents::TDataEvents::TEvLockRows::TPtr e
                 // skipAbsent sees the correct row state including own changes.
                 auto ownTxMap = NTable::TSingleTransactionMap::Create(lockId, TRowVersion::Min());
                 auto row = txc.DB.SelectRowVersionByKeyPrefix(localTid, uniqueKey, ownTxMap, observer);
+
+                LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+                    "FFF TEvLockRows: at tablet# " << TabletID()
+                    << ", key: " << processedKeys
+                    << ", rr: " << row.Ready
+                    << ", rlm: " << row.LockMode
+                    << ", rltxid: " << row.LockTxId
+                    << ", ro: " << row.RowOp
+                    << ", rtxid: " << row.RowTxId
+                    << ", rv: " << row.RowVersion);
 
                 // Handle page fault by restarting or rescheduling
                 if (row.Ready == NTable::EReady::Page) {
