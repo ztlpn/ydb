@@ -825,7 +825,7 @@ void TDataShardUserDb::CheckWriteConflicts(const TTableId& tableId, TConstArrayR
 
     // We are not actually interested in the row version, we only need to
     // detect uncommitted transaction skips on the path to that version.
-    auto res = Db.SelectRowVersionByKeyPrefix(localTableId, keyCells, txObserver);
+    auto res = Db.SelectRowVersionByKeyPrefix(localTableId, keyCells, nullptr, txObserver);
 
     if (res.Ready == NTable::EReady::Page) {
         if (mustFindConflicts || LockTxId) {

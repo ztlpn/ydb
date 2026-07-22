@@ -171,10 +171,13 @@ public:
     // by key prefix. Used to check row conflicts in unique indexes.
     // Returns either the first locked row or any non-deleted committed row
     // from the range if no rows are locked in range. Feeds uncommitted
-    // non-lock-only deltas to the specified observer.
+    // non-lock-only deltas to the specified observer. Non-lock-only deltas
+    // from transactions visible in the `visible` map are treated as committed
+    // and are not fed to the observer.
     TSelectRowVersionResult SelectRowVersionByKeyPrefix(
             TArrayRef<const TCell> keyPrefix, IPages* env,
-            const ITransactionObserverPtr& observer) const;
+            const ITransactionMapPtr& visible = nullptr,
+            const ITransactionObserverPtr& observer = nullptr) const;
 
     TPrechargeResult Precharge(TRawVals minKey, TRawVals maxKey, TTagsRef tags,
                      IPages* env, ui64 flg,

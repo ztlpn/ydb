@@ -1612,15 +1612,19 @@ TSelectRowVersionResult TTable::SelectRowVersion(
 
 TSelectRowVersionResult TTable::SelectRowVersionByKeyPrefix(
         TArrayRef<const TCell> keyPrefix, IPages* env,
+        const ITransactionMapPtr& visible,
         const ITransactionObserverPtr& observer) const
 {
     if (keyPrefix.size() == Scheme->Keys->Size()) {
         // A full key, not a prefix
-        return SelectRowVersion(keyPrefix, env, 0, nullptr, observer);
+        return SelectRowVersion(keyPrefix, env, 0, visible, observer);
     }
 
     const TCelled key(keyPrefix, *Scheme->Keys, true);
     TSelectRowVersionResult res(NTable::EReady::Gone);
+
+    auto committed = TMergedTransactionMap::Create(visible, CommittedTransactions);
+    ITransactionMapSimplePtr committedSimple = committed;
 
     auto iter = Iterate(key, {} /*tags*/, env, ESeek::Lower, TRowVersion::Max(), nullptr, nullptr);
 
@@ -1629,16 +1633,31 @@ TSelectRowVersionResult TTable::SelectRowVersionByKeyPrefix(
         if (!TCellVectorsEquals{}(iter->GetKey().Cells().Slice(0, keyPrefix.size()), keyPrefix)) {
             break;
         }
+        bool appliedVisible = false;
+        ERowOp visibleRowOp = ERowOp::Absent;
         while (ready == NTable::EReady::Data && iter->IsUncommitted()) {
             if (iter->Row().GetRowState() != ERowOp::Absent) {
-                // non-lock-only deltas are pushed to OnSkipUncommitted() to result in an optimistic conflict
+                auto txId = iter->GetUncommittedTxId();
+                if (committedSimple.Find(txId)) {
+                    // This delta belongs to a visible (own) transaction - treat as committed.
+                    // Do not report it to the observer as a conflict.
+                    visibleRowOp = iter->Row().GetRowState();
+                    appliedVisible = true;
+                    // Skip any remaining uncommitted deltas for this key.
+                    while ((ready = iter->SkipUncommitted()) == NTable::EReady::Data && iter->IsUncommitted()) {
+                    }
+                    break;
+                }
+                // non-lock-only deltas from other transactions are pushed to OnSkipUncommitted()
                 if (observer) {
-                    observer.OnSkipUncommitted(iter->GetUncommittedTxId());
+                    observer.OnSkipUncommitted(txId);
                 }
             } else {
                 // live lock-only deltas are processed to wait for a pessimistic lock on them
                 auto [lockMode, lockTxId] = iter->GetLockInfo();
-                // Lock is only valid as long as it's not committed or removed
+                // Lock is only valid as long as it's not committed or removed.
+                // Use CommittedTransactions (not the merged map) so that own lock-only
+                // deltas are still reported to the caller via res.LockTxId.
                 if (!CommittedTransactions.Contains(lockTxId) && !RemovedTransactions.Contains(lockTxId)) {
                     res.LockMode = lockMode;
                     res.LockTxId = lockTxId;
@@ -1658,6 +1677,16 @@ TSelectRowVersionResult TTable::SelectRowVersionByKeyPrefix(
                 res.RowOp = iter->Row().GetRowState();
             }
             return res;
+        }
+        // If we applied a visible (own) delta, use its row state
+        if (appliedVisible) {
+            if (visibleRowOp != ERowOp::Erase) {
+                res.Ready = NTable::EReady::Data;
+                res.RowVersion = TRowVersion::Min();
+                res.RowOp = visibleRowOp;
+                res.RowTxId = 0;
+            }
+            continue;
         }
         // If there is no pessimistic lock - we'll return any non-removed row from the range
         if (ready != NTable::EReady::Gone &&

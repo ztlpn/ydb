@@ -699,7 +699,7 @@ Y_UNIT_TEST_SUITE(DBRowLocks) {
         me.ToLine().Begin();
         {
             auto observer = MakeIntrusive<TTestLockObserver>();
-            auto r = me.ToLine()->SelectRowVersionByKeyPrefix(table1, TVector<TCell>{TCell::Make(1_u64)}, observer);
+            auto r = me.ToLine()->SelectRowVersionByKeyPrefix(table1, TVector<TCell>{TCell::Make(1_u64)}, nullptr, observer);
             UNIT_ASSERT_VALUES_EQUAL(observer->Skips, TVector<ui64>{105});
             UNIT_ASSERT_VALUES_EQUAL(r.Ready, EReady::Data);
             UNIT_ASSERT_VALUES_EQUAL(r.RowVersion, TRowVersion(1, 14));

@@ -137,6 +137,7 @@ public:
 
     TSelectRowVersionResult SelectRowVersionByKeyPrefix(
             ui32 table, TArrayRef<const TCell> key,
+            const ITransactionMapPtr& visible = nullptr,
             const ITransactionObserverPtr& observer = nullptr) const;
 
     TPrechargeResult Precharge(ui32 table, TRawVals minKey, TRawVals maxKey,

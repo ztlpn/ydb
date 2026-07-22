@@ -4847,7 +4847,7 @@ bool TDataShard::BreakWriteConflicts(NTable::TDatabase& db, const TTableId& tabl
 
     // We are not actually interested in the row version, we only need to
     // detect uncommitted transaction skips on the path to that version.
-    auto res = db.SelectRowVersionByKeyPrefix(localTid, keyCells, BreakWriteConflictsTxObserver);
+    auto res = db.SelectRowVersionByKeyPrefix(localTid, keyCells, nullptr, BreakWriteConflictsTxObserver);
 
     if (res.Ready == NTable::EReady::Page) {
         return false;

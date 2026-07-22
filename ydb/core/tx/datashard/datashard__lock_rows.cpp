@@ -634,8 +634,12 @@ void TDataShard::HandleLockRowsRequest(NEvents::TDataEvents::TEvLockRows::TPtr e
                 ui32 uniqueColumnCount = userTablePtr->UniqueIndexKeySize;
                 TConstArrayRef<TCell> uniqueKey = GetUniqueIndexKey(key, uniqueColumnCount);
 
-                // Probe the key or unique prefix until the first persistently committed version
-                auto row = txc.DB.SelectRowVersionByKeyPrefix(localTid, uniqueKey, observer);
+                // Probe the key or unique prefix until the first persistently committed version.
+                // Pass the lock's own txId as visible so that own uncommitted writes are treated
+                // as committed, preventing them from being reported as conflicts and ensuring
+                // skipAbsent sees the correct row state including own changes.
+                auto ownTxMap = NTable::TSingleTransactionMap::Create(lockId, TRowVersion::Min());
+                auto row = txc.DB.SelectRowVersionByKeyPrefix(localTid, uniqueKey, ownTxMap, observer);
 
                 // Handle page fault by restarting or rescheduling
                 if (row.Ready == NTable::EReady::Page) {
