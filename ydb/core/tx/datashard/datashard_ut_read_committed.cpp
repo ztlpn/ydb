@@ -414,6 +414,78 @@ Y_UNIT_TEST(ReadAfterSplit) {
     WaitTxNotification(server, sender, splitTxId);
 }
 
+Y_UNIT_TEST(SkipAbsentWithUncommitted) {
+    // PESSIMISTIC_NONE allows blind writes over committed updates (the expectation is that
+    // they are prevented separately via the TEvLockRows mechanism).
+
+    TTestEnv env;
+    auto [server, runtime, sender, tableId, shards] = env.GetAll();
+
+    ExecSQL(server, sender, R"(
+        UPSERT INTO `/Root/table` (key, value) VALUES (3, 300);
+    )");
+
+    TTransactionState tx1(runtime, NKikimrDataEvents::PESSIMISTIC_NONE);
+    TTransactionState tx2(runtime, NKikimrDataEvents::PESSIMISTIC_NONE);
+
+    // tx1 locks and inserts key 1
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx1.LockRows(
+            tableId, shards.at(0), {1},
+            NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE, /*skipAbsent=*/false),
+        "OK");
+    UNIT_ASSERT_VALUES_EQUAL(tx1.Locks.size(), 1);
+
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx1.Write(tableId, shards.at(0), TWriteOperation::Insert(1, 100)),
+        "OK");
+
+    // tx2 locks and inserts key 2
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx2.LockRows(
+            tableId, shards.at(0), {2},
+            NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE, /*skipAbsent=*/false),
+        "OK");
+    UNIT_ASSERT_VALUES_EQUAL(tx2.Locks.size(), 1);
+
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx2.Write(tableId, shards.at(0), TWriteOperation::Insert(2, 200)),
+        "OK");
+
+    // tx1 tries locking keys 1 and 2 before update with skipAbsent = true
+    auto lockRows2 = tx1.SendLockRows(
+        tableId, shards.at(0), {1, 2},
+        NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE, /*skipAbsent=*/true).NextResult();
+    UNIT_ASSERT_VALUES_EQUAL(
+        lockRows2->Record.GetStatus(),
+        NKikimrDataEvents::TEvLockRowsResult::STATUS_SUCCESS);
+    UNIT_ASSERT_VALUES_EQUAL(
+        JoinSeq(",", lockRows2->Record.GetSkippedAbsentKeys()),
+        "1");
+    UNIT_ASSERT_VALUES_EQUAL(
+        JoinSeq(",", lockRows2->Record.GetLockedKeys()),
+        "0");
+    UNIT_ASSERT_VALUES_EQUAL(tx1.Locks.size(), 1);
+
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx1.Write(tableId, shards.at(0), TWriteOperation::Upsert(1, 101)),
+        "OK");
+
+    // tx1 should be able to commit now.
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx1.WriteCommit(tableId, shards.at(0)),
+        "OK");
+
+    // Check that tx committed successfully.
+    UNIT_ASSERT_VALUES_EQUAL(
+        KqpSimpleExec(runtime, R"(
+            SELECT key, value FROM `/Root/table` ORDER BY key;
+        )"),
+        "{ items { uint32_value: 1 } items { int32_value: 101 } }, "
+        "{ items { uint32_value: 2 } items { int32_value: 200 } }, "
+        "{ items { uint32_value: 3 } items { int32_value: 300 } }");
+}
+
 } // Y_UNIT_TEST_SUITE(DataShardReadCommitted)
 
 } // namespace NKikimr

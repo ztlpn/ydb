@@ -45,6 +45,21 @@ struct TWriteOperation {
             std::move(rows),
         };
     }
+
+    static TWriteOperation Delete(i32 key) {
+        return Delete(TVector{key});
+    }
+
+    static TWriteOperation Delete(TVector<i32> keys) {
+        TVector<TKeyValue> rows; // values are ignored
+        for (const auto& key : keys) {
+            rows.push_back(TKeyValue{key, 0});
+        }
+        return TWriteOperation{
+            NKikimrDataEvents::TEvWrite::TOperation::OPERATION_DELETE,
+            std::move(rows),
+        };
+    }
 };
 
 class TTransactionState {
@@ -95,12 +110,14 @@ public:
 
     TLockRowsPromise SendLockRows(
         const TTableId& tableId, ui64 shardId, const TVector<i32>& keys,
-        NKikimrDataEvents::ELockMode lockMode = NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE);
+        NKikimrDataEvents::ELockMode lockMode = NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE,
+        bool skipAbsent = false);
 
     TString LockRows(
             const TTableId& tableId, ui64 shardId, const TVector<i32>& keys,
-            NKikimrDataEvents::ELockMode lockMode = NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE) {
-        auto promise = SendLockRows(tableId, shardId, keys, lockMode);
+            NKikimrDataEvents::ELockMode lockMode = NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE,
+            bool skipAbsent = false) {
+        auto promise = SendLockRows(tableId, shardId, keys, lockMode, skipAbsent);
         return promise.NextString();
     }
 
