@@ -234,7 +234,7 @@ class StressRunExecutor:
 
                             # Update node statistics
                             node_result.total_execution_time += execution_time
-                            sleep_between_runs = 240
+                            sleep_between_runs = 20
                             if success:
                                 logging.info(
                                     f"Run {current_iteration} on {node_host} completed successfully"

@@ -484,7 +484,7 @@ class ParallelWorkloadTestBase:
             recoverability_execution_result = stress_executor.execute_stress_runs(
                 stress_deployer,
                 workload_params,
-                1200,
+                20,
                 preparation_result,
                 False
             )

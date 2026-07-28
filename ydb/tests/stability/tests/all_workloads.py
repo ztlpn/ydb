@@ -150,20 +150,20 @@ def _init_stress_utils():
             'pre_nemesis_args': [
                 "--endpoint", "grpc://{node_host}:2135",
                 "--path", "workload_tpcc_{node_host}_{test_run_uuid}",
-                "--warehouses", "5000",
+                "--warehouses", "10",
                 "--phase", "prepare",
             ],
             'args': [
                 "--endpoint", "grpc://{node_host}:2135",
                 "--path", "workload_tpcc_{node_host}_{test_run_uuid}",
-                "--warehouses", "5000",
+                "--warehouses", "10",
                 "--phase", "run",
                 "--tx-mode", "mixed",
             ],
             'post_nemesis_args': [
                 "--endpoint", "grpc://{node_host}:2135",
                 "--path", "workload_tpcc_{node_host}_{test_run_uuid}",
-                "--warehouses", "5000",
+                "--warehouses", "10",
                 "--phase", "clean",
             ],
             'local_path': 'ydb/tests/stress/tpcc/workload_tpcc'

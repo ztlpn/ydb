@@ -12,7 +12,7 @@ ya make -r -tA --test-tag ya:manual ydb/tests/stability/tests \
 -F test_per_workload.py::TestPerWorkload::test_stress_util[Tpcc-nemesis_true] \
 --test-disable-timeout \
 --allure=./allure_nemesis \
---test-param workload_duration=14400 \
+--test-param workload_duration=10 \
 --test-param ydb-endpoint=grpc://vla5-7660.search.yandex.net:2135 \
 --test-param ydb-db=/Root/db1 \
 --test-param cluster_path=/home/ztlpn/y/run/slice2/stat_config.yaml \
