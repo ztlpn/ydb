@@ -2,6 +2,7 @@
 
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
 #include <ydb/core/tx/data_events/events.h>
+#include <ydb/core/tx/datashard/datashard.h>
 
 namespace NKikimr {
 namespace NKqp {
@@ -73,36 +74,71 @@ Y_UNIT_TEST(UpdateWhereTraceLocks) {
         return true;
     });
 
-    auto grab = [&](TAutoPtr<IEventHandle>& ev) -> TTestActorRuntime::EEventAction {
-        if (ev->GetTypeRewrite() == NEvents::TDataEvents::TEvWriteResult::EventType) {
-            auto* msg = ev->Get<NEvents::TDataEvents::TEvWriteResult>();
+    auto traceObserver = runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& ev) {
+        if (ev->GetTypeRewrite() == TEvDataShard::TEvRead::EventType) {
+            auto* msg = ev->Get<TEvDataShard::TEvRead>();
             const auto& record = msg->Record;
-            Cerr << ">>> TEvWriteResult"
-                 << " Status=" << NKikimrDataEvents::TEvWriteResult::EStatus_Name(record.GetStatus())
-                 << " TxId=" << record.GetTxId()
+            Cerr << ">>> TEvRead"
+                << " LockTxId=" << record.GetLockTxId()
+                << " Snapshot=" << record.GetSnapshot()
+                << Endl;
+        } else if (ev->GetTypeRewrite() == TEvDataShard::TEvReadResult::EventType) {
+            auto* msg = ev->Get<TEvDataShard::TEvReadResult>();
+            const auto& record = msg->Record;
+            Cerr << "<<< TEvReadResult"
+                 << " Status=" << record.GetStatus().GetCode()
+                 << " RowCount=" << record.GetRowCount()
                  << Endl;
             for (const auto& lock : record.GetTxLocks()) {
+                Cerr << "    " << FormatLock(lock) << Endl;
+            }
+            for (const auto& lock : record.GetBrokenTxLocks()) {
+                Cerr << "    broken: " << FormatLock(lock) << Endl;
+            }
+        } else if (ev->GetTypeRewrite() == NEvents::TDataEvents::TEvLockRows::EventType) {
+            auto* msg = ev->Get<NEvents::TDataEvents::TEvLockRows>();
+            const auto& record = msg->Record;
+            Cerr << ">>> TEvLockRows"
+                << " LockId=" << record.GetLockId()
+                << " Snapshot=" << record.GetSnapshot()
+                << " SkipAbsent=" << record.GetSkipAbsent()
+                << Endl;
+        } else if (ev->GetTypeRewrite() == NEvents::TDataEvents::TEvLockRowsResult::EventType) {
+            auto* msg = ev->Get<NEvents::TDataEvents::TEvLockRowsResult>();
+            const auto& record = msg->Record;
+            Cerr << "<<< TEvLockRowsResult"
+                 << " Status=" << NKikimrDataEvents::TEvLockRowsResult::EStatus_Name(record.GetStatus())
+                 << " LockedKeys.size()=" << record.GetLockedKeys().size()
+                 << " SkippedAbsentKeys.size()=" << record.GetSkippedAbsentKeys().size()
+                 << " ModifiedKeys.size()=" << record.GetModifiedKeys().size()
+                 << Endl;
+            for (const auto& lock : record.GetLocks()) {
                 Cerr << "    " << FormatLock(lock) << Endl;
             }
         } else if (ev->GetTypeRewrite() == NEvents::TDataEvents::TEvWrite::EventType) {
             auto* msg = ev->Get<NEvents::TDataEvents::TEvWrite>();
             const auto& record = msg->Record;
             const auto& kqpLocks = record.GetLocks();
-            if (kqpLocks.LocksSize() > 0) {
-                Cerr << ">>> TEvWrite"
-                     << " TxId=" << record.GetTxId()
-                     << " Op=" << FormatLocksOp(kqpLocks.GetOp())
-                     << Endl;
-                for (const auto& lock : kqpLocks.GetLocks()) {
-                    Cerr << "    " << FormatLock(lock) << Endl;
-                }
+            Cerr << ">>> TEvWrite"
+                << " TxId=" << record.GetTxId()
+                << " LockTxId=" << record.GetLockTxId()
+                << " LocksOp=" << FormatLocksOp(kqpLocks.GetOp())
+                << Endl;
+            for (const auto& lock : kqpLocks.GetLocks()) {
+                Cerr << "    " << FormatLock(lock) << Endl;
+            }
+        } else if (ev->GetTypeRewrite() == NEvents::TDataEvents::TEvWriteResult::EventType) {
+            auto* msg = ev->Get<NEvents::TDataEvents::TEvWriteResult>();
+            const auto& record = msg->Record;
+            Cerr << "<<< TEvWriteResult"
+                 << " Status=" << NKikimrDataEvents::TEvWriteResult::EStatus_Name(record.GetStatus())
+                 << " TxId=" << record.GetTxId()
+                 << Endl;
+            for (const auto& lock : record.GetTxLocks()) {
+                Cerr << "    " << FormatLock(lock) << Endl;
             }
         }
-        return TTestActorRuntime::EEventAction::PROCESS;
-    };
-
-    auto prevObserver = runtime.SetObserverFunc(grab);
-    Y_DEFER { runtime.SetObserverFunc(prevObserver); };
+    });
 
     auto result = kikimr.RunCall([&] {
         return client.ExecuteQuery(R"(
