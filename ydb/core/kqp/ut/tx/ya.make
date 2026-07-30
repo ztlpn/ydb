@@ -7,6 +7,7 @@ REQUIREMENTS(cpu:2)
 SIZE(MEDIUM)
 
 SRCS(
+    kqp_lock_trace_ut.cpp
     kqp_locks_tricky_ut.cpp
     kqp_locks_ut.cpp
     kqp_mvcc_ut.cpp
