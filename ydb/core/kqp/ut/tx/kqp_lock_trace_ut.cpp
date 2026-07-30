@@ -1,8 +1,9 @@
-#include "kqp_sink_common.h"
-
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
+
 #include <ydb/core/tx/data_events/events.h>
 #include <ydb/core/tx/datashard/datashard.h>
+
+#include <ydb/core/testlib/actors/block_events.h>
 
 namespace NKikimr {
 namespace NKqp {
@@ -40,6 +41,11 @@ Y_UNIT_TEST_SUITE(KqpLockTrace) {
 Y_UNIT_TEST(UpdateWhereTraceLocks) {
     auto settings = TKikimrSettings().SetWithSampleTables(false).SetUseRealThreads(false);
     settings.AppConfig.MutableTableServiceConfig()->SetEnableReadCommittedIsolation(true);
+    auto logConfig = TTestLogSettings()
+        .AddLogPriority(NKikimrServices::EServiceKikimr::KQP_EXECUTER, NLog::EPriority::PRI_TRACE)
+        .AddLogPriority(NKikimrServices::EServiceKikimr::KQP_COMPUTE, NLog::EPriority::PRI_INFO)
+        .AddLogPriority(NKikimrServices::EServiceKikimr::TX_DATASHARD, NLog::EPriority::PRI_TRACE);
+    settings.SetLogSettings(logConfig);
 
     TKikimrRunner kikimr(settings);
     auto& runtime = *kikimr.GetTestServer().GetRuntime();
@@ -62,6 +68,11 @@ Y_UNIT_TEST(UpdateWhereTraceLocks) {
         UNIT_ASSERT_C(result.GetStatus() == EStatus::SUCCESS, result.GetIssues().ToString());
         return true;
     });
+
+    auto sender = runtime.AllocateEdgeActor();
+
+    TVector<ui64> shardIds = GetTableShards(&kikimr.GetTestServer(), sender, "/Root/Test");
+    UNIT_ASSERT_VALUES_EQUAL(shardIds.size(), 2);
 
     kikimr.RunCall([&] {
         auto result = client.ExecuteQuery(R"(
@@ -140,12 +151,39 @@ Y_UNIT_TEST(UpdateWhereTraceLocks) {
         }
     });
 
-    auto result = kikimr.RunCall([&] {
-        return client.ExecuteQuery(R"(
-            UPDATE `/Root/Test` SET Value = "updated" WHERE Value = "target";
-        )", TTxControl::BeginTx(TTxSettings::ReadCommittedRW()).CommitTx()).GetValueSync();
+    auto session = kikimr.RunCall([&] {
+        return client.GetSession().GetValueSync().GetSession();
     });
-    UNIT_ASSERT_C(result.GetStatus() == EStatus::SUCCESS, result.GetIssues().ToString());
+
+    TBlockEvents<NEvents::TDataEvents::TEvWrite> blockEvents(runtime);
+
+    auto updateFut = kikimr.RunInThreadPool([&] {
+        return session.ExecuteQuery(R"(
+            UPDATE `/Root/Test` SET Value = "updated" WHERE Value = "target";
+        )", TTxControl::BeginTx(TTxSettings::ReadCommittedRW())).GetValueSync();
+    });
+
+    runtime.WaitFor("Events", [&] {
+        return blockEvents.size() >= 2;
+    });
+
+    RebootTablet(runtime, shardIds[0], sender);
+    blockEvents.Unblock().Stop();
+    Cerr << "... Rebooted tablet" << Endl;
+
+    auto updateResult = runtime.WaitFuture(updateFut);
+    UNIT_ASSERT_C(updateResult.GetStatus() == EStatus::SUCCESS, updateResult.GetIssues().ToString());
+
+    auto tx = updateResult.GetTransaction();
+    UNIT_ASSERT(tx);
+
+    Cerr << "... Committing transaction" << Endl;
+    auto commitFut = kikimr.RunInThreadPool([&] {
+        return tx->Commit().GetValueSync();
+    });
+
+    auto commitResult = runtime.WaitFuture(commitFut);
+    UNIT_ASSERT_C(commitResult.GetStatus() == EStatus::SUCCESS, commitResult.GetIssues().ToString());
 }
 
 } // Y_UNIT_TEST_SUITE
