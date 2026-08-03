@@ -738,6 +738,8 @@ public:
         // same key is written to multiple times.
         if (!SelfFound) {
             SelfFound = ConflictChecker.BreakWriteConflict(txId);
+        } else {
+            Y_ABORT_UNLESS(false);
         }
     }
 
@@ -1107,6 +1109,7 @@ void TDataShardUserDb::CheckReadConflict(const TRowVersion& rowVersion) {
 
 bool TDataShardUserDb::NeedToReadBeforeWrite(const TTableId& tableId) {
     if (LockMode == ELockMode::OptimisticSnapshotIsolation) {
+        Y_ABORT_UNLESS(false);
         return true;
     }
 

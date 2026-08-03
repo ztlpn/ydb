@@ -2879,6 +2879,7 @@ private:
         case NKikimrDataEvents::OPTIMISTIC_SNAPSHOT_ISOLATION:
         case NKikimrDataEvents::PESSIMISTIC_NONE:
             if (Reader->HadInconsistentResult()) {
+                Y_ABORT_UNLESS(false);
                 HandleDeferredLockBreak(state, sysLocks, ctx);
                 handledDeferredBreak = true;
             }
@@ -3516,6 +3517,7 @@ public:
 
         case NKikimrDataEvents::OPTIMISTIC_SNAPSHOT_ISOLATION:
         case NKikimrDataEvents::PESSIMISTIC_NONE:
+            Y_ABORT_UNLESS(!Reader->HadInconsistentResult());
             return Reader->HadInconsistentResult();
 
         default:
