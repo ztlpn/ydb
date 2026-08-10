@@ -232,7 +232,7 @@ TString TTransactionState::TLockRowsPromise::NextString(TDuration simTimeout) {
 
 TTransactionState::TLockRowsPromise TTransactionState::SendLockRows(
     const TTableId& tableId, ui64 shardId, const TVector<i32>& keys,
-    NKikimrDataEvents::ELockMode lockMode) {
+    NKikimrDataEvents::ELockMode lockMode, bool skipAbsent) {
         auto sender = Runtime.AllocateEdgeActor();
         ui32 nodeIdx = sender.NodeId() - Runtime.GetNodeId(0);
 
@@ -241,6 +241,7 @@ TTransactionState::TLockRowsPromise TTransactionState::SendLockRows(
         req->Record.SetLockId(LockTxId);
         req->Record.SetLockNodeId(LockNodeId);
         req->Record.SetLockMode(lockMode);
+        req->Record.SetSkipAbsent(skipAbsent);
         req->SetTableId(tableId);
         req->Record.AddColumnIds(1);
 

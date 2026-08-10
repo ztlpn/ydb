@@ -95,7 +95,8 @@ public:
 
     TLockRowsPromise SendLockRows(
         const TTableId& tableId, ui64 shardId, const TVector<i32>& keys,
-        NKikimrDataEvents::ELockMode lockMode = NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE);
+        NKikimrDataEvents::ELockMode lockMode = NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE,
+        bool skipAbsent = false);
 
     TString LockRows(
             const TTableId& tableId, ui64 shardId, const TVector<i32>& keys,

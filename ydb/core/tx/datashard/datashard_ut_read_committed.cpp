@@ -414,6 +414,62 @@ Y_UNIT_TEST(ReadAfterSplit) {
     WaitTxNotification(server, sender, splitTxId);
 }
 
+Y_UNIT_TEST(VolatilePredecessorTx) {
+    TTestEnv env;
+    auto [server, runtime, sender, tableId, shards] = env.GetAll();
+
+    UNIT_ASSERT_VALUES_EQUAL(
+        KqpSchemeExec(runtime, R"(
+            CREATE TABLE `/Root/t2` (key UInt32, value int, PRIMARY KEY (key));
+        )"),
+        "SUCCESS"
+    );
+
+    const TTableId t2Id = ResolveTableId(env.Server, env.Sender, "/Root/t2");
+    UNIT_ASSERT(t2Id);
+    const auto t2Shards = GetTableShards(env.Server, env.Sender, "/Root/t2");
+    UNIT_ASSERT_VALUES_EQUAL(t2Shards.size(), 1u);
+
+    TTransactionState tx1(runtime, NKikimrDataEvents::PESSIMISTIC_NONE);
+
+    // tx1 locks a row at each of two shards and updates them.
+    tx1.InitCommit({shards.at(0), t2Shards.at(0)});
+    TVector<TTransactionState::TWritePromise> tx1Promises;
+    for (const auto& [tid, shard] : TVector<std::pair<TTableId, ui64>>({
+            {tableId, shards.at(0)},
+            {t2Id, t2Shards.at(0)} })) {
+        UNIT_ASSERT_VALUES_EQUAL(
+            tx1.LockRows(tid, shard, {1}),
+            "OK");
+        UNIT_ASSERT_VALUES_EQUAL(
+            tx1.Write(tid, shard, TWriteOperation::Upsert(1, 100)),
+            "OK");
+        tx1Promises.push_back(tx1.PrepareCommit(tid, shard));
+    }
+
+    // Start blocking readsets (non expectations)
+    TBlockEvents<TEvTxProcessing::TEvReadSet> blockedReadSets(runtime, [&](auto& ev) {
+        auto* msg = ev->Get();
+        return !(msg->Record.GetFlags() & NKikimrTx::TEvReadSet::FLAG_EXPECT_READSET);
+    });
+
+    tx1.SendPlan();
+    runtime.WaitFor("blocked readsets", [&]{ return blockedReadSets.size() >= 2; });
+    blockedReadSets.Stop();
+
+    TTransactionState tx2(runtime, NKikimrDataEvents::PESSIMISTIC_NONE);
+    // establish snapshot
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx2.ReadKey(tableId, shards.at(0), 2),
+        "");
+    auto lockResFut = tx2.SendLockRows(
+        tableId, shards.at(0), {1}, NKikimrDataEvents::PESSIMISTIC_EXCLUSIVE, true);
+    auto lockRes = lockResFut.NextResult();
+    Cerr << "FFF1 locked " << JoinSeq(",", lockRes->Record.GetLockedKeys()) << Endl;
+    Cerr << "FFF1 skipped " << JoinSeq(",", lockRes->Record.GetSkippedAbsentKeys()) << Endl;
+    Cerr << "FFF1 modified " << JoinSeq(",", lockRes->Record.GetModifiedKeys()) << Endl;
+}
+
 } // Y_UNIT_TEST_SUITE(DataShardReadCommitted)
 
 } // namespace NKikimr
