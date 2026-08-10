@@ -70,7 +70,7 @@ TValidatedWriteTx::TValidatedWriteTx(TDataShard* self, ui64 globalTxId, TInstant
 
     NKikimrTxDataShard::TKqpTransaction::TDataTaskMeta meta;
 
-    LOG_T("Parsing write transaction for " << globalTxId << " at " << TabletId << ", record: " << record.ShortDebugString());
+    LOG_N("Parsing write transaction for " << globalTxId << " at " << TabletId << ", record: " << record.ShortDebugString());
 
     Operations.reserve(record.operations().size());
     for (const auto& recordOperation : record.operations()) {

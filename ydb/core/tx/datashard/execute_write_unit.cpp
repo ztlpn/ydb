@@ -5,8 +5,10 @@
 #include "datashard_user_db.h"
 #include "datashard_kqp.h"
 #include "datashard_integrity_trails.h"
+#include "range_ops.h"
 
 #include <ydb/core/engine/mkql_engine_flat_host.h>
+#include <ydb/core/scheme/scheme_tablecell.h>
 #include <ydb/library/aclib/user_context.h>
 
 namespace NKikimr {
@@ -278,7 +280,7 @@ public:
         return true;
     }
 
-    void DoUpdateToUserDb(TDataShardUserDb& userDb, const TValidatedWriteTxOperation& validatedOperation, TTransactionContext& txc) {
+    void DoUpdateToUserDb(TDataShardUserDb& userDb, const TValidatedWriteTxOperation& validatedOperation, TTransactionContext& txc, const TActorContext& ctx) {
         const ui64 tableId = validatedOperation.GetTableId().PathId.LocalPathId;
         const TTableId fullTableId(DataShard.GetPathOwnerId(), tableId);
         const TUserTable& userTable = *DataShard.GetUserTables().at(tableId);
@@ -303,6 +305,23 @@ public:
         for (ui32 rowIdx = 0; rowIdx < matrix.GetRowCount(); ++rowIdx)
         {
             FillKey(scheme, userTable, tableInfo, validatedOperation, rowIdx, key);
+
+            {
+                const auto& typeRegistry = *AppData()->TypeRegistry;
+                TSmallVec<TCell> keyCells(key.size());
+                for (size_t i = 0; i < key.size(); ++i) {
+                    keyCells[i] = TCell(static_cast<const char*>(key[i].Data()), key[i].Size());
+                }
+                YDB_LOG_NOTICE_CTX_COMP(ctx, NKikimrServices::TX_DATASHARD, "TExecuteWriteUnit::DoUpdateToUserDb: writing row",
+                    {"tabletId", DataShard.TabletID()},
+                    {"tableId", tableId},
+                    {"tableName", userTable.Name},
+                    {"operationType", operationType},
+                    {"key", DebugPrintPoint(userTable.KeyColumnTypes, keyCells, typeRegistry)},
+                    {"lockTxId", userDb.GetLockTxId()},
+                    {"mvccVersion", userDb.GetMvccVersion()},
+                    {"snapshotVersion", userDb.GetSnapshotVersion()});
+            }
 
             switch (operationType) {
                 case NKikimrDataEvents::TEvWrite::TOperation::OPERATION_UPSERT: {
@@ -342,6 +361,37 @@ public:
                 default:
                     // Checked before in TWriteOperation
                     Y_ENSURE(false, operationType << " operation is not supported now");
+            }
+
+            {
+                const auto& typeRegistry = *AppData()->TypeRegistry;
+                TSmallVec<TCell> keyCells(key.size());
+                for (size_t i = 0; i < key.size(); ++i) {
+                    keyCells[i] = TCell(static_cast<const char*>(key[i].Data()), key[i].Size());
+                }
+                TStringBuilder valuesStr;
+                valuesStr << "{";
+                for (size_t i = 0; i < ops.size(); ++i) {
+                    if (i > 0) valuesStr << ", ";
+                    const auto* colInfo = scheme.GetColumnInfo(&tableInfo, ops[i].Tag);
+                    valuesStr << ops[i].Tag << "=";
+                    if (colInfo && colInfo->PType.GetTypeId() != NScheme::NTypeIds::String) {
+                        valuesStr << DbgPrintCell(ops[i].AsCell(), colInfo->PType, typeRegistry);
+                    } else {
+                        valuesStr << "<skipped>";
+                    }
+                }
+                valuesStr << "}";
+                YDB_LOG_NOTICE_CTX_COMP(ctx, NKikimrServices::TX_DATASHARD, "TExecuteWriteUnit::DoUpdateToUserDb: written row",
+                    {"tabletId", DataShard.TabletID()},
+                    {"tableId", tableId},
+                    {"tableName", userTable.Name},
+                    {"operationType", operationType},
+                    {"key", DebugPrintPoint(userTable.KeyColumnTypes, keyCells, typeRegistry)},
+                    {"values", valuesStr},
+                    {"lockTxId", userDb.GetLockTxId()},
+                    {"mvccVersion", userDb.GetMvccVersion()},
+                    {"snapshotVersion", userDb.GetSnapshotVersion()});
             }
         }
         if (notReady) {
@@ -438,6 +488,14 @@ public:
         NMiniKQL::TEngineHostCounters engineHostCounters;
         const ui64 txId = op->GetTxId();
         const auto mvccVersion = DataShard.GetMvccVersion(writeOp);
+
+        LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+            "TExecuteWriteUnit mvccVersion at " << DataShard.TabletID()
+            << " opId=" << op->GetTxId()
+            << " lockTxId=" << writeTx->GetLockTxId()
+            << " mvccVersion=" << mvccVersion
+            << " ImmediateWriteEdge=" << DataShard.GetSnapshotManager().GetImmediateWriteEdge()
+            << " ImmediateWriteEdgeReplied=" << DataShard.GetSnapshotManager().GetImmediateWriteEdgeReplied());
 
         TDataShardUserDb userDb(DataShard, txc.DB, op->GetGlobalTxId(), mvccVersion, engineHostCounters, TAppData::TimeProvider->Now());
         userDb.SetIsWriteTx(true);
@@ -614,7 +672,7 @@ public:
                             }
                         }
                     }
-                    DoUpdateToUserDb(userDb, validatedOperation, txc);
+                    DoUpdateToUserDb(userDb, validatedOperation, txc, ctx);
                     YDB_LOG_DEBUG_CTX_COMP(ctx, NKikimrServices::TX_DATASHARD, "TExecuteWriteUnit::Execute: executed write operation for row",
                         {"operation", *writeOp},
                         {"tabletId", DataShard.TabletID()},

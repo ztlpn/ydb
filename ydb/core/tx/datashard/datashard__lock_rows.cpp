@@ -2,6 +2,7 @@
 #include "datashard_locks_db.h"
 #include "setup_sys_locks.h"
 
+#include <ydb/core/tx/datashard/range_ops.h>
 #include <ydb/library/actors/async/continuation.h>
 
 namespace NKikimr::NDataShard {
@@ -672,6 +673,14 @@ void TDataShard::HandleLockRowsRequest(NEvents::TDataEvents::TEvLockRows::TPtr e
                 };
 
                 auto finishLocked = [&]() {
+                    LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+                        "TEvLockRows locked row at tablet=" << TabletID()
+                        << " tableName=" << userTablePtr->Name
+                        << " snapshot=" << snapshot
+                        << " lockTxId=" << msg->Record.GetLockId()
+                        << " key=" << DebugPrintPoint(userTablePtr->KeyColumnTypes, key, *AppData()->TypeRegistry)
+                        << " modified=" << modified);
+
                     for (ui64 txId : observer->ReadConflicts) {
                         SysLocksTable().AddReadConflict(txId);
                     }
