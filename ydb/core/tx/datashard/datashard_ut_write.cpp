@@ -4489,5 +4489,93 @@ Y_UNIT_TEST_SUITE(DataShardWrite) {
         UNIT_ASSERT_VALUES_EQUAL(getTxCompleteLagCounter(), 0u);
     }
 
+    // Regression test for a bug where a locked INSERT could silently overwrite a row committed
+    // by a concurrent non-locked INSERT, because the locked write's dep_tracker snapshot was
+    // computed from ImmediateWriteEdgeReplied (stale) rather than ImmediateWriteEdge (current).
+    //
+    // Scenario:
+    //   T1: non-locked INSERT of key=1 → executes at version X+1/0, reply delayed (step X+1 > observedStep X).
+    //       ImmediateWriteEdge advances to X+1/0 but ImmediateWriteEdgeReplied stays at X/MaxU64.
+    //   T2: locked INSERT of key=1 → dep_tracker computes readVersion = ImmediateWriteEdgeReplied = X/MaxU64.
+    //       RowExists check at X/MaxU64 misses T1's row (committed at X+1/0) → INSERT proceeds → duplicate!
+    //
+    // With the fix, GetMvccTxVersion(ReadWrite) for snapshot reads returns Max(snapshot, ImmediateWriteEdge),
+    // so T2 sees the row committed by T1 and correctly returns STATUS_CONSTRAINT_VIOLATION.
+    Y_UNIT_TEST(LockedInsertWithStaleMvccSnapshot) {
+        auto [runtime, server, sender] = TestCreateServer();
+
+        auto opts = TShardedTableOptions()
+            .Columns({
+                {"key", "Uint64", true, false},
+                {"value", "Uint64", false, false},
+            });
+        auto [shards, tableId] = CreateShardedTable(server, sender, "/Root", "table", opts);
+        const ui64 shard = shards[0];
+        ui64 txId = 100;
+
+        // Initial UPSERT to advance ImmediateWriteEdge so that CompleteEdge.Step = X,
+        // which makes writeEdge = X/MaxU64 and writeEdge.Next() = X+1/0 (step increment).
+        // This is necessary so that the next immediate write goes to step X+1,
+        // which triggers a delayed reply (X+1 > observedStep X).
+        {
+            auto req = MakeWriteRequestOneKeyValue(++txId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE,
+                NKikimrDataEvents::TEvWrite_TOperation::OPERATION_UPSERT, tableId, opts.Columns_, 0, 0);
+            Write(runtime, sender, shard, std::move(req));
+        }
+
+        // Block mediator time updates to keep the window open:
+        // after T1 executes, its reply is delayed and ImmediateWriteEdgeReplied stays stale.
+        TBlockEvents<TEvMediatorTimecast::TEvUpdate> blockUpdate(runtime);
+        TBlockEvents<TEvMediatorTimecast::TEvGranularUpdate> blockGranular(runtime);
+
+        // T1: non-locked INSERT of key=1.
+        // Executes at version X+1/0; reply is put into MediatorDelayedReplies.
+        // ImmediateWriteEdge becomes X+1/0, ImmediateWriteEdgeReplied stays at X/MaxU64.
+        auto t1Sender = runtime.AllocateEdgeActor();
+        {
+            auto req = MakeWriteRequestOneKeyValue(++txId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE,
+                NKikimrDataEvents::TEvWrite_TOperation::OPERATION_INSERT, tableId, opts.Columns_, 1, 100);
+            runtime.SendToPipe(shard, t1Sender, req.release(), 0, GetPipeConfigWithRetries());
+        }
+
+        // T2: locked INSERT of key=1.
+        // Both T1 and T2 go through ProposeQueue in FIFO order.
+        // T1's TEvDelayedProposeTransaction fires first (executes, ImmediateWriteEdge=X+1/0, reply delayed).
+        // T2's TEvDelayedProposeTransaction fires next: dep_tracker computes
+        //   readVersion = ImmediateWriteEdgeReplied = X/MaxU64 (stale, bug)
+        //   RowExists at X/MaxU64 misses T1's row → INSERT proceeds → silent duplicate.
+        // With the fix: readVersion = Max(X/MaxU64, ImmediateWriteEdge=X+1/0) = X+1/0
+        //   RowExists at X+1/0 finds T1's row → STATUS_CONSTRAINT_VIOLATION.
+        auto t2Sender = runtime.AllocateEdgeActor();
+        {
+            auto req = MakeWriteRequestOneKeyValue(++txId, NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE,
+                NKikimrDataEvents::TEvWrite_TOperation::OPERATION_INSERT, tableId, opts.Columns_, 1, 200);
+            req->Record.SetLockTxId(999999);
+            req->Record.SetLockNodeId(runtime.GetNodeId(0));
+            runtime.SendToPipe(shard, t2Sender, req.release(), 0, GetPipeConfigWithRetries());
+        }
+
+        // Let T1 and T2 execute (in FIFO order via ProposeQueue).
+        // T2's reply (at version X/MaxU64) comes out immediately (not delayed).
+        SimulateSleep(server, TDuration::MilliSeconds(100));
+
+        auto t2Ev = runtime.GrabEdgeEventRethrow<NEvents::TDataEvents::TEvWriteResult>(t2Sender, TDuration::Seconds(5));
+        UNIT_ASSERT_C(t2Ev, "T2 write result not received");
+        UNIT_ASSERT_VALUES_EQUAL_C(
+            t2Ev->Get()->Record.GetStatus(),
+            NKikimrDataEvents::TEvWriteResult::STATUS_CONSTRAINT_VIOLATION,
+            "T2 locked INSERT should fail with CONSTRAINT_VIOLATION (key=1 was already committed by T1), "
+            "not silently succeed due to a stale MVCC snapshot");
+
+        // Unblock mediator so T1's delayed reply is released.
+        blockUpdate.Stop().Unblock();
+        blockGranular.Stop().Unblock();
+        SimulateSleep(server, TDuration::MilliSeconds(100));
+
+        auto t1Ev = runtime.GrabEdgeEventRethrow<NEvents::TDataEvents::TEvWriteResult>(t1Sender, TDuration::Seconds(5));
+        UNIT_ASSERT_C(t1Ev, "T1 write result not received");
+        UNIT_ASSERT_VALUES_EQUAL(t1Ev->Get()->Record.GetStatus(), NKikimrDataEvents::TEvWriteResult::STATUS_COMPLETED);
+    }
+
 } // Y_UNIT_TEST_SUITE(DataShardWrite)
 } // namespace NKikimr
