@@ -34,7 +34,10 @@ public:
         Setup(settings);
 
         Kikimr = std::make_unique<TKikimrRunner>(settings);
-        Tests::NCommon::TLoggerInit(*Kikimr).Initialize();
+        Tests::NCommon::TLoggerInit(*Kikimr)
+            .AddComponents({NKikimrServices::TX_DATASHARD}, "shards")
+            .SetPriority(NActors::NLog::PRI_TRACE)
+            .Initialize();
 
         auto client = Kikimr->GetQueryClient();
 

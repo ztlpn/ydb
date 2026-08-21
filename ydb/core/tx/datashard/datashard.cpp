@@ -860,7 +860,7 @@ void TDataShard::SendWriteResult(const TActorContext& ctx, std::unique_ptr<NEven
         return;
     }
 
-    LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, "Complete write [" << step << " : " << txId << "] from " << TabletID() << " at tablet " << TabletID() << " send result to client " << target);
+    LOG_NOTICE_S(ctx, NKikimrServices::TX_DATASHARD, "Complete write [" << step << " : " << txId << "] from " << TabletID() << " at tablet " << TabletID() << " send result to client " << target << " res: " << result->Record.ShortDebugString());
 
     LWTRACK(ProposeTransactionSendResult, result->GetOrbit());
     ctx.Send(target, result.release(), 0, 0, span.GetTraceId());
@@ -2457,7 +2457,7 @@ TRowVersion TDataShard::GetMvccTxVersion(EMvccTxMode mode, TOperation* op) const
         }
     }
 
-    LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, "GetMvccTxVersion at " << TabletID()
+    LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, "GetMvccTxVersion at " << TabletID()
         << " CompleteEdge# " << SnapshotManager.GetCompleteEdge()
         << " IncompleteEdge# " << SnapshotManager.GetIncompleteEdge()
         << " UnprotectedReadEdge# " << SnapshotManager.GetUnprotectedReadEdge()
@@ -2496,8 +2496,16 @@ TRowVersion TDataShard::GetMvccTxVersion(EMvccTxMode mode, TOperation* op) const
         // If there's any planned operation that is above our edge, it would be a
         // suitable version for a new immediate operation. We effectively try to
         // execute "before" that point if possible.
-        if (auto nextOp = Pipeline.GetNextPlannedOp(edge.Step, edge.TxId))
+        if (auto nextOp = Pipeline.GetNextPlannedOp(edge.Step, edge.TxId)) {
+            LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+                "GetMvccTxVersion FFF " << TabletID()
+                << " mode=" << (mode == EMvccTxMode::ReadOnly ? "ReadOnly" : "ReadWrite")
+                << " readEdge=" << readEdge
+                << " writeEdge=" << writeEdge
+                << " nextOpVersion=" << TRowVersion(nextOp->GetStep(), nextOp->GetTxId()));
+
             return TRowVersion(nextOp->GetStep(), nextOp->GetTxId());
+        }
 
         // Normally we stick transactions to the end of the last known mediator step
         // Note this calculations only happen when we don't have distributed
@@ -2505,37 +2513,66 @@ TRowVersion TDataShard::GetMvccTxVersion(EMvccTxMode mode, TOperation* op) const
         // up to the current mediator time. The mediator time itself may be stale,
         // in which case we may have evidence of its higher value via complete and
         // incomplete edges above.
-        const ui64 mediatorStep = Max(MediatorTimeCastEntry ? MediatorTimeCastEntry->Get(TabletID()) : 0, writeEdge.Step);
+        const ui64 mediatorTimeCast = MediatorTimeCastEntry ? MediatorTimeCastEntry->Get(TabletID()) : 0;
+        const ui64 mediatorStep = Max(mediatorTimeCast, writeEdge.Step);
         TRowVersion mediatorEdge(mediatorStep, ::Max<ui64>());
 
+        TRowVersion result;
         switch (mode) {
             case EMvccTxMode::ReadOnly: {
                 // We read at the end of the current step
-                return mediatorEdge;
+                result = mediatorEdge;
+                break;
             }
 
             case EMvccTxMode::ReadWrite: {
                 // We write at the end of the current step, or the start of the next step when that's protected
-                return Max(mediatorEdge, writeEdge.Next());
+                result = Max(mediatorEdge, writeEdge.Next());
+                break;
             }
+
+            default:
+                Y_ENSURE(false, "unreachable");
         }
 
-        Y_ENSURE(false, "unreachable");
+        LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+            "GetMvccTxVersion intermediate at " << TabletID()
+            << " mode=" << (mode == EMvccTxMode::ReadOnly ? "ReadOnly" : "ReadWrite")
+            << " readEdge=" << readEdge
+            << " writeEdge=" << writeEdge
+            << " mediatorTimeCast=" << mediatorTimeCast
+            << " mediatorEdge=" << mediatorEdge
+            << " writeEdgeNext=" << writeEdge.Next()
+            << " result=" << result);
+
+        return result;
     }();
 
+    TRowVersion finalResult;
     switch (mode) {
         case EMvccTxMode::ReadOnly: {
             // We must read all writes we have replied to already
-            return Max(version, SnapshotManager.GetImmediateWriteEdgeReplied());
+            finalResult = Max(version, SnapshotManager.GetImmediateWriteEdgeReplied());
+            break;
         }
 
         case EMvccTxMode::ReadWrite: {
             // We must never go backwards in our single-shard writes
-            return Max(version, SnapshotManager.GetImmediateWriteEdge());
+            finalResult = Max(version, SnapshotManager.GetImmediateWriteEdge());
+            break;
         }
+
+        default:
+            Y_ENSURE(false, "unreachable");
     }
 
-    Y_ENSURE(false, "unreachable");
+    LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+        "GetMvccTxVersion final at " << TabletID()
+        << " mode=" << (mode == EMvccTxMode::ReadOnly ? "ReadOnly" : "ReadWrite")
+        << " intermediate=" << version
+        << " finalResult=" << finalResult);
+
+    return finalResult;
 }
 
 TRowVersion TDataShard::GetMvccVersion(TOperation* op) const {
@@ -2545,7 +2582,14 @@ TRowVersion TDataShard::GetMvccVersion(TOperation* op) const {
 
     if (op) {
         if (!op->CachedMvccVersion) {
-            op->CachedMvccVersion = GetMvccTxVersion(op->IsReadOnly() ? EMvccTxMode::ReadOnly : EMvccTxMode::ReadWrite, op);
+            EMvccTxMode mode = op->IsReadOnly() ? EMvccTxMode::ReadOnly : EMvccTxMode::ReadWrite;
+            LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+                "GetMvccVersion at " << TabletID()
+                << " opId=" << op->GetTxId()
+                << " isReadOnly=" << op->IsReadOnly()
+                << " lockTxId=" << op->LockTxId()
+                << " mode=" << (mode == EMvccTxMode::ReadOnly ? "ReadOnly" : "ReadWrite"));
+            op->CachedMvccVersion = GetMvccTxVersion(mode, op);
         }
 
         return *op->CachedMvccVersion;

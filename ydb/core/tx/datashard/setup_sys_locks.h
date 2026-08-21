@@ -46,6 +46,12 @@ struct TSetupSysLocks
 
         auto mvccVersion = self.GetMvccVersion(op.Get());
 
+        LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+            "TSetupSysLocks mvccVersion at " << self.TabletID()
+            << " opId=" << op->GetTxId()
+            << " lockTxId=" << op->LockTxId()
+            << " mvccVersion=" << mvccVersion);
+
         // check whether the current operation is a part of an out-of-order Tx
         bool outOfOrder = false;
         if (auto &activeOps = self.Pipeline.GetActivePlannedOps()) {

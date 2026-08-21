@@ -64,6 +64,9 @@ namespace NKikimr::NDataShard {
                 auto tid = pr.second->LocalTid;
                 for (ui64 commitTxId : info->CommitTxIds) {
                     if (txc.DB.HasOpenTx(tid, commitTxId)) {
+                        YDB_LOG_NOTICE("Committing LockTxId (Volatile TX case)",
+                            {"lockTxId", commitTxId},
+                            {"version", info->Version});
                         txc.DB.CommitTx(tid, commitTxId, info->Version);
                         Self->GetConflictsCache().GetTableCache(tid).RemoveUncommittedWrites(commitTxId, txc.DB);
                     } else if (txc.DB.HasRemovedTx(tid, commitTxId)) {

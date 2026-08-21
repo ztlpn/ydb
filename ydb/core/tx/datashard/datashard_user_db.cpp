@@ -569,6 +569,10 @@ void TDataShardUserDb::CommitChanges(const TTableId& tableId, ui64 lockId) {
         return;
     }
 
+    LOG_NOTICE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD,
+        "Committing LockTxId (Immediate case) lockTxId=" << lockId
+        << " version=" << MvccVersion);
+
     LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TX_DATASHARD, "Committing changes lockId# " << lockId << " in localTid# " << localTid << " shard# " << Self.TabletID());
     Db.CommitTx(localTid, lockId, MvccVersion);
     Self.GetConflictsCache().GetTableCache(localTid).RemoveUncommittedWrites(lockId, Db);
