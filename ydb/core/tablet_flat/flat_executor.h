@@ -370,6 +370,7 @@ class TExecutor
     const TIntrusivePtr<ITimeProvider> Time = nullptr;
     NFlatExecutorSetup::ITablet * Owner;
     const TActorId OwnerActorId;
+    const ui32 OwnerActivityType = 0;
     TAutoPtr<NUtil::ILogger> Logger;
 
     ui32 FollowerId = 0;
