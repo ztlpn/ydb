@@ -229,11 +229,16 @@ public:
     void InitCommit(std::vector<ui64> participants);
 
     template<class... TOps>
-    TWritePromise SendPrepareCommit(const TTableId& tableId, ui64 shardId, TOps&&... ops) {
+    TWritePromise SendPrepareCommit(
+            const TTableId& tableId, ui64 shardId, bool volatileCommit, TOps&&... ops) {
         auto sender = Runtime.AllocateEdgeActor();
         ui32 nodeIndex = sender.NodeId() - Runtime.GetNodeId(0);
 
-        auto* req = new NEvents::TDataEvents::TEvWrite(CommitTxId, NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE);
+        auto* req = new NEvents::TDataEvents::TEvWrite(
+            CommitTxId,
+            volatileCommit
+                ? NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE
+                : NKikimrDataEvents::TEvWrite::MODE_PREPARE);
         req->Record.SetLockMode(LockMode);
         if (Snapshot) {
             req->Record.MutableMvccSnapshot()->SetStep(Snapshot->Step);
@@ -255,9 +260,7 @@ public:
         return { *this, sender };
     }
 
-    template<class... TOps>
-    TWritePromise PrepareCommit(const TTableId& tableId, ui64 shardId, TOps&&... ops) {
-        auto promise = SendPrepareCommit(tableId, shardId, std::forward<TOps>(ops)...);
+    void WaitPrepare(TWritePromise& promise) {
         auto msg = promise.NextResult();
         UNIT_ASSERT_VALUES_EQUAL(msg->Record.GetStatus(), NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED);
         MinStep = Max(MinStep, msg->Record.GetMinStep());
@@ -265,10 +268,25 @@ public:
         for (ui64 coordinator : msg->Record.GetDomainCoordinators()) {
             Coordinator = coordinator;
         }
+    }
+
+    template<class... TOps>
+    TWritePromise PrepareCommit(const TTableId& tableId, ui64 shardId, TOps&&... ops) {
+        auto promise = SendPrepareCommit(
+            tableId, shardId, /*volatilePrepare=*/true, std::forward<TOps>(ops)...);
+        WaitPrepare(promise);
         return promise;
     }
 
-    void SendPlan();
+    template<class... TOps>
+    TWritePromise PrepareNonVolatileCommit(const TTableId& tableId, ui64 shardId, TOps&&... ops) {
+        auto promise = SendPrepareCommit(
+            tableId, shardId, /*volatilePrepare=*/false, std::forward<TOps>(ops)...);
+        WaitPrepare(promise);
+        return promise;
+    }
+
+    void SendPlan(bool volatileCommit = true);
 
     TString Rollback(ui64 shardId);
 
