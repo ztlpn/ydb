@@ -154,10 +154,11 @@ public:
         if (!Self->SysLocksTable().GetLocks().empty()) {
             const bool lockTransferEnabled = AppData(ctx)
                 ->FeatureFlags.GetEnableDataShardLocksTransferOnSplit();
-            auto lockTransferPredicate = [lockTransferEnabled](const TLockInfo& lock) {
+            auto lockTransferPredicate = [this, lockTransferEnabled](const TLockInfo& lock) {
                 return lockTransferEnabled
                     && !lock.IsBroken()
-                    && lock.IsPersistent() && lock.GetReadTables().empty();
+                    && lock.IsPersistent() && lock.GetReadTables().empty()
+                    && !Self->HasLockChangeRecords(lock.GetLockId());
             };
 
             auto countBefore = Self->SysLocksTable().GetLocks().size();
