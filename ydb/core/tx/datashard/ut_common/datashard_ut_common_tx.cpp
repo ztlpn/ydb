@@ -323,7 +323,7 @@ void TTransactionState::InitCommit(std::vector<ui64> participants) {
     Participants = std::move(participants);
 }
 
-void TTransactionState::SendPlan() {
+void TTransactionState::SendPlan(bool volatileCommit) {
     UNIT_ASSERT(Coordinator != 0);
     UNIT_ASSERT(MinStep <= MaxStep);
     UNIT_ASSERT(!Participants.empty());
@@ -333,7 +333,7 @@ void TTransactionState::SendPlan() {
             .Coordinator = Coordinator,
             .MinStep = MinStep,
             .MaxStep = MaxStep,
-            .Volatile = true,
+            .Volatile = volatileCommit,
         });
 }
 

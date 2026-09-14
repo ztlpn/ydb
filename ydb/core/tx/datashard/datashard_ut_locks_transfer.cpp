@@ -410,6 +410,72 @@ Y_UNIT_TEST(ConflictsBrokenAncestorLock) {
         "{ items { uint32_value: 15 } items { int32_value: 1501 } }");
 }
 
+Y_UNIT_TEST(NonVolatileCommit) {
+    TTestEnv env({});
+    auto [server, runtime, sender, tableId, shards] = env.GetAll();
+
+    // Turn off "always volatile" commit path, so that we can initiate an old-style
+    // non-volatile distributed commit.
+    runtime.GetAppData().FeatureFlags.SetEnableDataShardWriteAlwaysVolatile(false);
+
+    TTransactionState tx(runtime, NKikimrDataEvents::PESSIMISTIC_NONE);
+
+    // Lock and upsert two rows.
+    UNIT_ASSERT_VALUES_EQUAL(tx.LockRows(tableId, shards.at(0), {1}), "OK");
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx.Write(tableId, shards.at(0), TWriteOperation::Upsert(1, 100)),
+        "OK");
+
+    UNIT_ASSERT_VALUES_EQUAL(tx.LockRows(tableId, shards.at(0), {15}), "OK");
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx.Write(tableId, shards.at(0), TWriteOperation::Upsert(15, 1500)),
+        "OK");
+
+    // Split into 2 shards, each row in its own shard.
+    auto oldShards = shards;
+    env.Split(0, 10);
+
+    tx.MapAncestorShard(shards.at(0), oldShards.at(0));
+    tx.MapAncestorShard(shards.at(1), oldShards.at(0));
+
+    // Dispatch a non-volatile commit.
+    tx.InitCommit({shards.at(0), shards.at(1)});
+    auto commit0 = tx.PrepareNonVolatileCommit(tableId, shards.at(0));
+    auto commit1 = tx.PrepareNonVolatileCommit(tableId, shards.at(1));
+
+    // Block the readset from shard 0 to shard 1 so that there is a delay between
+    // lock validation and lock commit on shard 1.
+    auto shard0Actor = ResolveTablet(runtime, shards.at(0));
+    TBlockEvents<TEvTxProcessing::TEvReadSet> blockReadSet(runtime, [&](auto& ev) {
+        if (ev->Sender != shard0Actor) {
+            return false;
+        }
+        auto* msg = ev->Get();
+        return !(msg->Record.GetFlags() & NKikimrTx::TEvReadSet::FLAG_EXPECT_READSET);
+    });
+
+    tx.SendPlan(/*volatileCommit=*/false);
+    UNIT_ASSERT_VALUES_EQUAL(commit0.NextString(), "OK");
+    UNIT_ASSERT_VALUES_EQUAL(commit1.NextString(TDuration::Seconds(1)), "<timeout>");
+    runtime.WaitFor("blocked ReadSet", [&] { return !blockReadSet.empty(); });
+
+    // Reset the session-side lock handle, so that the shard receives the
+    // TEvLockStatus::STATUS_UNAVAILABLE message from LongTxService.
+    // But the shard should not remove the lock, as the transaction outcome is already
+    // decided at this point (the transaction must successfully commit).
+    tx.LockHandle.Reset();
+    runtime.SimulateSleep(TDuration::MilliSeconds(100));
+    blockReadSet.Stop().Unblock();
+    UNIT_ASSERT_VALUES_EQUAL(commit1.NextString(), "OK");
+
+    UNIT_ASSERT_VALUES_EQUAL(
+        KqpSimpleExec(runtime, R"(
+            SELECT key, value FROM `/Root/table` ORDER BY key;
+        )"),
+        "{ items { uint32_value: 1 } items { int32_value: 100 } }, "
+        "{ items { uint32_value: 15 } items { int32_value: 1500 } }");
+}
+
 } // Y_UNIT_TEST_SUITE(DataShardLocksTransfer)
 
 } // namespace NKikimr
