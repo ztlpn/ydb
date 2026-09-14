@@ -360,6 +360,56 @@ Y_UNIT_TEST_TWIN(ConflictsSimple, CommitInWriteOrder) {
     }
 }
 
+Y_UNIT_TEST(ConflictsBrokenAncestorLock) {
+    TTestEnv env({});
+    auto [server, runtime, sender, tableId, shards] = env.GetAll();
+
+    TTransactionState tx1(runtime, NKikimrDataEvents::PESSIMISTIC_NONE);
+    tx1.WriterIndex = 123;
+
+    // Tx1: lock and upsert a row to each of the shards.
+    UNIT_ASSERT_VALUES_EQUAL(tx1.LockRows(tableId, shards.at(0), {1}), "OK");
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx1.Write(tableId, shards.at(0), TWriteOperation::Upsert(1, 100)),
+        "OK");
+
+    UNIT_ASSERT_VALUES_EQUAL(tx1.LockRows(tableId, shards.at(0), {15}), "OK");
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx1.Write(tableId, shards.at(0), TWriteOperation::Upsert(15, 1500)),
+        "OK");
+
+    // Split into 2 shard, execute a conflicting transaction that breaks tx1
+    // on one of the shards, and merge into a single shard again.
+    auto oldShards = shards;
+    env.Split(0, 10);
+
+    ExecSQL(server, sender, R"(
+        UPSERT INTO `/Root/table` (key, value) VALUES (15, 1501);
+    )");
+
+    for (auto shardId : shards) {
+        // Compact to avoid a "must not back-borrow parts" error when merging.
+        auto res = CompactBorrowed(runtime, shardId, tableId);
+    }
+    env.Merge(0, 1);
+    tx1.MapAncestorShard(shards.at(0), oldShards.at(0));
+
+    // tx1 should be aborted, so additional updates should fail.
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx1.Write(tableId, shards.at(0), TWriteOperation::Upsert(1, 101)),
+        "ERROR: STATUS_LOCKS_BROKEN");
+
+    UNIT_ASSERT_VALUES_EQUAL(
+        tx1.WriteCommit(tableId, shards.at(0)),
+        "ERROR: STATUS_LOCKS_BROKEN");
+
+    UNIT_ASSERT_VALUES_EQUAL(
+        KqpSimpleExec(runtime, R"(
+            SELECT key, value FROM `/Root/table` ORDER BY key;
+        )"),
+        "{ items { uint32_value: 15 } items { int32_value: 1501 } }");
+}
+
 } // Y_UNIT_TEST_SUITE(DataShardLocksTransfer)
 
 } // namespace NKikimr
