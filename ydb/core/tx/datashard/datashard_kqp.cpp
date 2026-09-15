@@ -123,6 +123,10 @@ TVector<NKikimrDataEvents::TLock> ValidateLocks(
             }
 
             auto lockInfo = sysLocks.GetRawLock(lockProto.GetLockId());
+            const TPathId tableId(lockProto.GetSchemeShard(), lockProto.GetPathId());
+            if (lockInfo) {
+                sysLocks.LogLock(*lockInfo, tableId);
+            }
             if (!lockInfo || lockInfo->IsBroken()) {
                 YDB_LOG_TRACE("ValidateLocks: broken ancestor lock (main lock not found or broken)",
                     {"lockId", lockProto.GetLockId()},
@@ -131,7 +135,6 @@ TVector<NKikimrDataEvents::TLock> ValidateLocks(
                 continue;
             }
 
-            const TPathId tableId(lockProto.GetSchemeShard(), lockProto.GetPathId());
             if (!lockInfo->GetReadTables().contains(tableId)
                 && !lockInfo->GetWriteTables().contains(tableId)) {
                  YDB_LOG_TRACE("ValidateLocks: broken ancestor lock (lock is not set for table)",

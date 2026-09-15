@@ -1829,6 +1829,15 @@ bool TSysLocks::HasWriteLocks(const TTableId& tableId) const {
     return false;
 }
 
+void TSysLocks::LogLock(const TLockInfo& lock, const TPathId& tableId) {
+    if (AccessLog) {
+        AccessLog->Locks[lock.GetLockId()] = MakeLock(
+            lock.GetLockId(), SelfShardId(),
+            lock.Generation, lock.Counter,
+            tableId, lock.IsWriteLock(), lock.GetLockWriteSeqNum());
+    }
+}
+
 EEnsureCurrentLock TSysLocks::EnsureCurrentLock(bool createMissing) {
     Y_ENSURE(Update && Update->LockTxId);
     Y_ENSURE(Db, "EnsureCurrentLock needs a valid locks database");
@@ -1888,7 +1897,7 @@ TSysLocks::TLock TSysLocks::MakeLock(
 
 TSysLocks::TLock TSysLocks::MakeAndLogLock(
     ui64 lockTxId, ui64 shardId, ui32 generation, ui64 counter,
-    const TPathId& pathId, bool hasWrites,TLockWriteSeqNum writeSeqNum) const
+    const TPathId& pathId, bool hasWrites, TLockWriteSeqNum writeSeqNum) const
 {
     TLock lock = MakeLock(lockTxId, shardId, generation, counter, pathId, hasWrites, writeSeqNum);
     if (AccessLog)

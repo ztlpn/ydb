@@ -410,7 +410,7 @@ Y_UNIT_TEST(ConflictsBrokenAncestorLock) {
         "{ items { uint32_value: 15 } items { int32_value: 1501 } }");
 }
 
-Y_UNIT_TEST(NonVolatileCommit) {
+Y_UNIT_TEST_TWIN(NonVolatileCommit, RebootShard) {
     TTestEnv env({});
     auto [server, runtime, sender, tableId, shards] = env.GetAll();
 
@@ -465,6 +465,11 @@ Y_UNIT_TEST(NonVolatileCommit) {
     // decided at this point (the transaction must successfully commit).
     tx.LockHandle.Reset();
     runtime.SimulateSleep(TDuration::MilliSeconds(100));
+
+    if (RebootShard) {
+        RebootTablet(runtime, shards.at(1), sender);
+    }
+
     blockReadSet.Stop().Unblock();
     UNIT_ASSERT_VALUES_EQUAL(commit1.NextString(), "OK");
 

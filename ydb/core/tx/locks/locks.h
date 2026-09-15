@@ -1270,6 +1270,8 @@ public:
     bool HasCurrentWriteLocks() const;
     bool HasWriteLocks(const TTableId& tableId) const;
 
+    void LogLock(const TLockInfo&, const TPathId& tableId);
+
     TRuntimeLockHolder AddRuntimeLock(const TTableId& tableId, TConstArrayRef<TCell> key);
 
     /**
