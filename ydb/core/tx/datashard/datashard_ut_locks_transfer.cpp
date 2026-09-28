@@ -418,7 +418,10 @@ Y_UNIT_TEST_TWIN(NonVolatileCommit, RebootShard) {
     // non-volatile distributed commit.
     runtime.GetAppData().FeatureFlags.SetEnableDataShardWriteAlwaysVolatile(false);
 
+    env.Split(0, 10);
+
     TTransactionState tx(runtime, NKikimrDataEvents::PESSIMISTIC_NONE);
+    tx.WriterIndex = 123;
 
     // Lock and upsert two rows.
     UNIT_ASSERT_VALUES_EQUAL(tx.LockRows(tableId, shards.at(0), {1}), "OK");
@@ -426,17 +429,22 @@ Y_UNIT_TEST_TWIN(NonVolatileCommit, RebootShard) {
         tx.Write(tableId, shards.at(0), TWriteOperation::Upsert(1, 100)),
         "OK");
 
-    UNIT_ASSERT_VALUES_EQUAL(tx.LockRows(tableId, shards.at(0), {15}), "OK");
+    UNIT_ASSERT_VALUES_EQUAL(tx.LockRows(tableId, shards.at(1), {15}), "OK");
     UNIT_ASSERT_VALUES_EQUAL(
-        tx.Write(tableId, shards.at(0), TWriteOperation::Upsert(15, 1500)),
+        tx.Write(tableId, shards.at(1), TWriteOperation::Upsert(15, 1500)),
         "OK");
 
-    // Split into 2 shards, each row in its own shard.
-    auto oldShards = shards;
-    env.Split(0, 10);
-
-    tx.MapAncestorShard(shards.at(0), oldShards.at(0));
-    tx.MapAncestorShard(shards.at(1), oldShards.at(0));
+    // Mess with seqnums so that the transaction aborts.
+    for (auto it = tx.Locks.rbegin(); it != tx.Locks.rend(); ++it) {
+        if (it->GetDataShard() == shards.at(1)) {
+            for (auto& seqNum : *it->MutableWriteSeqNums()) {
+                if (seqNum.GetWriterIndex() == 123) {
+                    seqNum.SetWriteSeqNum(666);
+                }
+            }
+            break;
+        }
+    }
 
     // Dispatch a non-volatile commit.
     tx.InitCommit({shards.at(0), shards.at(1)});
@@ -455,7 +463,7 @@ Y_UNIT_TEST_TWIN(NonVolatileCommit, RebootShard) {
     });
 
     tx.SendPlan(/*volatileCommit=*/false);
-    UNIT_ASSERT_VALUES_EQUAL(commit0.NextString(), "OK");
+    UNIT_ASSERT_VALUES_EQUAL(commit0.NextString(), "ERROR: STATUS_LOCKS_BROKEN");
     UNIT_ASSERT_VALUES_EQUAL(commit1.NextString(TDuration::Seconds(1)), "<timeout>");
     runtime.WaitFor("blocked ReadSet", [&] { return !blockReadSet.empty(); });
 
