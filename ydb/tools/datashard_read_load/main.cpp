@@ -289,9 +289,9 @@ public:
                 // Probe first so expensive dispatch work cannot consistently
                 // defer the independent useful-work probe.
                 for (size_t p : {size_t(Probe), size_t(Long), size_t(Short)}) {
-                    const uint64_t due = clocks[p].Poll(now);
-                    if (due) {
-                        Arrivals(p, phase, due, now, clocks[p].LastDueUs(), now < end);
+                    const auto batch = clocks[p].PollBatch(SinceUs(Start_), Options_.DispatchBatch);
+                    if (batch.Scheduled) {
+                        Arrivals(p, phase, batch, clocks[p], end);
                     }
                 }
                 ReportIfDue(spec.Name);
@@ -400,15 +400,26 @@ private:
         function(Origins_[origin][population]);
     }
 
-    void Arrivals(size_t p, size_t origin, uint64_t due, int64_t now, int64_t lastDue, bool allowLaunch) {
-        const uint64_t late = due - (allowLaunch ? 1 : 0);
+    void Arrivals(size_t p, size_t origin, const TArrivalBatch& batch, const TArrivalClock& clock, int64_t endUs) {
         Update(p, origin, [&](TStats& stats) {
-            stats.Scheduled += due;
-            stats.SkippedScheduler += late;
+            stats.Scheduled += batch.Scheduled;
+            stats.SkippedScheduler += batch.Scheduled - batch.Dispatch;
         });
-        if (!allowLaunch) {
-            return;
+        for (uint64_t i = 0; i < batch.Dispatch; ++i) {
+            const int64_t now = SinceUs(Start_);
+            if (StopRequested || now >= endUs) {
+                Update(p, origin, [&](TStats& stats) { stats.SkippedScheduler += batch.Dispatch - i; });
+                break;
+            }
+            if (Free_[p].empty()) {
+                Update(p, origin, [&](TStats& stats) { stats.SkippedCapacity += batch.Dispatch - i; });
+                break;
+            }
+            Launch(p, origin, now, clock.DueUs(batch.FirstIndex + i));
         }
+    }
+
+    void Launch(size_t p, size_t origin, int64_t now, int64_t dueUs) {
         if (Free_[p].empty() || !Capacity_.Acquire(p)) {
             Update(p, origin, [](TStats& stats) { ++stats.SkippedCapacity; });
             return;
@@ -419,7 +430,7 @@ private:
         slot.Origin = origin;
         Update(p, origin, [&](TStats& stats) {
             ++stats.Launched;
-            stats.SchedulerDelay.RecordValue(std::max<int64_t>(1, now - lastDue));
+            stats.SchedulerDelay.RecordValue(std::max<int64_t>(1, now - dueUs));
         });
         auto queue = Queue_;
         const auto start = TClock::now();
@@ -590,6 +601,7 @@ private:
         json["database"] = Options_.Database;
         json["table"] = Options_.Table;
         json["seed"] = Options_.Seed;
+        json["dispatch_batch"] = Options_.DispatchBatch;
         json["rows"] = Options_.Rows;
         json["rows_per_read"] = Options_.RowsPerRead;
         json["cancel_after_us"] = Options_.CancelAfterUs;

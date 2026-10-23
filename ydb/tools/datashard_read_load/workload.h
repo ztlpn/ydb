@@ -26,6 +26,7 @@ struct TOptions {
     uint64_t PayloadBytes = 64;
     uint64_t RowsPerRead = 1;
     uint64_t Seed = 1;
+    uint64_t DispatchBatch = 64;
     std::array<uint64_t, PopulationCount> Caps = {};
     uint64_t ProbeRate = 1;
     int64_t CancelAfterUs = 100000;
@@ -37,12 +38,20 @@ struct TOptions {
 
 TOptions ParseOptions(int argc, char** argv);
 
-// A deterministic open-loop clock. Poll consumes every elapsed arrival but the
-// caller launches at most one, counting the others as skipped. No catch-up queue.
+struct TArrivalBatch {
+    uint64_t Scheduled = 0;
+    uint64_t Dispatch = 0;
+    uint64_t FirstIndex = 0;
+};
+
+// A deterministic open-loop clock. Elapsed arrivals are consumed immediately;
+// at most batchLimit are eligible for dispatch, without retaining a backlog.
 class TArrivalClock {
 public:
     TArrivalClock(uint64_t rate, int64_t startUs, int64_t endUs);
     uint64_t Poll(int64_t nowUs);
+    TArrivalBatch PollBatch(int64_t nowUs, uint64_t batchLimit);
+    int64_t DueUs(uint64_t index) const;
     int64_t NextUs() const;
     int64_t LastDueUs() const;
 

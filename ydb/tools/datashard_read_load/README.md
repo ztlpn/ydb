@@ -50,10 +50,17 @@ must be less than the operation timeout. First measure healthy latency and choos
 a cancellation deadline above it, so requests normally reach the shard before
 becoming obsolete under congestion.
 
-Arrivals follow a monotonic clock independently of completions. When the clock
-falls behind, elapsed arrivals are counted and skipped, with at most one launch
-per stream per scheduling pass. An occupied or unavailable session also causes
-a counted skip. There is no unbounded waiting queue or catch-up burst. SDK query
+Arrivals follow a monotonic clock independently of completions. Each scheduling
+pass dispatches up to `--dispatch-batch` elapsed arrivals per stream (default 64,
+range 1–1,024). Batching absorbs ordinary timer wakeup jitter: for example, 50,000
+requests/s requires four launches per 80us wakeup. A limit of one would drop three
+of those arrivals and impose an artificial rate ceiling. Use `--dispatch-batch 1`
+to reproduce the original single-dispatch behavior for comparison.
+
+When more arrivals have elapsed than the batch limit, only the most recent batch
+is eligible and older arrivals are counted as scheduler skips. Skipped arrivals
+are never retained for later dispatch. An occupied or unavailable session also
+causes a counted skip. Batch dispatch stops at phase end or interruption. SDK query
 retries are disabled; normal KQP iterator retries remain part of server behavior.
 Broken sessions are replaced asynchronously, with failures and replacements
 reported separately. Failed replacements are retried at most once per reporting
@@ -105,6 +112,21 @@ the small-cap smoke run cannot test that condition. Large session populations ca
 hit KQP/session, gRPC, client CPU, or memory limits first. Inspect actual launches,
 skips, statuses, and shard counters before attributing a limit to the mailbox.
 Adjust operation timeouts if admitted work must survive longer than a phase.
+
+To test whether cancellation traffic sustains an already populated queue, keep
+the short stream enabled in a separate pressure phase. For example, after the
+burst above, add `--phase pressure:30s:2000:20000` before recovery. A long-only
+burst does not generate the intended deadline cancellations; KQP may still send
+cancellations when retrying or cleaning up iterators.
+
+Check achieved load before increasing concurrency. In the final `origins` entry
+for each phase, divide `launched` by the configured phase duration. A large
+`skipped_scheduler` count with zero `skipped_capacity` means raising the in-flight
+cap cannot fix the lost arrivals. Batching removes the one-dispatch-per-wakeup
+limit, but client CPU or SDK processing can still constrain the achieved rate.
+If needed, divide the aggregate rates and in-flight caps across independent tool
+processes. Adding a database node does not establish that `TEvRead` crosses nodes;
+verify the reader actor and target shard placement when testing remote decoding.
 
 ## Output and interpreting results
 

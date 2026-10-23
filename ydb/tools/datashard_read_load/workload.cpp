@@ -46,6 +46,8 @@ TOptions ParseOptions(int argc, char** argv) {
     opts.AddLongOption("payload-bytes", "Payload bytes per row during init").RequiredArgument("N").StoreResult(&result.PayloadBytes);
     opts.AddLongOption("rows-per-read", "Rows returned by each narrow range read").RequiredArgument("N").StoreResult(&result.RowsPerRead);
     opts.AddLongOption("seed", "Random seed").RequiredArgument("N").StoreResult(&result.Seed);
+    opts.AddLongOption("dispatch-batch", "Maximum arrivals dispatched per stream per wakeup; default 64 (1 restores single-dispatch pacing)")
+        .RequiredArgument("N").StoreResult(&result.DispatchBatch);
     opts.AddLongOption("long-inflight", "Reserved long-request sessions (required for run)").RequiredArgument("N").StoreResult(&result.Caps[Long]);
     opts.AddLongOption("short-inflight", "Reserved short-request sessions (required for run)").RequiredArgument("N").StoreResult(&result.Caps[Short]);
     opts.AddLongOption("probe-inflight", "Reserved probe sessions (required for run)").RequiredArgument("N").StoreResult(&result.Caps[Probe]);
@@ -77,6 +79,9 @@ TOptions ParseOptions(int argc, char** argv) {
     }
     if (result.ProbeRate > MaxRate) {
         throw std::runtime_error("probe-rps must be <= 1000000");
+    }
+    if (!result.DispatchBatch || result.DispatchBatch > 1024) {
+        throw std::runtime_error("dispatch-batch must be between 1 and 1024");
     }
     int64_t totalDuration = 0;
     for (const auto& spec : phases) {
@@ -148,6 +153,19 @@ uint64_t TArrivalClock::Poll(int64_t nowUs) {
     const uint64_t result = due - Consumed_;
     Consumed_ = due;
     return result;
+}
+
+TArrivalBatch TArrivalClock::PollBatch(int64_t nowUs, uint64_t batchLimit) {
+    const uint64_t due = Poll(nowUs);
+    const uint64_t dispatch = nowUs < EndUs_ ? std::min(due, batchLimit) : 0;
+    return {due, dispatch, Consumed_ - dispatch};
+}
+
+int64_t TArrivalClock::DueUs(uint64_t index) const {
+    if (!Rate_ || index >= Consumed_) {
+        throw std::out_of_range("arrival has not been scheduled");
+    }
+    return StartUs_ + (index * 1000000 + Rate_ - 1) / Rate_;
 }
 
 int64_t TArrivalClock::NextUs() const {
