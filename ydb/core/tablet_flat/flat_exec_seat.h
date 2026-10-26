@@ -89,6 +89,8 @@ namespace NTabletFlatExecutor {
 
         ESeatState State = ESeatState::None;
         bool LowPriority = false;
+        // Renewed on every insertion into ActivationLowQueue, including retries.
+        ui64 LowPriorityActivationSeq = 0;
         bool Cancelled = false;
 
         TAutoPtr<TMemoryToken> AttachedMemory;

@@ -655,12 +655,22 @@ void TExecutor::EnqueueActivation(TSeat* seat, bool activate) {
         }
     } else {
         seat->State = ESeatState::ActiveLow;
+        seat->LowPriorityActivationSeq = ++LastLowPriorityActivationSeq;
         ActivationLowQueue.PushBack(seat);
         ActivateLowTransactionWaiting++;
-        if (activate && ActivateLowTransactionInFlight < 1) {
-            Send(SelfId(), new TEvPrivate::TEvActivateLowExecution());
-            ++ActivateLowTransactionInFlight;
+        if (activate) {
+            ScheduleLowPriorityActivation();
         }
+    }
+}
+
+void TExecutor::ScheduleLowPriorityActivation() {
+    if (ActivateLowTransactionWaiting > 0 && ActivateLowTransactionInFlight == 0) {
+        // This immutable cutoff is a mailbox barrier for the transactions
+        // already queued. Later arrivals and requeued transactions must wait
+        // for another barrier, even if earlier transactions are cancelled.
+        Send(SelfId(), new TEvPrivate::TEvActivateLowExecution(LastLowPriorityActivationSeq));
+        ++ActivateLowTransactionInFlight;
     }
 }
 
@@ -683,10 +693,7 @@ void TExecutor::PlanTransactionActivation() {
         ++ActivateTransactionInFlight;
     }
 
-    while (ActivateLowTransactionWaiting > 0 && ActivateLowTransactionInFlight < 1) {
-        Send(SelfId(), new TEvPrivate::TEvActivateLowExecution());
-        ++ActivateLowTransactionInFlight;
-    }
+    ScheduleLowPriorityActivation();
 }
 
 void TExecutor::TryActivateWaitingTransaction(TIntrusivePtr<NPageCollection::TPagesWaitPad>&& waitPad, TVector<NSharedCache::TEvResult::TLoaded>&& loadedPages, TPrivatePageCache::TPageCollection* pageCollection) {
@@ -3194,15 +3201,20 @@ void TExecutor::Handle(TEvPrivate::TEvActivateExecution::TPtr &ev, const TActorC
 }
 
 void TExecutor::Handle(TEvPrivate::TEvActivateLowExecution::TPtr &ev, const TActorContext &ctx) {
-    Y_UNUSED(ev);
-    Y_UNUSED(ctx);
     Y_ENSURE(ActivateLowTransactionInFlight > 0);
     ActivateLowTransactionInFlight--;
 
     if (!CanExecuteTransaction())
         return;
 
-    if (ActivationLowQueue) {
+    const ui64 maxActivationSeq = ev->Get()->MaxActivationSeq;
+    const auto deadline = ctx.Monotonic() + MaxLowPriorityBatchTime;
+    ui32 executed = 0;
+    while (ActivationLowQueue && CanExecuteTransaction()) {
+        if (ActivationLowQueue.Front()->LowPriorityActivationSeq > maxActivationSeq) {
+            break;
+        }
+
         TSeat* seat = ActivationLowQueue.PopFront();
         Y_ENSURE(seat->State == ESeatState::ActiveLow);
         seat->State = ESeatState::None;
@@ -3210,14 +3222,24 @@ void TExecutor::Handle(TEvPrivate::TEvActivateLowExecution::TPtr &ev, const TAct
         ActivateLowTransactionWaiting--;
         seat->FinishEnqueuedSpan();
 
-        // Activate the next transaction
-        if (ActivateLowTransactionWaiting > 0 && ActivateLowTransactionInFlight < 1) {
-            Send(SelfId(), new TEvPrivate::TEvActivateLowExecution());
-            ++ActivateLowTransactionInFlight;
-        }
+        // Post the next barrier before execution, so mailbox traffic generated
+        // by this batch cannot keep moving it further back.
+        ScheduleLowPriorityActivation();
 
         ExecuteTransaction(seat);
-    } else {
+
+        // Transactions cannot be preempted; check the budget between attempts.
+        if (++executed >= MaxLowPriorityBatchSize || ctx.Monotonic() >= deadline) {
+            break;
+        }
+    }
+
+    // An old activation may have lost all its transactions to cancellation.
+    // It cannot execute newer transactions, but must arrange their own barrier.
+    if (CanExecuteTransaction()) {
+        ScheduleLowPriorityActivation();
+    }
+    if (!ActivationLowQueue) {
         Y_ENSURE(ActivateLowTransactionWaiting == 0);
     }
 }

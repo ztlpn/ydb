@@ -316,6 +316,8 @@ class TExecutor
     class TTxExecutorDbMon;
 
     static constexpr ui64 PostponeTransactionMemThreshold = 250*1024*1024;
+    static constexpr ui32 MaxLowPriorityBatchSize = 64;
+    static constexpr TDuration MaxLowPriorityBatchTime = TDuration::MilliSeconds(1);
 
     struct TEvPrivate {
         enum EEv {
@@ -336,7 +338,13 @@ class TExecutor
         static_assert(EvEnd < EventSpaceEnd(TKikimrEvents::ES_PRIVATE), "enum range overrun");
 
         struct TEvActivateExecution : public TEventLocal<TEvActivateExecution, EvActivateExecution> {};
-        struct TEvActivateLowExecution : public TEventLocal<TEvActivateLowExecution, EvActivateLowExecution> {};
+        struct TEvActivateLowExecution : public TEventLocal<TEvActivateLowExecution, EvActivateLowExecution> {
+            const ui64 MaxActivationSeq;
+
+            explicit TEvActivateLowExecution(ui64 maxActivationSeq)
+                : MaxActivationSeq(maxActivationSeq)
+            {}
+        };
         struct TEvUpdateCounters : public TEventLocal<TEvUpdateCounters, EvUpdateCounters> {};
         struct TEvCheckYellow : public TEventLocal<TEvCheckYellow, EvCheckYellow> {};
         struct TEvUpdateCompactions : public TEventLocal<TEvUpdateCompactions, EvUpdateCompactions> {};
@@ -444,6 +452,7 @@ class TExecutor
     ui32 ActivateTransactionInFlight = 0;
     ui32 ActivateLowTransactionWaiting = 0;
     ui32 ActivateLowTransactionInFlight = 0;
+    ui64 LastLowPriorityActivationSeq = 0;
 
     using TWaitingSnaps = THashMap<TTableSnapshotContext *, TIntrusivePtr<TTableSnapshotContext>>;
 
@@ -562,6 +571,7 @@ class TExecutor
     void ReleaseTxData(TSeat &seat, ui64 requested);
     void PostponeTransaction(TSeat*, TPageCollectionTxEnv&, TAutoPtr<NTable::TChange>, THPTimer &bookkeepingTimer);
     void EnqueueActivation(TSeat* seat, bool activate);
+    void ScheduleLowPriorityActivation();
     void PlanTransactionActivation();
     void MakeLogSnapshot();
     void TryActivateWaitingTransaction(TIntrusivePtr<NPageCollection::TPagesWaitPad>&& waitPad, TVector<NSharedCache::TEvResult::TLoaded>&& pages, TPrivatePageCache::TPageCollection* collectionInfo);

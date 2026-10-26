@@ -586,9 +586,13 @@ namespace NFlatExecutorSetup {
 
         /**
          * Enqueue a transaction that is low priority with respect to other
-         * mailbox events. Every transaction in turn is scheduled at the end of
-         * the current mailbox, which allows actors to handle possible cancellation
-         * before each transaction's execution.
+         * mailbox events. Each insertion into the ready queue must cross a
+         * mailbox barrier posted after that insertion before it may execute.
+         * This allows cancellation events already queued when the transaction
+         * is enqueued to be handled first. Transactions returning from a wait
+         * must cross a new barrier as well.
+         * A barrier may execute a bounded batch of eligible transactions;
+         * mailbox events arriving after it was posted may run after the batch.
          * Returns the unique id that may be used for cancellation.
          */
         virtual ui64 EnqueueLowPriority(TAutoPtr<ITransaction> transaction) = 0;

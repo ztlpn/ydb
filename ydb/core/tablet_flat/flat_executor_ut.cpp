@@ -7,6 +7,9 @@
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/testlib/actors/wait_events.h>
 
+#include <array>
+#include <functional>
+
 namespace NKikimr {
 namespace NTabletFlatExecutor {
 
@@ -9335,6 +9338,22 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_LowPriorityTxs) {
         }
     };
 
+    struct TCallbackTx : public TSimpleTx {
+        using TCallback = std::function<bool(TTransactionContext&, const TActorContext&)>;
+
+        TCallbackTx(TTxState& state, TCallback callback)
+            : TSimpleTx(state)
+            , Callback(std::move(callback))
+        {}
+
+        bool Execute(TTransactionContext& txc, const TActorContext& ctx) override {
+            ++State.Executed;
+            return Callback(txc, ctx);
+        }
+
+        TCallback Callback;
+    };
+
     Y_UNIT_TEST(TestEnqueueCancel) {
         TMyEnvBase env;
 
@@ -9455,6 +9474,132 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_LowPriorityTxs) {
                 Y_ENSURE(tx2.Destroyed == 0);
             }});
         }});
+    }
+
+    Y_UNIT_TEST(TestCancelledActivationCannotStartNewTransaction) {
+        TMyEnvBase env;
+        env.FireDummyTablet();
+
+        TTxState oldTx, newTx;
+        ui64 oldId = 0;
+        ui64 newId = 0;
+        env.SendSync(new NFake::TEvExecute{[&](auto*, const auto& ctx) {
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+                oldId = x->EnqueueLowPriority(new TSimpleTx(oldTx));
+                // The mailbox will contain CancelOld, EnqueueNew, ActivateOld,
+                // CancelNew. CancelNew is already queued when EnqueueNew runs.
+                ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+                    UNIT_ASSERT_VALUES_EQUAL(newTx.Executed, 0);
+                    UNIT_ASSERT(x->CancelTransaction(newId));
+                    ctx.Send(ctx.SelfID, new NFake::TEvReturn);
+                }});
+            }});
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto&) {
+                UNIT_ASSERT(x->CancelTransaction(oldId));
+            }});
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto&) {
+                newId = x->EnqueueLowPriority(new TSimpleTx(newTx));
+            }});
+        }});
+        UNIT_ASSERT_VALUES_EQUAL(oldTx.Executed, 0);
+        UNIT_ASSERT_VALUES_EQUAL(oldTx.Destroyed, 1);
+        UNIT_ASSERT_VALUES_EQUAL(newTx.Executed, 0);
+        UNIT_ASSERT_VALUES_EQUAL(newTx.Destroyed, 1);
+    }
+
+    Y_UNIT_TEST(TestLowPriorityBarrierBatchesAndYields) {
+        TMyEnvBase env;
+        env.FireDummyTablet();
+
+        TTxState first;
+        std::array<TTxState, 128> batch;
+        std::array<ui64, 128> ids;
+        env.SendSync(new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+            x->EnqueueLowPriority(new TSimpleTx(first));
+            for (size_t i = 0; i < batch.size(); ++i) {
+                ids[i] = x->EnqueueLowPriority(new TSimpleTx(batch[i]));
+            }
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto*, const auto& ctx) {
+                UNIT_ASSERT_VALUES_EQUAL(first.Executed, 1);
+                for (const auto& state : batch) {
+                    UNIT_ASSERT_VALUES_EQUAL(state.Executed, 0);
+                }
+                // The next activation covers the whole batch. A mailbox event
+                // behind it must observe multiple executions, but also a yield.
+                ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+                    size_t executed = 0;
+                    for (size_t i = 0; i < batch.size(); ++i) {
+                        executed += batch[i].Executed;
+                        if (!batch[i].Executed) {
+                            UNIT_ASSERT(x->CancelTransaction(ids[i]));
+                        }
+                    }
+                    UNIT_ASSERT_C(executed > 1, executed);
+                    UNIT_ASSERT_C(executed < batch.size(), executed);
+                    ctx.Send(ctx.SelfID, new NFake::TEvReturn);
+                }});
+            }});
+        }});
+        for (const auto& state : batch) {
+            UNIT_ASSERT_VALUES_EQUAL(state.Destroyed, 1);
+        }
+    }
+
+    Y_UNIT_TEST(TestLowPriorityBatchYieldsOnTimeBudget) {
+        TMyEnvBase env;
+        env.FireDummyTablet();
+
+        TTxState first, slow, last;
+        env.SendSync(new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+            x->EnqueueLowPriority(new TSimpleTx(first));
+            x->EnqueueLowPriority(new TCallbackTx(slow, [&](auto&, const auto&) {
+                env->AdvanceCurrentTime(TDuration::MilliSeconds(2));
+                return true;
+            }));
+            x->EnqueueLowPriority(new TSimpleTx(last));
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto*, const auto& ctx) {
+                UNIT_ASSERT_VALUES_EQUAL(first.Executed, 1);
+                UNIT_ASSERT_VALUES_EQUAL(slow.Executed, 0);
+                ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto*, const auto& ctx) {
+                    UNIT_ASSERT_VALUES_EQUAL(slow.Executed, 1);
+                    UNIT_ASSERT_VALUES_EQUAL(last.Executed, 0);
+                    ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto*, const auto& ctx) {
+                        UNIT_ASSERT_VALUES_EQUAL(last.Executed, 1);
+                        ctx.Send(ctx.SelfID, new NFake::TEvReturn);
+                    }});
+                }});
+            }});
+        }});
+    }
+
+    Y_UNIT_TEST(TestLowPriorityRetryMustCrossNewBarrier) {
+        TMyEnvBase env;
+        env.FireDummyTablet();
+
+        TTxState retry, other;
+        ui64 retryId = 0;
+        env.SendSync(new NFake::TEvExecute{[&](auto* x, const auto&) {
+            retryId = x->EnqueueLowPriority(new TCallbackTx(retry, [&](auto& txc, const auto& ctx) {
+                if (retry.Executed == 1) {
+                    txc.Reschedule();
+                    // The next activation already covers 'other'. Requeueing
+                    // this older transaction must not make it eligible there.
+                    ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+                        UNIT_ASSERT_VALUES_EQUAL(other.Executed, 1);
+                        UNIT_ASSERT_VALUES_EQUAL(retry.Executed, 1);
+                        UNIT_ASSERT(x->CancelTransaction(retryId));
+                        ctx.Send(ctx.SelfID, new NFake::TEvReturn);
+                    }});
+                    return false;
+                }
+                return true;
+            }));
+            x->EnqueueLowPriority(new TSimpleTx(other));
+        }});
+        UNIT_ASSERT_VALUES_EQUAL(retry.Executed, 1);
+        UNIT_ASSERT_VALUES_EQUAL(retry.Completed, 0);
+        UNIT_ASSERT_VALUES_EQUAL(retry.Destroyed, 1);
+        UNIT_ASSERT_VALUES_EQUAL(other.Executed, 1);
     }
 
     Y_UNIT_TEST(TestLowPriorityAllocatingCancel) {
