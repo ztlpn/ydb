@@ -1,6 +1,8 @@
 #include <ydb/tools/datashard_read_load/workload.h>
+#include <ydb/tools/datashard_read_load/stats.h>
 #include <library/cpp/testing/gtest/gtest.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace NDataShardReadLoad {
@@ -89,6 +91,81 @@ TEST(ArrivalClock, BatchLimitOnePreservesOriginalPacing) {
     EXPECT_EQ(clock.DueUs(late.FirstIndex), 80);
 }
 
+TEST(ArrivalClock, ThreadPartitionsPreserveTheOriginalSchedule) {
+    for (uint64_t rate : {1u, 3u, 17u, 50000u}) {
+        for (uint64_t partitions : {2u, 3u, 8u}) {
+            TArrivalClock original(rate, 10000, 135000);
+            std::vector<TArrivalClock> workers;
+            for (uint64_t i = 0; i < partitions; ++i) {
+                workers.emplace_back(rate, 10000, 135000, i, partitions);
+            }
+            for (int64_t now = 9900; now <= 135100; now += 137) {
+                const auto batch = original.PollBatch(now, 64);
+                std::vector<int64_t> expected, actual;
+                for (uint64_t i = 0; i < batch.Dispatch; ++i) {
+                    expected.push_back(original.DueUs(batch.FirstIndex + i));
+                }
+                uint64_t scheduled = 0;
+                int64_t next = 135000;
+                for (auto& clock : workers) {
+                    const auto part = clock.PollBatch(now, 64);
+                    scheduled += part.Scheduled;
+                    next = std::min(next, clock.NextUs());
+                    for (uint64_t i = 0; i < part.Dispatch; ++i) {
+                        actual.push_back(clock.DueUs(part.FirstIndex + i));
+                    }
+                }
+                std::sort(actual.begin(), actual.end());
+                EXPECT_EQ(actual, expected);
+                EXPECT_EQ(scheduled, batch.Scheduled);
+                EXPECT_EQ(next, original.NextUs());
+            }
+        }
+    }
+}
+
+TEST(ArrivalClock, PartitionedBatchesSkipOnlyTheirOwnArrivals) {
+    TArrivalClock even(1000, 0, 1000000, 0, 2);
+    TArrivalClock odd(1000, 0, 1000000, 1, 2);
+    EXPECT_EQ(even.PollBatch(0, 2).Dispatch, 1u);
+    EXPECT_EQ(odd.PollBatch(0, 2).Dispatch, 0u);
+    const auto a = even.PollBatch(10000, 2);
+    const auto b = odd.PollBatch(10000, 2);
+    EXPECT_EQ(a.Scheduled, 5u);
+    EXPECT_EQ(b.Scheduled, 5u);
+    EXPECT_EQ(a.Dispatch, 2u);
+    EXPECT_EQ(b.Dispatch, 2u);
+    EXPECT_EQ(even.DueUs(a.FirstIndex), 8000);
+    EXPECT_EQ(odd.DueUs(b.FirstIndex), 7000);
+    EXPECT_EQ(even.LastDueUs(), 10000);
+    EXPECT_EQ(odd.LastDueUs(), 9000);
+    EXPECT_EQ(even.NextUs(), 12000);
+    EXPECT_EQ(odd.NextUs(), 11000);
+    EXPECT_EQ(even.PollBatch(10000, 2).Scheduled, 0u);
+    EXPECT_EQ(odd.PollBatch(10000, 2).Scheduled, 0u);
+    EXPECT_THROW(TArrivalClock(1, 0, 1000000, 0, 0), std::invalid_argument);
+    EXPECT_THROW(TArrivalClock(1, 0, 1000000, 2, 2), std::invalid_argument);
+}
+
+TEST(Capacity, ThreadPartitionsKeepTotalCapsIncludingSmallAndDisabledStreams) {
+    TOptions options;
+    options.Threads = 4;
+    options.Caps = {7, 2, 0};
+    EXPECT_EQ(WorkerCaps(options, 0), (std::array<uint64_t, 3>{2, 1, 0}));
+    EXPECT_EQ(WorkerCaps(options, 1), (std::array<uint64_t, 3>{2, 1, 0}));
+    EXPECT_EQ(WorkerCaps(options, 2), (std::array<uint64_t, 3>{2, 0, 0}));
+    EXPECT_EQ(WorkerCaps(options, 3), (std::array<uint64_t, 3>{1, 0, 0}));
+    std::array<uint64_t, 3> sum{};
+    for (uint64_t i = 0; i < options.Threads; ++i) {
+        const auto caps = WorkerCaps(options, i);
+        for (size_t p = 0; p < PopulationCount; ++p) {
+            sum[p] += caps[p];
+        }
+    }
+    EXPECT_EQ(sum, options.Caps);
+    EXPECT_THROW(WorkerCaps(options, options.Threads), std::invalid_argument);
+}
+
 TEST(Capacity, PopulationsAndPhaseTransitionsAreIndependent) {
     TCapacity capacity({2, 1, 1});
     EXPECT_TRUE(capacity.Acquire(Long));
@@ -117,6 +194,35 @@ TEST(Capacity, StopsLaunchingAndDrainsOutstandingWork) {
     EXPECT_EQ(capacity.Outstanding(Long), 0u);
 }
 
+TEST(Statistics, AggregationMergesSamplesAndPreservesAccounting) {
+    TStats slow, fast, total;
+    slow.Scheduled = 101;
+    slow.Launched = 100;
+    slow.SkippedScheduler = 1;
+    slow.Completed = 99;
+    slow.Statuses["CANCELLED"] = 99;
+    slow.Latency.RecordValues(1000000, 99);
+    fast.Scheduled = 10003;
+    fast.Launched = 10000;
+    fast.SkippedCapacity = 3;
+    fast.Completed = 9998;
+    fast.Statuses["SUCCESS"] = 9998;
+    fast.SuccessfulRows = 9998;
+    fast.Latency.RecordValues(1000, 9998);
+    fast.SuccessLatency.RecordValues(1000, 9998);
+    total.Add(slow);
+    total.Add(fast);
+    EXPECT_EQ(total.Scheduled, total.Launched + total.SkippedScheduler + total.SkippedCapacity);
+    EXPECT_EQ(total.Launched - total.Completed, 3u);
+    EXPECT_EQ(total.Statuses["CANCELLED"], 99u);
+    EXPECT_EQ(total.Statuses["SUCCESS"], 9998u);
+    EXPECT_EQ(total.SuccessfulRows, 9998u);
+    // Percentiles come from merged samples, not averaged worker percentiles.
+    EXPECT_LT(total.Latency.GetValueAtPercentile(99), 2000);
+    EXPECT_GE(total.Latency.GetMax(), 1000000);
+    EXPECT_LT(total.SuccessLatency.GetMax(), 2000);
+}
+
 TOptions Parse(std::initializer_list<const char*> arguments) {
     std::vector<char*> argv;
     for (const auto* argument : arguments) {
@@ -133,6 +239,18 @@ TEST(Options, RequiresExplicitLoadConfiguration) {
     EXPECT_EQ(options.Phases[0].DurationUs, 2000000);
     EXPECT_EQ(options.Phases[0].Rates, (std::array<uint64_t, 3>{10, 0, 1}));
     EXPECT_EQ(options.DispatchBatch, 64u);
+    EXPECT_EQ(options.Threads, 1u);
+}
+
+TEST(Options, ThreadsDoNotMultiplyRatesOrCaps) {
+    auto options = Parse({"load", "run", "-e", "localhost:2136", "-d", "/Root", "--table", "/Root/load",
+        "--threads", "4", "--long-inflight", "7", "--short-inflight", "0", "--probe-inflight", "1",
+        "--phase", "burst:2s:25000:0"});
+    EXPECT_EQ(options.Threads, 4u);
+    EXPECT_EQ(options.Caps, (std::array<uint64_t, 3>{7, 0, 1}));
+    EXPECT_EQ(options.Phases[0].Rates, (std::array<uint64_t, 3>{25000, 0, 1}));
+    EXPECT_THROW(Parse({"load", "init", "-e", "localhost:2136", "-d", "/Root", "--table", "/Root/load", "--threads", "0"}), std::runtime_error);
+    EXPECT_THROW(Parse({"load", "init", "-e", "localhost:2136", "-d", "/Root", "--table", "/Root/load", "--threads", "65"}), std::runtime_error);
 }
 
 TEST(Options, RejectsInvalidPhaseAndDeadlines) {

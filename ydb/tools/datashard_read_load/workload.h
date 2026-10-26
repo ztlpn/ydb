@@ -26,6 +26,7 @@ struct TOptions {
     uint64_t PayloadBytes = 64;
     uint64_t RowsPerRead = 1;
     uint64_t Seed = 1;
+    uint64_t Threads = 1;
     uint64_t DispatchBatch = 64;
     std::array<uint64_t, PopulationCount> Caps = {};
     uint64_t ProbeRate = 1;
@@ -38,6 +39,10 @@ struct TOptions {
 
 TOptions ParseOptions(int argc, char** argv);
 
+// Rates and caps are process-wide. Sessions are divided among workers;
+// their clocks interleave arrivals from the original population schedule.
+std::array<uint64_t, PopulationCount> WorkerCaps(const TOptions& options, uint64_t worker);
+
 struct TArrivalBatch {
     uint64_t Scheduled = 0;
     uint64_t Dispatch = 0;
@@ -46,9 +51,12 @@ struct TArrivalBatch {
 
 // A deterministic open-loop clock. Elapsed arrivals are consumed immediately;
 // at most batchLimit are eligible for dispatch, without retaining a backlog.
+// Partition i owns global arrivals i, i + partitions, i + 2 * partitions, ...;
+// indices returned by PollBatch are local to that partition.
 class TArrivalClock {
 public:
-    TArrivalClock(uint64_t rate, int64_t startUs, int64_t endUs);
+    TArrivalClock(uint64_t rate, int64_t startUs, int64_t endUs,
+        uint64_t partition = 0, uint64_t partitions = 1);
     uint64_t Poll(int64_t nowUs);
     TArrivalBatch PollBatch(int64_t nowUs, uint64_t batchLimit);
     int64_t DueUs(uint64_t index) const;
@@ -59,6 +67,8 @@ private:
     uint64_t Rate_;
     int64_t StartUs_;
     int64_t EndUs_;
+    uint64_t Partition_;
+    uint64_t Partitions_;
     uint64_t Consumed_ = 0;
 };
 

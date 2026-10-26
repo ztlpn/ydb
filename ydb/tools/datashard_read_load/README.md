@@ -37,6 +37,18 @@ one SDK session before measurement, overriding the SDK's default limit of 50.
 Session creation and warmup happen outside the measured phases. Session capacity
 on the server must also accommodate the chosen caps.
 
+`--threads N` selects the number of dispatch threads (default 1, range 1–64).
+All rates and in-flight caps are **totals for the process**: keep the same values
+when changing the thread count. The tool divides each population's sessions
+among the threads and interleaves its scheduled arrivals. For example, two
+threads with a 50,000/s long rate and a 40,000 long cap target 50,000/s combined
+and reserve 40,000 long sessions in total. Low rates, including the default
+one-per-second probe, are preserved without rounding or multiplication. Sessions
+stay with their assigned thread, so idle capacity is not borrowed between threads.
+All threads use the same phase timeline and preserve outstanding work across
+phase changes. One coordinator emits aggregate counts and merged latency
+histograms in the existing JSONL format.
+
 Reads execute cached, parameterized `OnlineRO` SQL ranges over the primary key.
 `--rows-per-read` defaults to one and can be increased to vary execution cost.
 Pass the initialization row count again with `--rows` when overriding it. Warmup
@@ -51,8 +63,8 @@ a cancellation deadline above it, so requests normally reach the shard before
 becoming obsolete under congestion.
 
 Arrivals follow a monotonic clock independently of completions. Each scheduling
-pass dispatches up to `--dispatch-batch` elapsed arrivals per stream (default 64,
-range 1–1,024). Batching absorbs ordinary timer wakeup jitter: for example, 50,000
+pass dispatches up to `--dispatch-batch` elapsed arrivals per stream per thread
+(default 64, range 1–1,024). Batching absorbs ordinary timer wakeup jitter: for example, 50,000
 requests/s requires four launches per 80us wakeup. A limit of one would drop three
 of those arrivals and impose an artificial rate ceiling. Use `--dispatch-batch 1`
 to reproduce the original single-dispatch behavior for comparison.
@@ -124,14 +136,17 @@ for each phase, divide `launched` by the configured phase duration. A large
 `skipped_scheduler` count with zero `skipped_capacity` means raising the in-flight
 cap cannot fix the lost arrivals. Batching removes the one-dispatch-per-wakeup
 limit, but client CPU or SDK processing can still constrain the achieved rate.
-If needed, divide the aggregate rates and in-flight caps across independent tool
-processes. Adding a database node does not establish that `TEvRead` crosses nodes;
+Increase `--threads` to dispatch concurrently while keeping the configured total
+rates and caps. Separate tool processes are also possible, but their rates and
+caps must be divided manually. Adding a database node does not establish that
+`TEvRead` crosses nodes;
 verify the reader actor and target shard placement when testing remote decoding.
 
 ## Output and interpreting results
 
 Stdout is JSON Lines; diagnostics and bounded error samples go to stderr.
-`run_start` records effective settings, query text, and the explained query plan.
+`run_start` records effective settings, including `threads`, query text, and the
+explained query plan.
 Then `phase_start`, approximately one-second `interval`, `phase_end`, and `final`
 records report populations separately as `long`, `short`, and `probe`.
 

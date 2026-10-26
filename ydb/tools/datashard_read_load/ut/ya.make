@@ -9,6 +9,8 @@ SRCS(
 
 PEERDIR(
     library/cpp/getopt
+    library/cpp/histogram/hdr
+    library/cpp/json/writer
 )
 
 END()

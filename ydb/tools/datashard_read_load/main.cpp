@@ -1,9 +1,9 @@
 #include "workload.h"
+#include "stats.h"
 
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/driver/driver.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/table/table.h>
 
-#include <library/cpp/histogram/hdr/histogram.h>
 #include <library/cpp/json/writer/json.h>
 #include <library/cpp/json/writer/json_value.h>
 #include <util/stream/output.h>
@@ -17,14 +17,15 @@
 #include <csignal>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <iostream>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace NDataShardReadLoad {
@@ -35,10 +36,11 @@ using namespace NYdb::NTable;
 using TClock = std::chrono::steady_clock;
 using TJson = NJson::TJsonValue;
 
-volatile std::sig_atomic_t StopRequested = 0;
+static_assert(std::atomic<bool>::is_always_lock_free);
+std::atomic<bool> StopRequested = false;
 
 void HandleSignal(int) {
-    StopRequested = 1;
+    StopRequested = true;
 }
 
 void Check(const TStatus& status, const std::string& operation) {
@@ -170,57 +172,6 @@ void ValidateTable(TSession& session, const TOptions& options) {
     }
 }
 
-struct TStats {
-    uint64_t Scheduled = 0;
-    uint64_t Launched = 0;
-    uint64_t SkippedScheduler = 0;
-    uint64_t SkippedCapacity = 0;
-    uint64_t Completed = 0;
-    uint64_t SuccessfulRows = 0;
-    uint64_t RowMismatches = 0;
-    uint64_t SessionFailures = 0;
-    uint64_t SessionReplacements = 0;
-    std::map<std::string, uint64_t> Statuses;
-    NHdr::THistogram Latency{1000000000000LL, 3};
-    NHdr::THistogram SuccessLatency{1000000000000LL, 3};
-    NHdr::THistogram SchedulerDelay{1000000000000LL, 3};
-
-    static TJson Histogram(const NHdr::THistogram& histogram) {
-        TJson json(NJson::JSON_MAP);
-        json["p50"] = histogram.GetValueAtPercentile(50);
-        json["p95"] = histogram.GetValueAtPercentile(95);
-        json["p99"] = histogram.GetValueAtPercentile(99);
-        json["max"] = histogram.GetMax();
-        return json;
-    }
-
-    TJson Json(bool cumulative) const {
-        TJson json(NJson::JSON_MAP);
-        json["scheduled"] = Scheduled;
-        json["launched"] = Launched;
-        json["skipped_scheduler"] = SkippedScheduler;
-        json["skipped_capacity"] = SkippedCapacity;
-        json["completed"] = Completed;
-        json["successful_rows"] = SuccessfulRows;
-        json["row_mismatches"] = RowMismatches;
-        json["session_failures"] = SessionFailures;
-        json["session_replacements"] = SessionReplacements;
-        if (cumulative) {
-            json["outstanding"] = Launched - Completed;
-        }
-        json["statuses"].SetType(NJson::JSON_MAP);
-        for (const auto& [status, count] : Statuses) {
-            json["statuses"][status] = count;
-        }
-        json["latency_us"] = Histogram(Latency);
-        json["success_latency_us"] = Histogram(SuccessLatency);
-        json["scheduler_delay_us"] = Histogram(SchedulerDelay);
-        return json;
-    }
-};
-
-using TPopulationStats = std::array<TStats, PopulationCount>;
-
 struct TCompletion {
     size_t Slot = 0;
     bool SessionResult = false;
@@ -237,7 +188,7 @@ struct TCompletionQueue {
     std::mutex Mutex;
     std::condition_variable Ready;
     std::deque<TCompletion> Items;
-    std::atomic<uint64_t> ErrorSamples = 0;
+    std::shared_ptr<std::atomic<uint64_t>> ErrorSamples;
 
     void Push(TCompletion completion) {
         {
@@ -254,36 +205,48 @@ struct TSlot {
     size_t Origin = 0;
 };
 
-class TRunner {
+struct TSnapshot {
+    TPopulationStats Totals;
+    TPopulationStats Interval;
+    std::vector<TPopulationStats> Origins;
+
+    explicit TSnapshot(size_t phases)
+        : Origins(phases)
+    {}
+};
+
+class TWorker {
 public:
-    TRunner(TTableClient& client, const TOptions& options)
+    TWorker(TTableClient& client, const TOptions& options, uint64_t index,
+        std::atomic<bool>& abort, std::shared_ptr<std::atomic<uint64_t>> errorSamples)
         : Client_(client)
         , Options_(options)
+        , Index_(index)
+        , Abort_(abort)
         , Query_(ReadQuery(options))
-        , Capacity_(options.Caps)
-        , Random_(options.Seed)
+        , Caps_(WorkerCaps(options, index))
+        , Capacity_(Caps_)
+        , Random_(options.Seed + index)
         , Origins_(options.Phases.size())
-    {}
+    {
+        Queue_->ErrorSamples = std::move(errorSamples);
+    }
 
-    int Run() {
-        Setup();
-        Start_ = TClock::now();
-        EmitConfig();
-        int64_t phaseStart = 0;
-        for (size_t phase = 0; phase < Options_.Phases.size() && !StopRequested; ++phase) {
-            const auto& spec = Options_.Phases[phase];
-            const int64_t end = phaseStart + spec.DurationUs;
-            std::array<TArrivalClock, PopulationCount> clocks = {
-                TArrivalClock(spec.Rates[Long], phaseStart, end),
-                TArrivalClock(spec.Rates[Short], phaseStart, end),
-                TArrivalClock(spec.Rates[Probe], phaseStart, end)};
-            std::cerr << "Phase " << spec.Name << ": long=" << spec.Rates[Long]
-                << "/s short=" << spec.Rates[Short] << "/s\n";
-            Emit("phase_start", spec.Name, phase);
-            for (;;) {
+    void RunPhase(TClock::time_point start, size_t phase, int64_t phaseStart) {
+        Start_ = start;
+        const auto& spec = Options_.Phases[phase];
+        const int64_t end = phaseStart + spec.DurationUs;
+        std::array<TArrivalClock, PopulationCount> clocks = {
+            MakeClock(Long, spec.Rates[Long], phaseStart, end),
+            MakeClock(Short, spec.Rates[Short], phaseStart, end),
+            MakeClock(Probe, spec.Rates[Probe], phaseStart, end)};
+        for (;;) {
+            int64_t next = end;
+            {
+                std::lock_guard lock(StatsMutex_);
                 ProcessCompletions(true);
                 const int64_t now = SinceUs(Start_);
-                if (StopRequested) {
+                if (Stopping()) {
                     break;
                 }
                 // Probe first so expensive dispatch work cannot consistently
@@ -294,54 +257,70 @@ public:
                         Arrivals(p, phase, batch, clocks[p], end);
                     }
                 }
-                ReportIfDue(spec.Name);
                 if (now >= end) {
                     break;
                 }
-                int64_t next = std::min(end, NextReportUs_);
+                next = std::min(end, NextSessionRetryUs_);
                 for (const auto& clock : clocks) {
                     next = std::min(next, clock.NextUs());
                 }
-                Wait(next);
             }
-            ProcessCompletions(true);
-            Emit("phase_end", spec.Name, phase);
-            phaseStart = end;
+            Wait(next);
         }
-        const int64_t drainEnd = SinceUs(Start_) + Options_.DrainTimeoutUs;
-        while (Outstanding() && SinceUs(Start_) < drainEnd) {
-            ProcessCompletions(false);
-            ReportIfDue("drain", false);
-            Wait(std::min(drainEnd, NextReportUs_));
-        }
-        ProcessCompletions(false);
-        Emit("final", "drain");
-        if (Outstanding()) {
-            std::cerr << "Drain timed out with " << Outstanding() << " outstanding requests\n";
-            return 2;
-        }
-        for (const auto& stats : Totals_) {
-            if (stats.RowMismatches) {
-                return 1;
-            }
-        }
-        return StopRequested ? 130 : 0;
+        std::lock_guard lock(StatsMutex_);
+        ProcessCompletions(true);
     }
 
-private:
+    void Drain(TClock::time_point start, int64_t end) {
+        Start_ = start;
+        while (SinceUs(Start_) < end && !Abort_) {
+            {
+                std::lock_guard lock(StatsMutex_);
+                ProcessCompletions(false);
+                if (!Outstanding()) {
+                    return;
+                }
+            }
+            Wait(end);
+        }
+        std::lock_guard lock(StatsMutex_);
+        ProcessCompletions(false);
+    }
+
+    void Collect(TSnapshot& snapshot, bool resetInterval) {
+        std::lock_guard lock(StatsMutex_);
+        for (size_t p = 0; p < PopulationCount; ++p) {
+            snapshot.Totals[p].Add(Totals_[p]);
+            snapshot.Interval[p].Add(Interval_[p]);
+            for (size_t phase = 0; phase < Origins_.size(); ++phase) {
+                snapshot.Origins[phase][p].Add(Origins_[phase][p]);
+            }
+        }
+        if (resetInterval) {
+            Interval_ = TPopulationStats{};
+        }
+    }
+
+    const std::string& Plan() const {
+        return Plan_;
+    }
+
     void Setup() {
         size_t total = 0;
-        for (auto cap : Options_.Caps) {
+        for (auto cap : Caps_) {
             total += cap;
+        }
+        if (!total) {
+            return;
         }
         Slots_.reserve(total);
         for (size_t p = 0; p < PopulationCount; ++p) {
-            for (uint64_t count = 0; count < Options_.Caps[p];) {
+            for (uint64_t count = 0; count < Caps_[p];) {
                 if (StopRequested) {
                     throw std::runtime_error("startup interrupted");
                 }
                 std::vector<TAsyncCreateSessionResult> pending;
-                for (uint64_t n = 0; n < 32 && count < Options_.Caps[p]; ++n, ++count) {
+                for (uint64_t n = 0; n < 32 && count < Caps_[p]; ++n, ++count) {
                     pending.push_back(Client_.GetSession(SessionSettings()));
                 }
                 for (auto& future : pending) {
@@ -350,27 +329,42 @@ private:
                     Free_[p].push_back(Slots_.size());
                     Slots_.push_back({p, result.GetSession(), 0});
                 }
-                std::cerr << "Reserved " << Slots_.size() << '/' << total << " sessions\r";
+                std::cerr << "Worker " << Index_ << ": reserved " << Slots_.size() << '/' << total << " sessions\r";
             }
         }
         std::cerr << '\n';
-        auto& session = *Slots_.front().Session;
-        ValidateTable(session, Options_);
-        auto explained = session.ExplainDataQuery(Query_, TExplainDataQuerySettings()
-            .ClientTimeout(TDuration::Seconds(30))).GetValueSync();
-        Check(explained, "explain range-read query");
-        Plan_ = explained.GetPlan();
-        // Warm each reserved session, then cover the full keyspace in bounded
-        // batches using the exact query used during measurement.
-        std::cerr << "Warming sessions and " << Options_.Rows << " rows\n";
+        if (Index_ == 0) {
+            auto& session = *Slots_.front().Session;
+            ValidateTable(session, Options_);
+            auto explained = session.ExplainDataQuery(Query_, TExplainDataQuerySettings()
+                .ClientTimeout(TDuration::Seconds(30))).GetValueSync();
+            Check(explained, "explain range-read query");
+            Plan_ = explained.GetPlan();
+        }
+        std::cerr << "Worker " << Index_ << ": warming sessions\n";
         for (size_t first = 0; first < Slots_.size(); first += 32) {
             WarmBatch(first, std::min<size_t>(32, Slots_.size() - first), 0, false);
         }
-        const size_t batch = std::min<size_t>(32, Slots_.size());
-        const uint64_t reads = (Options_.Rows + Options_.RowsPerRead - 1) / Options_.RowsPerRead;
-        for (uint64_t first = 0; first < reads; first += batch) {
-            WarmBatch(0, std::min<uint64_t>(batch, reads - first), first, true);
+        if (Index_ == 0) {
+            const size_t batch = std::min<size_t>(32, Slots_.size());
+            const uint64_t reads = (Options_.Rows + Options_.RowsPerRead - 1) / Options_.RowsPerRead;
+            for (uint64_t first = 0; first < reads; first += batch) {
+                WarmBatch(0, std::min<uint64_t>(batch, reads - first), first, true);
+            }
         }
+    }
+
+private:
+    bool Stopping() const {
+        return StopRequested || Abort_;
+    }
+
+    TArrivalClock MakeClock(size_t p, uint64_t rate, int64_t start, int64_t end) const {
+        const uint64_t partitions = std::min(Options_.Threads, Options_.Caps[p]);
+        if (Index_ >= partitions) {
+            return TArrivalClock(0, start, end);
+        }
+        return TArrivalClock(rate, start, end, Index_, partitions);
     }
 
     void WarmBatch(size_t slotStart, size_t count, uint64_t readStart, bool coverData) {
@@ -407,7 +401,7 @@ private:
         });
         for (uint64_t i = 0; i < batch.Dispatch; ++i) {
             const int64_t now = SinceUs(Start_);
-            if (StopRequested || now >= endUs) {
+            if (Stopping() || now >= endUs) {
                 Update(p, origin, [&](TStats& stats) { stats.SkippedScheduler += batch.Dispatch - i; });
                 break;
             }
@@ -449,7 +443,7 @@ private:
                         completion.Rows = result.IsSuccess() ? ResultRows(result) : 0;
                         completion.ReplaceSession = result.IsTransportError() || result.GetStatus() == EStatus::BAD_SESSION
                             || result.GetStatus() == EStatus::SESSION_EXPIRED || result.GetStatus() == EStatus::SESSION_BUSY;
-                        if (!result.IsSuccess() && queue->ErrorSamples.fetch_add(1, std::memory_order_relaxed) < 5) {
+                        if (!result.IsSuccess() && queue->ErrorSamples->fetch_add(1, std::memory_order_relaxed) < 5) {
                             completion.Error = result.GetIssues().ToString().c_str();
                         }
                     } catch (const std::exception& error) {
@@ -545,6 +539,15 @@ private:
                 std::cerr << "Sample error (" << PopulationNames[p] << "): " << completion.Status << ' ' << completion.Error.substr(0, 1000) << '\n';
             }
         }
+        const int64_t now = SinceUs(Start_);
+        if (replace && now >= NextSessionRetryUs_) {
+            NextSessionRetryUs_ = now + 1000000;
+            auto failed = std::move(FailedSessions_);
+            FailedSessions_.clear();
+            for (size_t id : failed) {
+                ReplaceSession(id);
+            }
+        }
     }
 
     uint64_t Outstanding() const {
@@ -561,6 +564,128 @@ private:
         Queue_->Ready.wait_for(lock, std::chrono::microseconds(delay), [&] { return !Queue_->Items.empty(); });
     }
 
+    TTableClient& Client_;
+    const TOptions& Options_;
+    const uint64_t Index_;
+    std::atomic<bool>& Abort_;
+    const std::string Query_;
+    std::string Plan_;
+    const std::array<uint64_t, PopulationCount> Caps_;
+    TCapacity Capacity_;
+    std::mt19937_64 Random_;
+    std::vector<TSlot> Slots_;
+    std::array<std::vector<size_t>, PopulationCount> Free_;
+    std::vector<size_t> FailedSessions_;
+    std::shared_ptr<TCompletionQueue> Queue_ = std::make_shared<TCompletionQueue>();
+    std::mutex StatsMutex_;
+    TPopulationStats Totals_;
+    TPopulationStats Interval_;
+    std::vector<TPopulationStats> Origins_;
+    TClock::time_point Start_;
+    int64_t NextSessionRetryUs_ = 1000000;
+    uint64_t ErrorSamples_ = 0;
+};
+
+class TRunner {
+public:
+    TRunner(TTableClient& client, const TOptions& options)
+        : Options_(options)
+    {
+        auto errorSamples = std::make_shared<std::atomic<uint64_t>>(0);
+        for (uint64_t i = 0; i < options.Threads; ++i) {
+            Workers_.push_back(std::make_unique<TWorker>(client, options, i, Abort_, errorSamples));
+        }
+    }
+
+    int Run() {
+        for (auto& worker : Workers_) {
+            worker->Setup();
+        }
+        Start_ = TClock::now();
+        EmitConfig();
+        int64_t phaseStart = 0;
+        for (size_t phase = 0; phase < Options_.Phases.size() && !StopRequested; ++phase) {
+            const auto& spec = Options_.Phases[phase];
+            std::cerr << "Phase " << spec.Name << ": long=" << spec.Rates[Long]
+                << "/s short=" << spec.Rates[Short] << "/s threads=" << Options_.Threads << '\n';
+            Emit("phase_start", spec.Name, phase);
+            RunWorkers(spec.Name, [&](TWorker& worker) {
+                worker.RunPhase(Start_, phase, phaseStart);
+            });
+            Emit("phase_end", spec.Name, phase);
+            phaseStart += spec.DurationUs;
+        }
+        const int64_t drainEnd = SinceUs(Start_) + Options_.DrainTimeoutUs;
+        RunWorkers("drain", [&](TWorker& worker) { worker.Drain(Start_, drainEnd); });
+        const auto final = Emit("final", "drain");
+        const auto outstanding = Outstanding(final);
+        if (outstanding) {
+            std::cerr << "Drain timed out with " << outstanding << " outstanding requests\n";
+            return 2;
+        }
+        for (const auto& stats : final.Totals) {
+            if (stats.RowMismatches) {
+                return 1;
+            }
+        }
+        return StopRequested ? 130 : 0;
+    }
+
+private:
+    template <typename F>
+    void RunWorkers(const std::string& phase, F&& work) {
+        std::mutex mutex;
+        std::condition_variable done;
+        size_t remaining = Workers_.size();
+        std::exception_ptr error;
+        // A phase's threads are joined before the next phase starts, so phase
+        // reports never include arrivals launched by the following phase.
+        std::vector<std::jthread> threads;
+        try {
+            for (auto& worker : Workers_) {
+                threads.emplace_back([&, worker = worker.get()] {
+                    try {
+                        work(*worker);
+                    } catch (...) {
+                        Abort_ = true;
+                        std::lock_guard lock(mutex);
+                        if (!error) {
+                            error = std::current_exception();
+                        }
+                    }
+                    {
+                        std::lock_guard lock(mutex);
+                        --remaining;
+                    }
+                    done.notify_one();
+                });
+            }
+            std::unique_lock lock(mutex);
+            while (remaining) {
+                const auto delay = std::clamp<int64_t>(NextReportUs_ - SinceUs(Start_), 0, 100000);
+                done.wait_for(lock, std::chrono::microseconds(delay), [&] { return !remaining; });
+                lock.unlock();
+                ReportIfDue(phase);
+                lock.lock();
+            }
+        } catch (...) {
+            Abort_ = true;
+            throw;
+        }
+        threads.clear();
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+
+    static uint64_t Outstanding(const TSnapshot& snapshot) {
+        uint64_t result = 0;
+        for (const auto& stats : snapshot.Totals) {
+            result += stats.Launched - stats.Completed;
+        }
+        return result;
+    }
+
     static TJson Populations(const TPopulationStats& stats, bool cumulative) {
         TJson json(NJson::JSON_MAP);
         for (size_t p = 0; p < PopulationCount; ++p) {
@@ -569,29 +694,34 @@ private:
         return json;
     }
 
-    void Emit(const std::string& kind, const std::string& phase, std::optional<size_t> origin = {}) {
+    TSnapshot Emit(const std::string& kind, const std::string& phase, std::optional<size_t> origin = {}) {
+        TSnapshot snapshot(Options_.Phases.size());
+        for (auto& worker : Workers_) {
+            worker->Collect(snapshot, kind == "interval");
+        }
         TJson json(NJson::JSON_MAP);
         json["kind"] = kind;
         json["phase"] = phase;
         json["timestamp"] = TInstant::Now().ToString();
         json["elapsed_s"] = SinceUs(Start_) / 1000000.0;
-        json["totals"] = Populations(Totals_, true);
+        json["totals"] = Populations(snapshot.Totals, true);
         if (origin) {
-            json["origin"] = Populations(Origins_[*origin], true);
+            json["origin"] = Populations(snapshot.Origins[*origin], true);
         }
         if (kind == "interval") {
             json["interval_s"] = (SinceUs(Start_) - LastReportUs_) / 1000000.0;
-            json["interval"] = Populations(Interval_, false);
+            json["interval"] = Populations(snapshot.Interval, false);
         }
         if (kind == "final") {
             json["interrupted"] = bool(StopRequested);
-            json["drained"] = Outstanding() == 0;
+            json["drained"] = Outstanding(snapshot) == 0;
             json["origins"].SetType(NJson::JSON_MAP);
-            for (size_t i = 0; i < Origins_.size(); ++i) {
-                json["origins"][Options_.Phases[i].Name] = Populations(Origins_[i], true);
+            for (size_t i = 0; i < snapshot.Origins.size(); ++i) {
+                json["origins"][Options_.Phases[i].Name] = Populations(snapshot.Origins[i], true);
             }
         }
         WriteJson(json);
+        return snapshot;
     }
 
     void EmitConfig() {
@@ -601,6 +731,7 @@ private:
         json["database"] = Options_.Database;
         json["table"] = Options_.Table;
         json["seed"] = Options_.Seed;
+        json["threads"] = Options_.Threads;
         json["dispatch_batch"] = Options_.DispatchBatch;
         json["rows"] = Options_.Rows;
         json["rows_per_read"] = Options_.RowsPerRead;
@@ -608,8 +739,8 @@ private:
         json["long_timeout_us"] = Options_.LongTimeoutUs;
         json["rpc_grace_us"] = Options_.RpcGraceUs;
         json["drain_timeout_us"] = Options_.DrainTimeoutUs;
-        json["query"] = Query_;
-        json["query_plan"] = Plan_;
+        json["query"] = ReadQuery(Options_);
+        json["query_plan"] = Workers_.front()->Plan();
         json["phases"].SetType(NJson::JSON_ARRAY);
         for (const auto& phase : Options_.Phases) {
             TJson entry(NJson::JSON_MAP);
@@ -626,41 +757,22 @@ private:
         WriteJson(json);
     }
 
-    void ReportIfDue(const std::string& phase, bool replace = true) {
+    void ReportIfDue(const std::string& phase) {
         const int64_t now = SinceUs(Start_);
         if (now < NextReportUs_) {
             return;
         }
         Emit("interval", phase);
-        Interval_ = TPopulationStats{};
         LastReportUs_ = now;
         NextReportUs_ = now + 1000000;
-        auto failed = std::move(FailedSessions_);
-        FailedSessions_.clear();
-        if (replace) {
-            for (size_t id : failed) {
-                ReplaceSession(id);
-            }
-        }
     }
 
-    TTableClient& Client_;
     const TOptions& Options_;
-    const std::string Query_;
-    std::string Plan_;
-    TCapacity Capacity_;
-    std::mt19937_64 Random_;
-    std::vector<TSlot> Slots_;
-    std::array<std::vector<size_t>, PopulationCount> Free_;
-    std::vector<size_t> FailedSessions_;
-    std::shared_ptr<TCompletionQueue> Queue_ = std::make_shared<TCompletionQueue>();
-    TPopulationStats Totals_;
-    TPopulationStats Interval_;
-    std::vector<TPopulationStats> Origins_;
+    std::atomic<bool> Abort_ = false;
+    std::vector<std::unique_ptr<TWorker>> Workers_;
     TClock::time_point Start_;
     int64_t LastReportUs_ = 0;
     int64_t NextReportUs_ = 1000000;
-    uint64_t ErrorSamples_ = 0;
 };
 
 } // namespace

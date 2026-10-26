@@ -46,7 +46,9 @@ TOptions ParseOptions(int argc, char** argv) {
     opts.AddLongOption("payload-bytes", "Payload bytes per row during init").RequiredArgument("N").StoreResult(&result.PayloadBytes);
     opts.AddLongOption("rows-per-read", "Rows returned by each narrow range read").RequiredArgument("N").StoreResult(&result.RowsPerRead);
     opts.AddLongOption("seed", "Random seed").RequiredArgument("N").StoreResult(&result.Seed);
-    opts.AddLongOption("dispatch-batch", "Maximum arrivals dispatched per stream per wakeup; default 64 (1 restores single-dispatch pacing)")
+    opts.AddLongOption("threads", "Dispatch threads; rates and in-flight caps remain process-wide totals; default 1")
+        .RequiredArgument("N").StoreResult(&result.Threads);
+    opts.AddLongOption("dispatch-batch", "Maximum arrivals dispatched per stream per thread per wakeup; default 64")
         .RequiredArgument("N").StoreResult(&result.DispatchBatch);
     opts.AddLongOption("long-inflight", "Reserved long-request sessions (required for run)").RequiredArgument("N").StoreResult(&result.Caps[Long]);
     opts.AddLongOption("short-inflight", "Reserved short-request sessions (required for run)").RequiredArgument("N").StoreResult(&result.Caps[Short]);
@@ -82,6 +84,9 @@ TOptions ParseOptions(int argc, char** argv) {
     }
     if (!result.DispatchBatch || result.DispatchBatch > 1024) {
         throw std::runtime_error("dispatch-batch must be between 1 and 1024");
+    }
+    if (!result.Threads || result.Threads > 64) {
+        throw std::runtime_error("threads must be between 1 and 64");
     }
     int64_t totalDuration = 0;
     for (const auto& spec : phases) {
@@ -136,10 +141,23 @@ TOptions ParseOptions(int argc, char** argv) {
     return result;
 }
 
-TArrivalClock::TArrivalClock(uint64_t rate, int64_t startUs, int64_t endUs)
-    : Rate_(rate), StartUs_(startUs), EndUs_(endUs)
+std::array<uint64_t, PopulationCount> WorkerCaps(const TOptions& options, uint64_t worker) {
+    if (!options.Threads || worker >= options.Threads) {
+        throw std::invalid_argument("invalid worker index or thread count");
+    }
+    std::array<uint64_t, PopulationCount> caps;
+    for (size_t p = 0; p < PopulationCount; ++p) {
+        caps[p] = options.Caps[p] / options.Threads + (worker < options.Caps[p] % options.Threads);
+    }
+    return caps;
+}
+
+TArrivalClock::TArrivalClock(uint64_t rate, int64_t startUs, int64_t endUs,
+    uint64_t partition, uint64_t partitions)
+    : Rate_(rate), StartUs_(startUs), EndUs_(endUs), Partition_(partition), Partitions_(partitions)
 {
-    if (rate > MaxRate || startUs < 0 || endUs <= startUs || endUs > MaxDurationUs) {
+    if (rate > MaxRate || startUs < 0 || endUs <= startUs || endUs > MaxDurationUs
+        || !partitions || partition >= partitions) {
         throw std::invalid_argument("invalid arrival clock bounds or rate");
     }
 }
@@ -149,7 +167,8 @@ uint64_t TArrivalClock::Poll(int64_t nowUs) {
         return 0;
     }
     const uint64_t elapsed = std::min(nowUs, EndUs_ - 1) - StartUs_;
-    const uint64_t due = elapsed * Rate_ / 1000000 + 1;
+    const uint64_t totalDue = elapsed * Rate_ / 1000000 + 1;
+    const uint64_t due = totalDue > Partition_ ? (totalDue - Partition_ - 1) / Partitions_ + 1 : 0;
     const uint64_t result = due - Consumed_;
     Consumed_ = due;
     return result;
@@ -165,15 +184,16 @@ int64_t TArrivalClock::DueUs(uint64_t index) const {
     if (!Rate_ || index >= Consumed_) {
         throw std::out_of_range("arrival has not been scheduled");
     }
-    return StartUs_ + (index * 1000000 + Rate_ - 1) / Rate_;
+    return StartUs_ + ((Partition_ + index * Partitions_) * 1000000 + Rate_ - 1) / Rate_;
 }
 
 int64_t TArrivalClock::NextUs() const {
-    return Rate_ ? std::min(EndUs_, StartUs_ + static_cast<int64_t>((Consumed_ * 1000000 + Rate_ - 1) / Rate_)) : EndUs_;
+    return Rate_ ? std::min(EndUs_, StartUs_ + static_cast<int64_t>(
+        ((Partition_ + Consumed_ * Partitions_) * 1000000 + Rate_ - 1) / Rate_)) : EndUs_;
 }
 
 int64_t TArrivalClock::LastDueUs() const {
-    return Consumed_ && Rate_ ? StartUs_ + ((Consumed_ - 1) * 1000000 + Rate_ - 1) / Rate_ : StartUs_;
+    return Consumed_ && Rate_ ? DueUs(Consumed_ - 1) : StartUs_;
 }
 
 TCapacity::TCapacity(std::array<uint64_t, PopulationCount> caps)
