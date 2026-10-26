@@ -43,6 +43,17 @@ TOptions ParseOptions(int argc, char** argv);
 // their clocks interleave arrivals from the original population schedule.
 std::array<uint64_t, PopulationCount> WorkerCaps(const TOptions& options, uint64_t worker);
 
+// Record interval boundaries after statistics collection, using the same
+// timestamp as elapsed_s. Collection delays must not overlap later intervals.
+class TReportClock {
+public:
+    int64_t NextUs() const;
+    int64_t Record(int64_t collectedUs);
+
+private:
+    int64_t LastUs_ = 0;
+};
+
 struct TArrivalBatch {
     uint64_t Scheduled = 0;
     uint64_t Dispatch = 0;

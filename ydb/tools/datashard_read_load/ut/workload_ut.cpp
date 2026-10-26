@@ -7,6 +7,33 @@
 
 namespace NDataShardReadLoad {
 
+TEST(ReportClock, DelayedCollectionDoesNotOverlapIntervalsOrTriggerCatchUpReports) {
+    TReportClock clock;
+    EXPECT_EQ(clock.NextUs(), 1000000);
+    EXPECT_EQ(clock.Record(9005569), 9005569);
+    EXPECT_EQ(clock.NextUs(), 10005569);
+
+    // Collection starts when due, but blocks until 11.351327s. That completion
+    // time anchors both this interval and the next deadline, not its start time.
+    EXPECT_EQ(clock.Record(11351327), 2345758);
+    EXPECT_EQ(clock.NextUs(), 12351327);
+    EXPECT_EQ(clock.Record(12379029), 1027702);
+    EXPECT_EQ(clock.NextUs(), 13379029);
+    EXPECT_GT(clock.NextUs(), 12392351); // no spurious report 13ms later
+}
+
+TEST(ReportClock, IntervalsPartitionElapsedTimeIncludingTimeSpentWritingReports) {
+    TReportClock clock;
+    int64_t sum = 0;
+    for (int64_t collectedUs : {1100000, 2450000, 3500000, 6000000}) {
+        // Time spent writing earlier reports is part of the next interval;
+        // phase records do not reset the interval clock.
+        sum += clock.Record(collectedUs);
+        EXPECT_EQ(sum, collectedUs);
+        EXPECT_EQ(clock.NextUs(), collectedUs + 1000000);
+    }
+}
+
 TEST(ArrivalClock, CountsLateArrivalsWithoutCatchUp) {
     TArrivalClock clock(100, 0, 1000000);
     EXPECT_EQ(clock.Poll(0), 1u);

@@ -662,7 +662,7 @@ private:
             }
             std::unique_lock lock(mutex);
             while (remaining) {
-                const auto delay = std::clamp<int64_t>(NextReportUs_ - SinceUs(Start_), 0, 100000);
+                const auto delay = std::clamp<int64_t>(ReportClock_.NextUs() - SinceUs(Start_), 0, 100000);
                 done.wait_for(lock, std::chrono::microseconds(delay), [&] { return !remaining; });
                 lock.unlock();
                 ReportIfDue(phase);
@@ -699,17 +699,18 @@ private:
         for (auto& worker : Workers_) {
             worker->Collect(snapshot, kind == "interval");
         }
+        const int64_t collectedUs = SinceUs(Start_);
         TJson json(NJson::JSON_MAP);
         json["kind"] = kind;
         json["phase"] = phase;
         json["timestamp"] = TInstant::Now().ToString();
-        json["elapsed_s"] = SinceUs(Start_) / 1000000.0;
+        json["elapsed_s"] = collectedUs / 1000000.0;
         json["totals"] = Populations(snapshot.Totals, true);
         if (origin) {
             json["origin"] = Populations(snapshot.Origins[*origin], true);
         }
         if (kind == "interval") {
-            json["interval_s"] = (SinceUs(Start_) - LastReportUs_) / 1000000.0;
+            json["interval_s"] = ReportClock_.Record(collectedUs) / 1000000.0;
             json["interval"] = Populations(snapshot.Interval, false);
         }
         if (kind == "final") {
@@ -758,21 +759,17 @@ private:
     }
 
     void ReportIfDue(const std::string& phase) {
-        const int64_t now = SinceUs(Start_);
-        if (now < NextReportUs_) {
+        if (SinceUs(Start_) < ReportClock_.NextUs()) {
             return;
         }
         Emit("interval", phase);
-        LastReportUs_ = now;
-        NextReportUs_ = now + 1000000;
     }
 
     const TOptions& Options_;
     std::atomic<bool> Abort_ = false;
     std::vector<std::unique_ptr<TWorker>> Workers_;
     TClock::time_point Start_;
-    int64_t LastReportUs_ = 0;
-    int64_t NextReportUs_ = 1000000;
+    TReportClock ReportClock_;
 };
 
 } // namespace

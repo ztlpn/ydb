@@ -152,6 +152,16 @@ std::array<uint64_t, PopulationCount> WorkerCaps(const TOptions& options, uint64
     return caps;
 }
 
+int64_t TReportClock::NextUs() const {
+    return LastUs_ + 1000000;
+}
+
+int64_t TReportClock::Record(int64_t collectedUs) {
+    const int64_t intervalUs = collectedUs - LastUs_;
+    LastUs_ = collectedUs;
+    return intervalUs;
+}
+
 TArrivalClock::TArrivalClock(uint64_t rate, int64_t startUs, int64_t endUs,
     uint64_t partition, uint64_t partitions)
     : Rate_(rate), StartUs_(startUs), EndUs_(endUs), Partition_(partition), Partitions_(partitions)
