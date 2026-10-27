@@ -4131,6 +4131,8 @@ void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ct
     }
 
     if (!Pipeline.CheckInflightLimit()) {
+        // Advance admitted work before replying to overload/retry traffic.
+        Executor()->TryExecuteReadyTransaction();
         replyWithError(
             Ydb::StatusIds::OVERLOADED,
             TStringBuilder() << "Request " << readId.ReadId << " rejected, MaxTxInFly was exceeded"
@@ -4220,9 +4222,11 @@ void TDataShard::Handle(TEvDataShard::TEvRead::TPtr& ev, const TActorContext& ct
 
     SetCounter(COUNTER_READ_ITERATORS_COUNT, ReadIterators.size());
 
+    // Executor()->Execute(new TTxReadViaPipeline(this, localReadId, request->ReadSpan.GetTraceId()), ctx);
     // Note: we may have a read cancellation already in the mailbox, so we
     // enqueue a low-priority transaction.
-    state.EnqueuedLocalTxId = Executor()->EnqueueLowPriority(new TTxReadViaPipeline(this, localReadId, request->ReadSpan.GetTraceId()));
+    // state.EnqueuedLocalTxId = Executor()->EnqueueLowPriority(new TTxReadViaPipeline(this, localReadId, request->ReadSpan.GetTraceId()));
+    state.EnqueuedLocalTxId = Executor()->Enqueue(new TTxReadViaPipeline(this, localReadId, request->ReadSpan.GetTraceId()));
 }
 
 void TDataShard::Handle(TEvDataShard::TEvReadContinue::TPtr& ev, const TActorContext& ctx) {

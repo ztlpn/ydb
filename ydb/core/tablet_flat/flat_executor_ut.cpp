@@ -9354,6 +9354,96 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_LowPriorityTxs) {
         TCallback Callback;
     };
 
+    Y_UNIT_TEST(TestHelpNormalQueue) {
+        TMyEnvBase env;
+        env.FireDummyTablet();
+
+        TTxState first, second, third;
+        env.SendSync(new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+            x->Enqueue(new TCallbackTx(first, [&](auto&, const auto&) {
+                UNIT_ASSERT(!x->TryExecuteReadyTransaction()); // No nested execution.
+                return true;
+            }));
+            x->Enqueue(new TSimpleTx(second));
+            UNIT_ASSERT(x->TryExecuteReadyTransaction());
+            UNIT_ASSERT_VALUES_EQUAL(first.Executed, 1);
+            UNIT_ASSERT_VALUES_EQUAL(second.Executed, 0);
+            UNIT_ASSERT(x->TryExecuteReadyTransaction());
+            UNIT_ASSERT_VALUES_EQUAL(second.Executed, 1);
+            UNIT_ASSERT(!x->TryExecuteReadyTransaction());
+
+            // Both posted activations remain; one can serve a new transaction
+            // and the other must safely handle an empty queue.
+            x->Enqueue(new TSimpleTx(third));
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+                UNIT_ASSERT_VALUES_EQUAL(third.Executed, 1);
+                UNIT_ASSERT(!x->TryExecuteReadyTransaction());
+                ctx.Send(ctx.SelfID, new NFake::TEvReturn);
+            }});
+        }});
+    }
+
+    Y_UNIT_TEST(TestHelpMustWaitForLowPriorityBarrier) {
+        TMyEnvBase env;
+        env.FireDummyTablet();
+
+        TTxState state;
+        ui64 id = 0;
+        env.SendSync(new NFake::TEvExecute{[&](auto*, const auto& ctx) {
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto&) {
+                id = x->EnqueueLowPriority(new TSimpleTx(state));
+            }});
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto&) {
+                UNIT_ASSERT(!x->TryExecuteReadyTransaction());
+                UNIT_ASSERT_VALUES_EQUAL(state.Executed, 0);
+            }});
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+                UNIT_ASSERT(x->CancelTransaction(id));
+                ctx.Send(ctx.SelfID, new NFake::TEvReturn);
+            }});
+        }});
+        UNIT_ASSERT_VALUES_EQUAL(state.Executed, 0);
+        UNIT_ASSERT_VALUES_EQUAL(state.Destroyed, 1);
+    }
+
+    Y_UNIT_TEST(TestHelpLowPriorityAfterBarrier) {
+        TMyEnvBase env;
+        env.FireDummyTablet();
+
+        TTxState first, slow, helped, remaining, fresh;
+        ui64 freshId = 0;
+        env.SendSync(new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+            x->EnqueueLowPriority(new TSimpleTx(first));
+            x->EnqueueLowPriority(new TCallbackTx(slow, [&](auto&, const auto&) {
+                env->AdvanceCurrentTime(TDuration::MilliSeconds(2));
+                return true;
+            }));
+            x->EnqueueLowPriority(new TSimpleTx(helped));
+            x->EnqueueLowPriority(new TSimpleTx(remaining));
+            ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto*, const auto& ctx) {
+                // The next barrier covers slow, helped, and remaining, but
+                // slow exhausts its time budget before the last two execute.
+                ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+                    UNIT_ASSERT_VALUES_EQUAL(slow.Executed, 1);
+                    UNIT_ASSERT_VALUES_EQUAL(helped.Executed, 0);
+                    freshId = x->EnqueueLowPriority(new TSimpleTx(fresh));
+                    UNIT_ASSERT(x->TryExecuteReadyTransaction());
+                    UNIT_ASSERT_VALUES_EQUAL(helped.Executed, 1);
+                    UNIT_ASSERT_VALUES_EQUAL(remaining.Executed, 0);
+                    UNIT_ASSERT(x->TryExecuteReadyTransaction());
+                    UNIT_ASSERT_VALUES_EQUAL(remaining.Executed, 1);
+                    UNIT_ASSERT(!x->TryExecuteReadyTransaction());
+                    ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
+                        UNIT_ASSERT_VALUES_EQUAL(fresh.Executed, 0);
+                        UNIT_ASSERT(x->CancelTransaction(freshId));
+                        ctx.Send(ctx.SelfID, new NFake::TEvReturn);
+                    }});
+                }});
+            }});
+        }});
+        UNIT_ASSERT_VALUES_EQUAL(fresh.Destroyed, 1);
+    }
+
     Y_UNIT_TEST(TestEnqueueCancel) {
         TMyEnvBase env;
 
@@ -9587,6 +9677,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_LowPriorityTxs) {
                     ctx.Send(ctx.SelfID, new NFake::TEvExecute{[&](auto* x, const auto& ctx) {
                         UNIT_ASSERT_VALUES_EQUAL(other.Executed, 1);
                         UNIT_ASSERT_VALUES_EQUAL(retry.Executed, 1);
+                        UNIT_ASSERT(!x->TryExecuteReadyTransaction());
                         UNIT_ASSERT(x->CancelTransaction(retryId));
                         ctx.Send(ctx.SelfID, new NFake::TEvReturn);
                     }});

@@ -453,6 +453,7 @@ class TExecutor
     ui32 ActivateLowTransactionWaiting = 0;
     ui32 ActivateLowTransactionInFlight = 0;
     ui64 LastLowPriorityActivationSeq = 0;
+    ui64 PassedLowPriorityActivationSeq = 0;
 
     using TWaitingSnaps = THashMap<TTableSnapshotContext *, TIntrusivePtr<TTableSnapshotContext>>;
 
@@ -711,6 +712,7 @@ public:
     void Execute(TAutoPtr<ITransaction> transaction, const TActorContext &ctx) override;
     ui64 Enqueue(TAutoPtr<ITransaction> transaction) override;
     ui64 EnqueueLowPriority(TAutoPtr<ITransaction> transaction) override;
+    bool TryExecuteReadyTransaction() override;
     bool CancelTransaction(ui64 id) override;
 
     void LeaseConfirmed(ui64 confirmedCookie);

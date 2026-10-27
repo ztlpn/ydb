@@ -2111,6 +2111,37 @@ ui64 TExecutor::EnqueueLowPriority(TAutoPtr<ITransaction> self) {
     return DoExecute(self, ETxMode::LowPriority);
 }
 
+bool TExecutor::TryExecuteReadyTransaction() {
+    if (ActiveTransaction || !CanExecuteTransaction()) {
+        return false;
+    }
+
+    TSeat* seat;
+    if (ActivationQueue) {
+        seat = ActivationQueue.PopFront();
+        Y_ENSURE(seat->State == ESeatState::Active);
+        Y_ENSURE(ActivateTransactionWaiting > 0);
+        --ActivateTransactionWaiting;
+    } else if (ActivationLowQueue &&
+            ActivationLowQueue.Front()->LowPriorityActivationSeq <= PassedLowPriorityActivationSeq)
+    {
+        seat = ActivationLowQueue.PopFront();
+        Y_ENSURE(seat->State == ESeatState::ActiveLow);
+        Y_ENSURE(ActivateLowTransactionWaiting > 0);
+        --ActivateLowTransactionWaiting;
+        ScheduleLowPriorityActivation();
+    } else {
+        return false;
+    }
+
+    // Posted activation events remain in the mailbox; only their handlers
+    // decrement the corresponding InFlight counters.
+    seat->State = ESeatState::None;
+    seat->FinishEnqueuedSpan();
+    ExecuteTransaction(seat);
+    return true;
+}
+
 bool TExecutor::CancelTransaction(ui64 id) {
     auto it = Transactions.find(id);
     if (it == Transactions.end()) {
@@ -3191,11 +3222,7 @@ void TExecutor::Handle(TEvPrivate::TEvActivateExecution::TPtr &ev, const TActorC
         seat->FinishEnqueuedSpan();
         ExecuteTransaction(seat);
     } else {
-        // N.B. it should actually never happen, since ActivationQueue size
-        // is always exactly equal to ActivateTransactionWaiting and we never
-        // have more ActivateTransactionInFlight events that these waiting
-        // transactions, so when we handle this event we must have at least
-        // one transaction in queue.
+        // Cancellation or helping may have consumed the queued transactions.
         Y_ENSURE(ActivateTransactionWaiting == 0);
     }
 }
@@ -3203,6 +3230,7 @@ void TExecutor::Handle(TEvPrivate::TEvActivateExecution::TPtr &ev, const TActorC
 void TExecutor::Handle(TEvPrivate::TEvActivateLowExecution::TPtr &ev, const TActorContext &ctx) {
     Y_ENSURE(ActivateLowTransactionInFlight > 0);
     ActivateLowTransactionInFlight--;
+    PassedLowPriorityActivationSeq = Max(PassedLowPriorityActivationSeq, ev->Get()->MaxActivationSeq);
 
     if (!CanExecuteTransaction())
         return;
