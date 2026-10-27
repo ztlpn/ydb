@@ -210,6 +210,34 @@ in milliseconds, and the measured phase windows. Add `--timeline` to include its
 interval counts and rates in JSON too. Accounting inconsistencies and malformed
 or unfinished reports produce an error and a nonzero exit code.
 
+For `cancellation.sh` runs, use the cancellation-specific report:
+
+```bash
+python3 ydb/tools/datashard_read_load/analyze_cancellation.py cancellation.burst.jsonl
+python3 ydb/tools/datashard_read_load/analyze_cancellation.py cancellation.noburst.jsonl cancellation.burst.jsonl
+python3 ydb/tools/datashard_read_load/analyze_cancellation.py cancellation.burst.jsonl --timeline
+python3 ydb/tools/datashard_read_load/analyze_cancellation.py cancellation.burst.jsonl --json > cancellation.summary.json
+```
+
+The default input is `cancellation.burst.jsonl`. This script reuses the retry
+analyzer's accounting and adds short-request success/cancellation percentages,
+all-status and success-only latency, and probe latency relative to baseline.
+Probe counts distinguish scheduled, launched, eventually successful, completed
+by phase end, and still pending at phase end. Probe scheduler/capacity skips and
+outstanding totals appear in the load table. Thus eventual probe success cannot
+hide arrivals skipped at the capacity limit or completions delayed until recovery.
+The recovery phase also reports the same short-request clean-tail heuristic
+defined above. Multiple inputs produce a sustained-phase comparison.
+
+`--timeline` includes probes as well as bulk requests, with completion rates,
+cancellation rates, skips, outstanding counts, and all-status p99/max latency.
+It uses cumulative differences for counts and the original interval histograms
+for latency. Latency is omitted (`null` in JSON) for the first interval in a phase
+and for its final boundary, because those histogram and counter windows differ.
+No cancellation-only latency histogram is available: all-status short latency
+includes successful and cancelled requests. Client `CANCELLED` outcomes do not
+prove that obsolete work was avoided on the server.
+
 Before interpreting a run as evidence, verify that the SQL uses DataShard read
 iterators: inspect the emitted plan and correlate actual reads with iterator
 creation/row counters on the target shard. Collect aligned server measurements:

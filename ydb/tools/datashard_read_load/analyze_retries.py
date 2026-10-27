@@ -130,7 +130,10 @@ def clean_tail(timeline, cap, target_rps):
 
 
 def summarize(path, include_timeline=False):
-    records = read_report(path)
+    return summarize_records(read_report(path), path, include_timeline)
+
+
+def summarize_records(records, path, include_timeline=False):
     config, final = records[0], records[-1]
     phases = []
     for spec in config["phases"]:
