@@ -170,6 +170,46 @@ At phase end, origin `outstanding` may be positive; later final origin records
 show what eventually completed. `final.drained` indicates whether any measured
 requests remained when the bounded drain ended.
 
+### Analyze saved runs
+
+The standalone Python script needs no extra packages:
+
+```bash
+python3 ydb/tools/datashard_read_load/analyze_retries.py retries.burst.jsonl
+python3 ydb/tools/datashard_read_load/analyze_retries.py retries.noburst.jsonl retries.burst.jsonl
+python3 ydb/tools/datashard_read_load/analyze_retries.py retries.burst.jsonl --timeline
+python3 ydb/tools/datashard_read_load/analyze_retries.py retries.burst.jsonl --json > summary.json
+```
+
+With no filenames it reads `retries.burst.jsonl`. Each file must contain one
+finished run, including its `final` record; interrupted runs with a final record
+are accepted and labeled. The summary shows achieved dispatch rates, scheduler
+and capacity skips, completion statuses, success-only latency, probes, and
+outstanding requests. Multiple files also get a sustained long-read comparison
+and a list of differing client settings. Server builds and executor policies
+are not recorded in the input and must be tracked separately.
+
+Dispatch rates divide phase-origin launches by configured phase duration.
+Delivered percentages divide launches by scheduled arrivals. For interrupted
+phases the configured duration can exceed the time actually run; consult the
+interrupted flag and `window_s` in JSON output. Successful completion rates use
+cumulative counter differences between phase boundaries divided by measured
+elapsed time, including completions of requests launched in earlier phases.
+The script never treats eventual cohort successes as completions during load.
+`--timeline` also derives rates from cumulative counters and `elapsed_s`, avoiding
+historical `interval_s` reporting errors. Histogram percentiles are taken directly
+from final cohorts; they are not averaged or subtracted.
+
+A **clean tail** is a sampled suffix lasting at least five seconds with client
+outstanding at most `max(1, floor(1% of cap))`, no failed completions or skipped
+arrivals, and both dispatch and successful completion rates at least 95% of the
+configured target. Its start is relative to the phase's `phase_start` record.
+This is an explicit recovery heuristic, not a measurement of server queue state.
+JSON output preserves full cohort statistics, all-status and success-only latency
+in milliseconds, and the measured phase windows. Add `--timeline` to include its
+interval counts and rates in JSON too. Accounting inconsistencies and malformed
+or unfinished reports produce an error and a nonzero exit code.
+
 Before interpreting a run as evidence, verify that the SQL uses DataShard read
 iterators: inspect the emitted plan and correlate actual reads with iterator
 creation/row counters on the target shard. Collect aligned server measurements:
