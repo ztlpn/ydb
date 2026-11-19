@@ -287,6 +287,11 @@ public:
             item.SetId(target->GetId());
             item.SetSrcPath(target->GetSrcPath());
             item.SetDstPath(target->GetDstPath());
+            if (auto it = Self->ChecksumStates.find(std::make_pair(replication->GetId(), target->GetId()));
+                it != Self->ChecksumStates.end() && it->second.HasStatus())
+            {
+                *item.MutableChecksumStatus() = it->second.GetStatus();
+            }
 
             if (target->GetStreamName()) {
                 item.SetSrcStreamName(target->GetStreamName());

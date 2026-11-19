@@ -142,6 +142,10 @@ class TController::TTxInit: public TTxBase {
             if (workerSetComplete) {
                 Self->CompleteWorkerSets.insert({rid, tid});
             }
+            const auto checksum = rowset.GetValueOrDefault<Schema::Targets::CdcChecksum>(TString());
+            if (!checksum.empty()) {
+                Y_ENSURE(Self->ChecksumStates[std::make_pair(rid, tid)].ParseFromString(checksum));
+            }
             const auto barrierPhase = rowset.GetValueOrDefault<Schema::Targets::SchemaBarrierPhase>(0);
             if (barrierPhase) {
                 auto& barrier = Self->SchemaBarriers[{rid, tid}];

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ydb/core/tx/replication/checksum/checksum.h>
+
 #include "logging.h"
 #include "nodes_manager.h"
 #include "private_events.h"
@@ -243,6 +245,7 @@ private:
     class TTxRunWorker;
     class TTxRemoveWorker;
     class TTxCompleteWorkerSet;
+    class TTxChecksum;
     class TTxSchemaChangeReport;
     class TTxSchemaChangeDstAlterTxId;
     class TTxSchemaChangeDstAlterResult;
@@ -280,6 +283,17 @@ private:
     void RunTxSchemaChangeDstAlterTxId(TEvPrivate::TEvSchemaChangeDstAlterTxId::TPtr& ev, const TActorContext& ctx);
     void RunTxSchemaChangeDstAlterResult(TEvPrivate::TEvSchemaChangeDstAlterResult::TPtr& ev, const TActorContext& ctx);
     void RunTxResumeDeferredAlter(TEvPrivate::TEvResumeDeferredAlter::TPtr& ev, const TActorContext& ctx);
+
+    void Handle(NChecksum::TEvSnapshot::TPtr& ev, const TActorContext& ctx);
+    void Handle(NChecksum::TEvResult::TPtr& ev, const TActorContext& ctx);
+    void Handle(TEvents::TEvWakeup::TPtr& ev, const TActorContext& ctx);
+    bool ObserveChecksum(const std::pair<ui64, ui64>& key,
+        const NKikimrChangeExchange::TCdcChecksum& control, NIceDb::TNiceDb& db, TInstant now);
+    void SaveChecksumSnapshot(const std::pair<ui64, ui64>& key, TRowVersion snapshot,
+        Ydb::StatusIds::StatusCode status, NIceDb::TNiceDb& db, TInstant now);
+    void PersistChecksum(const std::pair<ui64, ui64>& key, NIceDb::TNiceDb& db, TInstant now);
+    bool HasChecksumReads(const std::pair<ui64, ui64>& key) const;
+    void ProgressChecksums(const TActorContext& ctx);
 
     void StartSchemaChangeDstAlter(const std::pair<ui64, ui64>& key, const TActorContext& ctx);
     void StopSchemaChangeDstAlter(const std::pair<ui64, ui64>& key, const TActorContext& ctx);
@@ -349,6 +363,13 @@ private:
     THashSet<std::pair<ui64, ui64>> CompleteWorkerSets;
     TMap<std::pair<ui64, ui64>, TSchemaBarrier> SchemaBarriers;
     THashMap<std::pair<ui64, ui64>, TActorId> SchemaChangeDstAlterers;
+    THashMap<std::pair<ui64, ui64>, NKikimrReplication::TCdcChecksumState> ChecksumStates;
+    struct TChecksumQuery {
+        std::pair<ui64, ui64> Target;
+        TString CheckpointId;
+    };
+    THashMap<TActorId, TChecksumQuery> ChecksumQueries;
+    bool ChecksumTimerScheduled = false;
     THashSet<ui64> DeferredAlters;
     THashSet<TWorkerId> BootQueue;
     THashSet<std::pair<TWorkerId, ui32>> StopQueue;

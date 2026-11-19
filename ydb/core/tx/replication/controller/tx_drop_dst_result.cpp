@@ -75,6 +75,7 @@ public:
         if (Replication) {
             Replication->Progress(ctx);
         }
+        Self->ProgressChecksums(ctx);
     }
 
 }; // TTxDropDstResult
@@ -91,6 +92,7 @@ void TController::RemoveTarget(NIceDb::TNiceDb& db, TReplication& replication, u
     for (const auto wid : replication.FindTarget(targetId)->GetWorkers()) {
         db.Table<Schema::Workers>().Key(rid, targetId, wid).Delete();
     }
+    ChecksumStates.erase(std::make_pair(rid, targetId));
     IndexBuilds.erase({rid, targetId});
     for (auto it = IndexBuildProgress.begin(); it != IndexBuildProgress.end();) {
         if (it->first.ReplicationId() == rid && it->first.TargetId() == targetId) {

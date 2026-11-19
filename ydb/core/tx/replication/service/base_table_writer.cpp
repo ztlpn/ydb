@@ -527,7 +527,7 @@ class TLocalTableWriter
                 break;
             }
             if (PendingSchemaChange) {
-                if (IndexBuild) {
+                if (IndexBuild && !schema.HasChecksum()) {
                     return LogCritAndLeave("Schema changes during replicated index build are not supported");
                 }
 
@@ -775,6 +775,15 @@ class TLocalTableWriter
 
         if (!IsSameSchemaChange(schema, PendingSchemaChange->Schema)) {
             return LogCritAndLeave("Unexpected schema change result");
+        }
+
+        if (schema.HasChecksum()) {
+            // The snapshot has already been secured, or this attempt was
+            // skipped. Consuming a control does not invalidate the row schema.
+            Send(Worker, new TEvWorker::TEvSchemaChangeApplied(schema));
+            LastAppliedSchema = MakeHolder<NKikimrReplication::TSchemaChange>(schema);
+            PendingSchemaChange.Reset();
+            return;
         }
 
         if (RefreshingSchema) {

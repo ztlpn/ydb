@@ -1,8 +1,10 @@
+#include <ydb/core/protos/change_exchange.pb.h>
 #include "controller_impl.h"
 #include "dst_schema_changer.h"
 #include "target_table.h"
 
 #include <ydb/core/base/path.h>
+#include <ydb/library/actors/core/actor_bootstrapped.h>
 
 #include <ydb/core/tx/replication/common/family_settings.h>
 #include <ydb/core/tx/replication/common/schema_change.h>
@@ -18,7 +20,29 @@ namespace {
 
 using TFamily = NKikimrReplication::TSchemaChange::TFamily;
 
+class TReadyChecksumSnapshot: public TActorBootstrapped<TReadyChecksumSnapshot> {
+    const TActorId Parent;
+    const TRowVersion Snapshot;
+    const Ydb::StatusIds::StatusCode Status;
+
+public:
+    TReadyChecksumSnapshot(TActorId parent, TRowVersion snapshot, Ydb::StatusIds::StatusCode status)
+        : Parent(parent), Snapshot(snapshot), Status(status) {}
+
+    void Bootstrap() {
+        auto result = MakeHolder<NChecksum::TEvSnapshot>();
+        result->Snapshot = Snapshot;
+        result->Status = Status;
+        Send(Parent, result.Release());
+        PassAway();
+    }
+};
+
 bool IsValidSchemaChange(const NKikimrReplication::TSchemaChange& schema) {
+    if (schema.HasChecksum()) {
+        return schema.HasVersion() && !schema.GetChecksum().GetCheckpointId().empty() &&
+            schema.GetChecksum().GetProtocolVersion() == 1;
+    }
     if (!schema.HasVersion() || !schema.GetSourceSchemaVersion()) {
         return false;
     }
@@ -660,20 +684,27 @@ public:
         }
 
         const auto key = std::make_pair(id.ReplicationId(), id.TargetId());
-        if (!Self->CompleteWorkerSets.contains(key)) {
-            YDB_LOG_NOTICE_CTX(ctx, "Schema report before complete worker set is ready",
-                {"worker", id});
-            return true;
-        }
-
         auto replication = Self->Find(key.first);
-        if (!replication) {
-            YDB_LOG_NOTICE_CTX(ctx, "Schema report for unknown replication",
+        if (!replication || !replication->FindTarget(key.second)) {
+            YDB_LOG_NOTICE_CTX(ctx, "Schema report for unknown replication target",
                 {"worker", id});
             return true;
         }
 
         NIceDb::TNiceDb db(txc.DB);
+        if (schema.HasChecksum() && Self->ObserveChecksum(key, schema.GetChecksum(), db, ctx.Now())) {
+            ReporterReply = record.GetCompleted() ? EReporterReply::Completed
+                : record.GetApplied() ? EReporterReply::Applied : EReporterReply::Release;
+            return true;
+        }
+        // Start the checksum deadline at its first arrival, even if the worker
+        // roster is still being recovered. Only a complete roster can park a
+        // table; results and terminal attempts need no quorum.
+        if (!Self->CompleteWorkerSets.contains(key)) {
+            YDB_LOG_NOTICE_CTX(ctx, "Schema report before complete worker set is ready",
+                {"worker", id});
+            return true;
+        }
         auto* barrierPtr = FindOrCreateBarrier(id, schema, key, db, ctx);
         if (!barrierPtr) {
             return true;
@@ -773,6 +804,7 @@ public:
             Self->SendSchemaChangeResult(id, record.GetSchema(), record.GetOffset(), applied, completed, ctx);
         }
 
+        Self->ProgressChecksums(ctx);
         if (ReporterReply == EReporterReply::Release) {
             return;
         }
@@ -817,6 +849,36 @@ void TController::StartSchemaChangeDstAlter(const std::pair<ui64, ui64>& key, co
     }
 
     if (replication->GetState() == TReplication::EState::Removing) {
+        return;
+    }
+
+    if (it->second.Schema.HasChecksum()) {
+        const auto& control = it->second.Schema.GetChecksum();
+        const auto& state = ChecksumStates.at(key);
+        for (const auto& attempt : state.GetAttempts()) {
+            if (attempt.GetCheckpoint().GetCheckpointId() != control.GetCheckpointId()) {
+                continue;
+            }
+            // Creation can be retried only before durable snapshot publication
+            // and worker release. A released snapshot always retains its D.
+            if (attempt.GetFinished() || attempt.HasDestinationSnapshot()) {
+                const auto status = attempt.HasDestinationSnapshot()
+                    ? Ydb::StatusIds::SUCCESS : attempt.GetLocalStatus();
+                // Give replay its own actor identity: cancellation must never
+                // poison the controller, and stale results must remain distinct.
+                const auto actor = ctx.Register(new TReadyChecksumSnapshot(ctx.SelfID,
+                    TRowVersion::FromProto(attempt.GetDestinationSnapshot()), status));
+                SchemaChangeDstAlterers.emplace(key, actor);
+            } else {
+                const auto actor = ctx.Register(NChecksum::CreateSnapshot(ctx.SelfID,
+                    replication->GetDatabase(), target->GetDstPath(), TInstant::MicroSeconds(attempt.GetDeadlineUs())));
+                SchemaChangeDstAlterers.emplace(key, actor);
+            }
+            return;
+        }
+        return;
+    }
+    if (HasChecksumReads(key)) {
         return;
     }
 
@@ -977,7 +1039,7 @@ public:
         return TXTYPE_SCHEMA_CHANGE_REPORT;
     }
 
-    bool Execute(TTransactionContext& txc, const TActorContext&) override {
+    bool Execute(TTransactionContext& txc, const TActorContext& ctx) override {
         const auto key = std::make_pair(Event->Get()->ReplicationId, Event->Get()->TargetId);
         auto it = Self->SchemaBarriers.find(key);
         auto alterer = Self->SchemaChangeDstAlterers.find(key);
@@ -994,6 +1056,10 @@ public:
         }
 
         NIceDb::TNiceDb db(txc.DB);
+        if (it->second.Schema.HasChecksum()) {
+            Self->SaveChecksumSnapshot(key, Event->Get()->ChecksumSnapshot,
+                Event->Get()->ChecksumSnapshotStatus, db, ctx.Now());
+        }
         if (!Event->Get()->IsSuccess()) {
             auto replication = Self->Find(key.first);
             auto* target = replication ? replication->FindTarget(key.second) : nullptr;
@@ -1142,6 +1208,7 @@ public:
             }
         }
 
+        Self->ProgressChecksums(ctx);
         Self->RunTxIndexBuild(ctx);
         for (const auto replicationId : Self->DeferredAlters) {
             if (!Self->HasPendingAlter(replicationId)) {

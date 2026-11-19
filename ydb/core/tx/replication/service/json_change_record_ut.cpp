@@ -1,4 +1,5 @@
 #include "json_change_record.h"
+#include <ydb/core/change_exchange/cdc_checksum.h>
 
 #include <ydb/core/io_formats/json/json.h>
 #include <ydb/core/protos/base.pb.h>
@@ -11,6 +12,7 @@
 #include <ydb/core/tx/datashard/change_record_cdc_serializer.h>
 #include <ydb/library/aclib/user_context.h>
 #include <ydb/library/testlib/helpers.h>
+#include <ydb/public/api/protos/draft/ydb_replication.pb.h>
 
 #include <contrib/libs/zstd/include/zstd.h>
 
@@ -561,6 +563,75 @@ Y_UNIT_TEST_SUITE(JsonChangeRecord) {
         UNIT_ASSERT_VALUES_EQUAL(record->GetKind(), TChangeRecord::EKind::CdcHeartbeat);
         UNIT_ASSERT_VALUES_EQUAL(record->GetStep(), 10);
         UNIT_ASSERT_VALUES_EQUAL(record->GetTxId(), 20);
+    }
+
+    Y_UNIT_TEST(ChecksumControlRoundTrip) {
+        NKikimrChangeExchange::TCdcChecksum control;
+        control.SetProtocolVersion(1);
+        control.SetCheckpointId("checkpoint-1");
+        control.MutableTableId()->SetOwnerId(42);
+        control.MutableTableId()->SetLocalId(17);
+        control.SetSnapshotStep(100);
+        control.SetSnapshotTxId(20);
+        control.SetSchema("3:key8:Uint64:0");
+        control.SetAlgorithm("CityHash64");
+        control.SetAlgorithmVersion(1);
+        for (const bool result : {false, true}) {
+            control.SetResult(result);
+            if (result) {
+                control.SetStatus(Ydb::StatusIds::SUCCESS);
+                control.MutableChecksum()->set_row_count(7);
+                control.MutableChecksum()->set_hash("0123456789ABCDEF");
+            }
+            const auto json = NChangeExchange::SerializeCdcChecksum(control);
+            auto record = TChangeRecordBuilder().WithBody(NJson::WriteJson(json)).Build();
+            UNIT_ASSERT_VALUES_EQUAL(record->GetKind(), result
+                ? TChangeRecord::EKind::CdcChecksumResult : TChangeRecord::EKind::CdcChecksumCheckpoint);
+            UNIT_ASSERT_VALUES_EQUAL(record->GetStep(), 100);
+            UNIT_ASSERT_VALUES_EQUAL(record->GetTxId(), 20);
+            NKikimrReplication::TSchemaChange parsed;
+            TString error;
+            UNIT_ASSERT_C(record->TryGetSchemaChange(parsed, error), error);
+            UNIT_ASSERT(parsed.HasChecksum());
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetChecksum().GetCheckpointId(), control.GetCheckpointId());
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetChecksum().GetResult(), result);
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetChecksum().GetSchema(), control.GetSchema());
+            if (result) {
+                UNIT_ASSERT_VALUES_EQUAL(parsed.GetChecksum().GetChecksum().SerializeAsString(),
+                    control.GetChecksum().SerializeAsString());
+            }
+        }
+    }
+
+    Y_UNIT_TEST(RejectMalformedChecksumControls) {
+        NKikimrChangeExchange::TCdcChecksum control;
+        control.SetCheckpointId("checkpoint-1");
+        control.MutableTableId()->SetOwnerId(42);
+        control.MutableTableId()->SetLocalId(17);
+        control.SetSnapshotStep(100);
+        control.SetSnapshotTxId(20);
+        control.SetResult(true);
+        control.SetStatus(Ydb::StatusIds::SUCCESS);
+        control.MutableChecksum()->set_hash("0123456789ABCDEF");
+        const auto valid = NChangeExchange::SerializeCdcChecksum(control);
+        for (ui32 mutation = 0; mutation < 7; ++mutation) {
+            auto json = valid;
+            auto& value = json["checksum_result"];
+            switch (mutation) {
+            case 0: value["version"] = 2; break;
+            case 1: value["snapshot"] = "100:20"; break;
+            case 2: value["hash"] = "0123456789abcdef"; break;
+            case 3: value["row_count"] = -1; break;
+            case 4: json["checksum_checkpoint"] = value; break;
+            case 5: value["status"] = 0; break;
+            case 6: value["status"] = 0x100000000ull; break;
+            }
+            auto record = TChangeRecordBuilder().WithBody(NJson::WriteJson(json)).Build();
+            NKikimrReplication::TSchemaChange parsed;
+            TString error;
+            UNIT_ASSERT(!record->TryGetSchemaChange(parsed, error));
+            UNIT_ASSERT(!error.empty());
+        }
     }
 
     Y_UNIT_TEST(SchemaChange) {

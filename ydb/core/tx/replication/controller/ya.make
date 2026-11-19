@@ -11,6 +11,7 @@ PEERDIR(
     ydb/core/protos
     ydb/core/tablet
     ydb/core/tablet_flat
+    ydb/core/tx/replication/checksum
     ydb/core/tx/replication/common
     ydb/core/tx/replication/controller/protos
     ydb/core/tx/replication/ydb_proxy
@@ -69,6 +70,7 @@ SRCS(
     tx_heartbeat.cpp
     tx_index_build.cpp
     tx_init.cpp
+    tx_checksum.cpp
     tx_schema_change.cpp
     tx_init_schema.cpp
     tx_resolve_database_result.cpp
