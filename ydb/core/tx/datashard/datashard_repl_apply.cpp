@@ -464,6 +464,15 @@ public:
         TReplicationSourceOffsetsDb rdb(txc);
         source.AdvanceMaxOffset(rdb, keyCellVec.GetCells(), sourceOffset);
 
+        // A table-scoped replication barrier may commit an interval before
+        // its global transaction id is retired. Further records in that
+        // interval must not inherit the old commit version: that would change
+        // snapshots retained after the barrier. These records are already
+        // visible on this table, so apply them at a fresh MVCC version.
+        if (writeTxId && txc.DB.HasCommittedTx(userTable.LocalTid, writeTxId)) {
+            writeTxId = 0;
+        }
+
         if (writeTxId) {
             if (collector) {
                 if (!MvccVersion) {

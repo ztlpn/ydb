@@ -224,6 +224,43 @@ Y_UNIT_TEST_SUITE(DataShardReplication) {
         }
     }
 
+    Y_UNIT_TEST_TWIN(CommittedReplicationIntervalPreservesSnapshot, Reboot) {
+        TPortManager pm;
+        TServerSettings settings(pm.GetPort(2134));
+        settings.SetDomainName("Root").SetUseRealThreads(false);
+        Tests::TServer::TPtr server = new TServer(settings);
+        auto& runtime = *server->GetRuntime();
+        const auto sender = runtime.AllocateEdgeActor();
+        InitRoot(server, sender);
+        CreateShardedTable(
+            server, sender, "/Root", "table-1", TShardedTableOptions().Replicated(true).ReplicationConsistencyLevel(EConsistencyLevel::Global));
+        const auto shard = GetTableShards(server, sender, "/Root/table-1").at(0);
+        const auto table = ResolveTableId(server, sender, "/Root/table-1");
+        ApplyChanges(server, shard, table, "source",
+            {
+                TChange{ .Offset = 0, .WriteTxId = 123, .Key = 1, .Value = 11 },
+            });
+        CommitWrites(server, { "/Root/table-1" }, 123);
+        const auto snapshot = CreateVolatileSnapshot(server, { "/Root/table-1" }, TDuration::Hours(1));
+        if (Reboot) {
+            RebootTablet(runtime, shard, sender);
+        }
+
+        // The global interval remains assigned after a table-only flush.
+        // Test both overwriting an existing key and inserting a new key.
+        ApplyChanges(server, shard, table, "source",
+            {
+                TChange{ .Offset = 1, .WriteTxId = 123, .Key = 1, .Value = 22 },
+                TChange{ .Offset = 2, .WriteTxId = 123, .Key = 2, .Value = 33 },
+            });
+        UNIT_ASSERT_VALUES_EQUAL(ReadShardedTable(server, "/Root/table-1", snapshot), "key = 1, value = 11\n");
+        // Completing the ordinary global commit must not backdate the suffix.
+        CommitWrites(server, { "/Root/table-1" }, 123);
+        UNIT_ASSERT_VALUES_EQUAL(ReadShardedTable(server, "/Root/table-1", snapshot), "key = 1, value = 11\n");
+        UNIT_ASSERT_VALUES_EQUAL(ReadShardedTable(server, "/Root/table-1"), "key = 1, value = 22\nkey = 2, value = 33\n");
+        UNIT_ASSERT(DiscardVolatileSnapshot(server, { "/Root/table-1" }, snapshot));
+    }
+
     Y_UNIT_TEST_TWIN(RejectedChangeDoesNotAdvanceOffset, Reboot) {
         TPortManager pm;
         TServerSettings settings(pm.GetPort(2134));
