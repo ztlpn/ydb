@@ -1,5 +1,6 @@
 option cc_enable_arenas = true;
 
+import "ydb/core/protos/change_exchange.proto";
 import "ydb/library/actors/protos/actors.proto";
 import "ydb/core/protos/base.proto";
 import "ydb/core/scheme/protos/type_info.proto";
@@ -627,6 +628,8 @@ message TAlterCdcStreamNotice {
     optional uint64 TableSchemaVersion = 2;
     optional NKikimrSchemeOp.TCdcStreamDescription StreamDescription = 3;
     optional TSnapshot DropSnapshot = 4;
+    optional NKikimrChangeExchange.TCdcChecksum Checksum = 5;
+    optional uint64 ChecksumEmitterTabletId = 6;
 }
 
 message TDropCdcStreamNotice {

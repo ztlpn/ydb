@@ -3081,6 +3081,9 @@ void TSchemeShard::PersistTxState(NIceDb::TNiceDb& db, const TOperationId opId) 
     }  else if (txState.TxType == TTxState::TxRotateCdcStreamAtTable) {
         NKikimrSchemeOp::TGenericTxInFlyExtraData proto;
         txState.CdcPathId.ToProto(proto.MutableTxCopyTableExtraData()->MutableCdcPathId());
+        if (txState.CdcChecksum.HasCheckpointId()) {
+            *proto.MutableCdcChecksum() = txState.CdcChecksum;
+        }
         bool serializeRes = proto.SerializeToString(&extraData);
         Y_ABORT_UNLESS(serializeRes);
     } else if (txState.TxType == TTxState::TxCreateCdcStreamAtTable ||
@@ -3091,6 +3094,9 @@ void TSchemeShard::PersistTxState(NIceDb::TNiceDb& db, const TOperationId opId) 
                txState.TxType == TTxState::TxDropCdcStreamAtTableDropSnapshot) {
         NKikimrSchemeOp::TGenericTxInFlyExtraData proto;
         txState.CdcPathId.ToProto(proto.MutableTxCopyTableExtraData()->MutableCdcPathId());
+        if (txState.CdcChecksum.HasCheckpointId()) {
+            *proto.MutableCdcChecksum() = txState.CdcChecksum;
+        }
         bool serializeRes = proto.SerializeToString(&extraData);
         Y_ABORT_UNLESS(serializeRes);
     }
@@ -5268,6 +5274,7 @@ void TSchemeShard::PersistRemoveTable(NIceDb::TNiceDb& db, TPathId pathId, const
         db.Table<Schema::Tables>().Key(pathId.LocalPathId).Delete();
     }
     db.Table<Schema::MigratedTables>().Key(pathId.OwnerId, pathId.LocalPathId).Delete();
+    db.Table<Schema::CdcChecksumAttempts>().Key(pathId.OwnerId, pathId.LocalPathId).Delete();
 
     if (tableInfo->IsTTLEnabled()) {
         TTLEnabledTables.erase(pathId);

@@ -1003,6 +1003,7 @@ struct TTableInfo : public TSimpleRefCount<TTableInfo> {
     THashMap<TShardIdx, NKikimrSchemeOp::TPartitionConfig> PerShardPartitionConfig;
 
     bool IsExternalBlobsEnabled = false;
+    NKikimrChangeExchange::TCdcChecksum CdcChecksum;
 
     mutable ui64 LastVerifyConsistencyTime = 0;
 

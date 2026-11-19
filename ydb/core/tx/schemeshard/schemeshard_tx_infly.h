@@ -8,6 +8,7 @@
 #include <ydb/library/actors/core/actorid.h>
 #include <ydb/core/base/tablet_types.h>
 #include <ydb/core/protos/replication.pb.h>
+#include <ydb/core/protos/change_exchange.pb.h>
 #include <ydb/core/scheme/scheme_pathid.h>
 #include <ydb/core/tx/message_seqno.h>
 
@@ -87,6 +88,7 @@ struct TTxState {
     // TxCopy or TxRotateCdcStreamAtTable: Stores path for cdc stream to create in case of ContinuousBackup;
     // uses ExtraData through proto
     TPathId CdcPathId = InvalidPathId;
+    NKikimrChangeExchange::TCdcChecksum CdcChecksum;
     TMaybe<NKikimrSchemeOp::EPathState> TargetPathTargetState;
     // Persisted in TxInFlightV2::ExtraBytes for DROP replay.
     NKikimrReplication::ESourceCleanupPolicy ReplicationSourceCleanup = NKikimrReplication::SOURCE_CLEANUP_POLICY_DROP;

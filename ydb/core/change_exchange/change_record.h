@@ -33,6 +33,8 @@ public:
         CdcHeartbeat = 2 ,
         IncrementalRestore = 3,
         CdcSchemaChange = 4,
+        CdcChecksumCheckpoint = 5,
+        CdcChecksumResult = 6,
     };
 
 public:

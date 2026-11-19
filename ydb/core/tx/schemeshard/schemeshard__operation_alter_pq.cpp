@@ -680,6 +680,23 @@ public:
             }
         }
 
+        const auto parent = path.Parent();
+        if (parent.IsCdcStream()) {
+            const auto tablePath = parent.Parent();
+            if (const auto* table = context.SS->Tables.FindPtr(tablePath.Base()->PathId)) {
+                const auto& attempt = (*table)->CdcChecksum;
+                const bool layoutChange = alter.HasTotalGroupCount() || alter.SplitSize() || alter.MergeSize() ||
+                    (alter.HasPQTabletConfig() && alter.GetPQTabletConfig().HasPartitionStrategy());
+                if (layoutChange && (tablePath.IsUnderOperation() ||
+                    (!attempt.GetResult() && attempt.GetDeadlineUs() > context.Ctx.Now().MicroSeconds())))
+                {
+                    result->SetError(NKikimrScheme::StatusMultipleModifications,
+                        "Topic partition layout is reserved by a checksum attempt");
+                    return result;
+                }
+            }
+        }
+
         TTopicInfo::TPtr topic = context.SS->Topics.at(path.Base()->PathId);
         Y_ABORT_UNLESS(topic);
 

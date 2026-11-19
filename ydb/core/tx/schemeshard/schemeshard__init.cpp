@@ -2050,6 +2050,24 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
             }
         }
 
+        {
+            auto rowset = db.Table<Schema::CdcChecksumAttempts>().Range().Select();
+            if (!rowset.IsReady()) {
+                return false;
+            }
+            while (!rowset.EndOfSet()) {
+                const TPathId pathId(rowset.GetValue<Schema::CdcChecksumAttempts::OwnerId>(),
+                    rowset.GetValue<Schema::CdcChecksumAttempts::LocalId>());
+                if (auto* table = Self->Tables.FindPtr(pathId)) {
+                    Y_ENSURE(ParseFromStringNoSizeLimit((*table)->CdcChecksum,
+                        rowset.GetValue<Schema::CdcChecksumAttempts::Record>()));
+                }
+                if (!rowset.Next()) {
+                    return false;
+                }
+            }
+        }
+
         // Read External Tables
         {
             auto rowset = db.Table<Schema::ExternalTable>().Range().Select();
@@ -4098,6 +4116,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         bool deserializeRes = ParseFromStringNoSizeLimit(proto, extraData);
                         Y_ABORT_UNLESS(deserializeRes);
                         txState.CdcPathId = TPathId::FromProto(proto.GetTxCopyTableExtraData().GetCdcPathId());
+                        txState.CdcChecksum = proto.GetCdcChecksum();
                         if (proto.GetTxCopyTableExtraData().HasTargetPathTargetState()) {
                             txState.TargetPathTargetState = proto.GetTxCopyTableExtraData().GetTargetPathTargetState();
                         }
@@ -4117,6 +4136,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         bool deserializeRes = ParseFromStringNoSizeLimit(proto, extraData);
                         Y_ABORT_UNLESS(deserializeRes);
                         txState.CdcPathId = TPathId::FromProto(proto.GetTxCopyTableExtraData().GetCdcPathId());
+                        txState.CdcChecksum = proto.GetCdcChecksum();
                     }
                 } else if (txState.TxType == TTxState::TxCreateCdcStreamAtTable ||
                            txState.TxType == TTxState::TxCreateCdcStreamAtTableWithInitialScan ||
@@ -4129,6 +4149,7 @@ struct TSchemeShard::TTxInit : public TTransactionBase<TSchemeShard> {
                         bool deserializeRes = ParseFromStringNoSizeLimit(proto, extraData);
                         Y_ABORT_UNLESS(deserializeRes);
                         txState.CdcPathId = TPathId::FromProto(proto.GetTxCopyTableExtraData().GetCdcPathId());
+                        txState.CdcChecksum = proto.GetCdcChecksum();
                     }
                 }
 

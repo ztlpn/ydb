@@ -1,6 +1,7 @@
 #include "change_record_cdc_serializer.h"
 #include "change_record.h"
 #include "type_serialization.h"
+#include <ydb/core/change_exchange/cdc_checksum.h>
 
 #include <ydb/core/io_formats/json/json.h>
 #include <ydb/core/protos/change_exchange.pb.h>
@@ -78,8 +79,10 @@ public:
         cmd.SetCreateTimeMS(record.GetApproximateCreationDateTime().MilliSeconds());
         switch (record.GetKind()) {
         case TChangeRecord::EKind::CdcDataChange:
+        case TChangeRecord::EKind::CdcChecksumResult:
             return SerializeDataChange(cmd, record);
         case TChangeRecord::EKind::CdcSchemaChange:
+        case TChangeRecord::EKind::CdcChecksumCheckpoint:
             return SerializeSchemaChange(cmd, record);
         case TChangeRecord::EKind::CdcHeartbeat:
             return SerializeHeartbeat(cmd, record);
@@ -560,6 +563,14 @@ protected:
 
     void SerializeToJson(NJson::TJsonValue& json, const TChangeRecord& record) override {
         switch (record.GetKind()) {
+        case TChangeRecord::EKind::CdcChecksumCheckpoint:
+        case TChangeRecord::EKind::CdcChecksumResult: {
+            NKikimrChangeExchange::TChangeRecord proto;
+            record.Serialize(proto);
+            json = NChangeExchange::SerializeCdcChecksum(
+                proto.HasCdcChecksumCheckpoint() ? proto.GetCdcChecksumCheckpoint() : proto.GetCdcChecksumResult());
+            return;
+        }
         case TChangeRecord::EKind::AsyncIndex:
         case TChangeRecord::EKind::CdcDataChange:
             return SerializeDataChange(json, record);

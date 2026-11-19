@@ -317,7 +317,8 @@ void TChangeSender::SendPreparedRecords(ui64 partitionId) {
             rest.push_back(std::move(record));
             continue;
         }
-        if (record->GetKind() == IChangeRecord::EKind::CdcSchemaChange) {
+        if (record->GetKind() == IChangeRecord::EKind::CdcSchemaChange ||
+            record->GetKind() == IChangeRecord::EKind::CdcChecksumCheckpoint) {
             seenSchemaChangeBarrier = true;
         }
         toSend.push_back(std::move(record));

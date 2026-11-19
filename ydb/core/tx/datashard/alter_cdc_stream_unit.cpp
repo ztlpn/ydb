@@ -1,4 +1,5 @@
 #include "datashard_impl.h"
+#include <ydb/library/aclib/user_context.h>
 #include "datashard_locks_db.h"
 #include "datashard_pipeline.h"
 #include "execution_unit_ctors.h"
@@ -29,6 +30,9 @@ public:
         }
 
         const auto& params = schemeTx.GetAlterCdcStreamNotice();
+        if (params.HasChecksum()) {
+            return ExecuteChecksum(op, params, txc, ctx);
+        }
         const auto& streamDesc = params.GetStreamDescription();
         const auto streamPathId = TPathId::FromProto(streamDesc.GetPathId());
         const auto state = streamDesc.GetState();
@@ -90,7 +94,63 @@ public:
         return EExecutionStatus::DelayCompleteNoMoreRestarts;
     }
 
-    void Complete(TOperation::TPtr, const TActorContext&) override {
+    EExecutionStatus ExecuteChecksum(TOperation::TPtr op,
+            const NKikimrTxDataShard::TAlterCdcStreamNotice& params,
+            TTransactionContext& txc, const TActorContext& ctx) {
+        auto checksum = params.GetChecksum();
+        const auto pathId = TPathId::FromProto(params.GetPathId());
+        const auto& table = *DataShard.GetUserTables().at(pathId.LocalPathId);
+        if (!checksum.GetResult()) {
+            checksum.SetSnapshotStep(op->GetStep());
+            checksum.SetSnapshotTxId(op->GetTxId());
+            const TSnapshotKey key(pathId, op->GetStep(), op->GetTxId());
+            const auto deadline = TInstant::MicroSeconds(checksum.GetDeadlineUs());
+            const auto timeout = deadline > ctx.Now() ? deadline - ctx.Now() : TDuration::MilliSeconds(1);
+            if (DataShard.GetSnapshotManager().AddSnapshot(txc.DB, key,
+                checksum.GetCheckpointId(), TSnapshot::FlagTimeout, timeout))
+            {
+                DataShard.GetSnapshotManager().InitSnapshotExpireTime(key, ctx.Now());
+                DataShard.PlanCleanup(ctx);
+            }
+        } else {
+            DataShard.GetSnapshotManager().RemoveSnapshot(txc.DB,
+                TSnapshotKey(pathId, checksum.GetSnapshotStep(), checksum.GetSnapshotTxId()));
+        }
+        if (!checksum.GetResult() || DataShard.TabletID() == params.GetChecksumEmitterTabletId()) {
+            NIceDb::TNiceDb db(txc.DB);
+            for (const auto& stream : checksum.GetStreams()) {
+                auto record = TChangeRecordBuilder(checksum.GetResult()
+                        ? TChangeRecord::EKind::CdcChecksumResult : TChangeRecord::EKind::CdcChecksumCheckpoint)
+                    .WithOrder(DataShard.AllocateChangeRecordOrder(db))
+                    .WithGroup(0)
+                    .WithStep(op->GetStep())
+                    .WithTxId(op->GetTxId())
+                    .WithPathId(TPathId::FromProto(stream.GetPathId()))
+                    .WithTableId(pathId)
+                    .WithSchemaVersion(table.GetTableSchemaVersion())
+                    .WithBody(checksum.SerializeAsString())
+                    .WithUserCtx(NACLib::TUserContextBuilder().WithUserSID(BUILTIN_ACL_CDC_WITHOUT_USER_SID).Build())
+                    .Build();
+                DataShard.PersistChangeRecord(db, *record);
+                op->ChangeRecords().push_back(IDataShardChangeCollector::TChange{
+                    .Order = record->GetOrder(),
+                    .Group = record->GetGroup(),
+                    .Step = record->GetStep(),
+                    .TxId = record->GetTxId(),
+                    .PathId = record->GetPathId(),
+                    .BodySize = record->GetBodySize(),
+                    .TableId = record->GetTableId(),
+                    .SchemaVersion = record->GetSchemaVersion(),
+                });
+            }
+        }
+        BuildResult(op, NKikimrTxDataShard::TEvProposeTransactionResult::COMPLETE);
+        op->Result()->SetStepOrderId(op->GetStepOrder().ToPair());
+        return EExecutionStatus::DelayCompleteNoMoreRestarts;
+    }
+
+    void Complete(TOperation::TPtr op, const TActorContext&) override {
+        DataShard.EnqueueChangeRecords(std::move(op->ChangeRecords()));
         DataShard.EmitHeartbeats();
     }
 };

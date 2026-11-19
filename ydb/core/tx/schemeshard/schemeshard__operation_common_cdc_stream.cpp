@@ -154,6 +154,19 @@ bool TProposeAtTable::HandleReply(TEvPrivate::TEvOperationPlan::TPtr& ev, TOpera
 
     NIceDb::TNiceDb db(context.GetDB());
 
+    if (txState->CdcChecksum.HasCheckpointId()) {
+        table->CdcChecksum = txState->CdcChecksum;
+        if (!table->CdcChecksum.GetResult()) {
+            table->CdcChecksum.SetSnapshotStep(ev->Get()->StepId);
+            table->CdcChecksum.SetSnapshotTxId(ui64(OperationId.GetTxId()));
+        }
+        db.Table<Schema::CdcChecksumAttempts>().Key(pathId.OwnerId, pathId.LocalPathId).Update(
+            NIceDb::TUpdate<Schema::CdcChecksumAttempts::Record>(table->CdcChecksum.SerializeAsString()));
+        context.SS->ClearDescribePathCaches(path);
+        context.SS->ChangeTxState(db, OperationId, TTxState::ProposedWaitParts);
+        return true;
+    }
+
     // Don't call InitAlterData() here - it was already called in ConfigureParts,
     // and calling it again after another subop's Done() updated AlterVersion
     // would incorrectly create a new version.

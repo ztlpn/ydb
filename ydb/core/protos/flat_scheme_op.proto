@@ -2,6 +2,7 @@ import "ydb/core/protos/bind_channel_storage_pool.proto";
 import "ydb/core/protos/blob_depot_config.proto";
 import "ydb/core/protos/blockstore_config.proto";
 import "ydb/core/protos/channel_purpose.proto";
+import "ydb/core/protos/change_exchange.proto";
 import "ydb/core/protos/compaction.proto";
 import "ydb/core/protos/filestore_config.proto";
 import "ydb/core/protos/follower_group.proto";
@@ -440,6 +441,7 @@ message TTableDescription {
     // Actual number of table partitions (shards), always filled in describe
     // results, so clients don't need to request the TablePartitions list.
     optional uint64 PartitionCount = 55;
+    optional NKikimrChangeExchange.TCdcChecksum CdcChecksum = 56;
 }
 
 message TCompressionOptions {
@@ -1247,6 +1249,7 @@ message TAlterCdcStream {
     oneof Action {
         TDisable Disable = 3;
         TGetReady GetReady = 4;
+        NKikimrChangeExchange.TCdcChecksum Checksum = 5;
     }
 }
 
@@ -1457,6 +1460,7 @@ message TGenericTxInFlyExtraData {
     // we do not use oneof here as far as we want to combine some subops rarely
     // and it can be used in this case
     optional TTxCopyTableExtraData TxCopyTableExtraData = 1;
+    optional NKikimrChangeExchange.TCdcChecksum CdcChecksum = 2;
 }
 
 message TIndexAlteringConfig {

@@ -5,6 +5,8 @@
 #include "schemeshard_cdc_stream_common.h"
 
 #include <ydb/library/actors/core/log.h>
+#include <ydb/core/scheme/scheme_type_info.h>
+#include <ydb/public/api/protos/draft/ydb_replication.pb.h>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::FLAT_TX_SCHEMESHARD
 
@@ -247,6 +249,19 @@ protected:
         auto& notice = *tx.MutableAlterCdcStreamNotice();
         pathId.ToProto(notice.MutablePathId());
 
+        const auto* txState = context.SS->FindTx(OperationId);
+        if (txState->CdcChecksum.HasCheckpointId()) {
+            *notice.MutableChecksum() = txState->CdcChecksum;
+            notice.SetTableSchemaVersion(table->AlterVersion);
+            // One producer broadcasts the result; checkpoints require every producer.
+            ui64 emitter = Max<ui64>();
+            for (const auto& shard : txState->Shards) {
+                emitter = Min(emitter, ui64(context.SS->ShardInfos.at(shard.Idx).TabletID));
+            }
+            notice.SetChecksumEmitterTabletId(emitter);
+            return;
+        }
+
         table->InitAlterData(OperationId);
         notice.SetTableSchemaVersion(*table->AlterData->CoordinatedSchemaVersion);
 
@@ -361,7 +376,175 @@ public:
     {
     }
 
+    THolder<TProposeResponse> ProposeChecksum(TProposeContext& context) {
+        auto response = MakeHolder<TProposeResponse>(NKikimrScheme::StatusAccepted,
+            ui64(OperationId.GetTxId()), context.SS->TabletID());
+        auto reject = [&response](NKikimrScheme::EStatus status, const TString& message) {
+            response->SetError(status, message);
+            return std::move(response);
+        };
+        const auto& request = Transaction.GetAlterCdcStream();
+        const auto path = TPath::Resolve(Transaction.GetWorkingDir(), context.SS)
+            .Child(request.GetTableName(), TPath::TSplitChildTag{});
+        const auto checks = path.Check();
+        checks.NotEmpty().NotUnderDomainUpgrade().IsAtLocalSchemeShard().IsResolved()
+            .NotDeleted().IsTable().NotAsyncReplicaTable().NotUnderDeleting().NotUnderOperation();
+        if (!checks) {
+            return reject(checks.GetStatus(), checks.GetError());
+        }
+        if (path.IsBackupTable() || path.IsInsideTableIndexPath()) {
+            return reject(NKikimrScheme::StatusPreconditionFailed, "Checksums require a user row table");
+        }
+        auto table = context.SS->Tables.at(path.Base()->PathId);
+        auto checksum = request.GetChecksum();
+        const auto now = context.Ctx.Now();
+        if (checksum.GetCheckpointId().empty() || checksum.GetProtocolVersion() != 1 ||
+            checksum.GetAlgorithm() != "CityHash64" || checksum.GetAlgorithmVersion() != 1 ||
+            TPathId::FromProto(checksum.GetTableId()) != path.Base()->PathId)
+        {
+            return reject(NKikimrScheme::StatusInvalidParameter, "Invalid checksum request");
+        }
+        if (checksum.GetResult()) {
+            if (table->CdcChecksum.GetCheckpointId() != checksum.GetCheckpointId() ||
+                table->CdcChecksum.GetResult())
+            {
+                return reject(NKikimrScheme::StatusPreconditionFailed, "Checksum attempt is no longer active");
+            }
+            auto saved = table->CdcChecksum;
+            saved.SetResult(true);
+            saved.SetStatus(checksum.GetStatus());
+            *saved.MutableIssues() = checksum.GetIssues();
+            *saved.MutableChecksum() = checksum.GetChecksum();
+            checksum = std::move(saved);
+        } else {
+            if (!AppData()->FeatureFlags.GetEnableAsyncReplicationChecksumCheck()) {
+                return reject(NKikimrScheme::StatusPreconditionFailed, "CDC checksums are disabled");
+            }
+            if (table->CdcChecksum.HasCheckpointId() && !table->CdcChecksum.GetResult() &&
+                table->CdcChecksum.GetDeadlineUs() > now.MicroSeconds())
+            {
+                return reject(NKikimrScheme::StatusMultipleModifications, "Another checksum attempt is active");
+            }
+            if (checksum.GetDeadlineUs() <= now.MicroSeconds() ||
+                checksum.GetDeadlineUs() > (now + TDuration::Hours(1)).MicroSeconds())
+            {
+                return reject(NKikimrScheme::StatusInvalidParameter, "Invalid checksum deadline");
+            }
+            checksum.ClearStreams();
+            for (const auto& [name, id] : path.Base()->GetChildren()) {
+                auto* streamPtr = context.SS->CdcStreams.FindPtr(id);
+                if (!streamPtr || context.SS->PathsById.at(id)->Dropped()) {
+                    continue;
+                }
+                const auto& stream = **streamPtr;
+                if (stream.State == NKikimrSchemeOp::ECdcStreamStateDisabled ||
+                    stream.Format == NKikimrSchemeOp::ECdcStreamFormatProto)
+                {
+                    continue;
+                }
+                if (stream.State != NKikimrSchemeOp::ECdcStreamStateReady ||
+                    stream.Format != NKikimrSchemeOp::ECdcStreamFormatJson ||
+                    !context.SS->PathsById.at(id)->NormalState())
+                {
+                    return reject(NKikimrScheme::StatusPreconditionFailed,
+                        "Every active user feed must be ready and use native JSON");
+                }
+                auto* selected = checksum.AddStreams();
+                id.ToProto(selected->MutablePathId());
+                selected->SetName(name);
+            }
+            if (checksum.StreamsSize() == 0) {
+                return reject(NKikimrScheme::StatusPreconditionFailed, "No eligible CDC feeds");
+            }
+        }
+        const bool terminalFailure = checksum.GetResult() && checksum.GetStatus() != Ydb::StatusIds::SUCCESS;
+        if (!checksum.GetResult() && checksum.GetTableSchemaVersion() != table->AlterVersion) {
+            return reject(NKikimrScheme::StatusPreconditionFailed, "Table schema changed during checksum");
+        }
+        if (checksum.GetResult() && !terminalFailure) {
+            // Feed/index metadata also advances AlterVersion. Compare the
+            // logical columns, using the same encoding as the scan helper,
+            // so unrelated feed creation does not invalidate the attempt.
+            TMap<TString, TString> columns;
+            for (const auto& [id, column] : table->Columns) {
+                if (column.IsDropped()) {
+                    continue;
+                }
+                if (column.IsBuildInProgress || column.SetNotNullInProgress ||
+                    column.CreateVersion > checksum.GetTableSchemaVersion()) {
+                    return reject(NKikimrScheme::StatusPreconditionFailed, "Table schema is changing");
+                }
+                columns[column.Name] = TStringBuilder() << NScheme::TypeName(column.PType, column.PTypeMod)
+                    << ":" << column.NotNull;
+            }
+            TStringBuilder schema;
+            for (const auto& [name, type] : columns) {
+                schema << name.size() << ":" << name << type.size() << ":" << type;
+            }
+            if (schema != checksum.GetSchema()) {
+                return reject(NKikimrScheme::StatusPreconditionFailed, "Table schema changed during checksum");
+            }
+        }
+        if (terminalFailure) {
+            for (int i = checksum.StreamsSize() - 1; i >= 0; --i) {
+                const auto id = TPathId::FromProto(checksum.GetStreams(i).GetPathId());
+                const auto* stream = context.SS->CdcStreams.FindPtr(id);
+                if (!stream || context.SS->PathsById.at(id)->Dropped() ||
+                    (*stream)->State != NKikimrSchemeOp::ECdcStreamStateReady)
+                {
+                    checksum.MutableStreams()->DeleteSubrange(i, 1);
+                }
+            }
+        }
+        for (const auto& selected : checksum.GetStreams()) {
+            const auto id = TPathId::FromProto(selected.GetPathId());
+            const auto* stream = context.SS->CdcStreams.FindPtr(id);
+            if (!stream || context.SS->PathsById.at(id)->Dropped() ||
+                (*stream)->State != NKikimrSchemeOp::ECdcStreamStateReady)
+            {
+                return reject(NKikimrScheme::StatusPreconditionFailed, "Selected feed changed during checksum");
+            }
+            for (const auto& [name, childId] : context.SS->PathsById.at(id)->GetChildren()) {
+                const auto* topic = context.SS->Topics.FindPtr(childId);
+                if (!topic || !context.SS->PathsById.at(childId)->NormalState()) {
+                    return reject(NKikimrScheme::StatusPreconditionFailed, "Selected topic is being modified");
+                }
+                const auto config = (*topic)->GetTabletConfig();
+                if (config.HasPartitionStrategy() && config.GetPartitionStrategy().GetPartitionStrategyType() !=
+                    NKikimrPQ::TPQTabletConfig::DISABLED)
+                {
+                    return reject(NKikimrScheme::StatusPreconditionFailed, "Checksum requires fixed topic partitions");
+                }
+            }
+        }
+        TString error;
+        if (!context.SS->CheckApplyIf(Transaction, error) ||
+            !context.SS->CheckLocks(path.Base()->PathId, Transaction, error))
+        {
+            return reject(NKikimrScheme::StatusPreconditionFailed, error);
+        }
+        auto guard = context.DbGuard();
+        context.MemChanges.GrabPath(context.SS, path.Base()->PathId);
+        context.MemChanges.GrabNewTxState(context.SS, OperationId);
+        context.DbChanges.PersistPath(path.Base()->PathId);
+        context.DbChanges.PersistTxState(OperationId);
+        auto& txState = context.SS->CreateTx(OperationId, TTxState::TxAlterCdcStreamAtTable, path.Base()->PathId);
+        txState.State = TTxState::ConfigureParts;
+        txState.CdcChecksum = std::move(checksum);
+        path.Base()->PathState = NKikimrSchemeOp::EPathStateAlter;
+        path.Base()->LastTxId = OperationId.GetTxId();
+        for (const auto& splitOpId : table->GetSplitOpsInFlight()) {
+            context.OnComplete.Dependence(splitOpId.GetTxId(), OperationId.GetTxId());
+        }
+        context.OnComplete.ActivateTx(OperationId);
+        SetState(NextState());
+        return response;
+    }
+
     THolder<TProposeResponse> Propose(const TString&, TProposeContext& context) override {
+        if (Transaction.GetAlterCdcStream().HasChecksum()) {
+            return ProposeChecksum(context);
+        }
         const auto& workingDir = Transaction.GetWorkingDir();
         const auto& op = Transaction.GetAlterCdcStream();
         const auto& tableName = op.GetTableName();
@@ -608,6 +791,9 @@ TVector<ISubOperation::TPtr> CreateAlterCdcStream(TOperationId opId, const TTxTr
     );
 
     const auto& op = tx.GetAlterCdcStream();
+    if (op.HasChecksum()) {
+        return {CreateAlterCdcStreamAtTable(opId, tx, false)};
+    }
     const auto& tableName = op.GetTableName();
     const auto& streamName = op.GetStreamName();
 

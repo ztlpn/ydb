@@ -826,6 +826,16 @@ bool TCheckSchemeTxUnit::CheckAlterCdcStream(TActiveTransaction *activeTx) {
         return false;
     }
 
+    if (notice.HasChecksum()) {
+        const auto* table = DataShard.GetUserTables().FindPtr(GetPathId(notice).LocalPathId);
+        if (!table || !CheckSchemaVersion(activeTx, notice.GetTableSchemaVersion(),
+            (*table)->GetTableSchemaVersion(), (*table)->GetTableSchemaVersion()))
+        {
+            BuildResult(activeTx, NKikimrTxDataShard::TEvProposeTransactionResult::ERROR);
+            return false;
+        }
+        return true;
+    }
     return CheckSchemaVersion(activeTx, notice);
 }
 

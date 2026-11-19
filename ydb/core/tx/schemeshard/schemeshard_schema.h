@@ -2748,7 +2748,16 @@ struct Schema : NIceDb::Schema {
         using TColumns = TableColumns<PathId, AlterVersion, TestShards, CmdInitialize>;
     };
 
+    struct CdcChecksumAttempts : Table<141> {
+        struct OwnerId : Column<1, NScheme::NTypeIds::Uint64> {};
+        struct LocalId : Column<2, NScheme::NTypeIds::Uint64> {};
+        struct Record : Column<3, NScheme::NTypeIds::String> {};
+        using TKey = TableKey<OwnerId, LocalId>;
+        using TColumns = TableColumns<OwnerId, LocalId, Record>;
+    };
+
     using TTables = SchemaTables<
+        CdcChecksumAttempts,
         Paths,
         TxInFlight,
         TxDependencies,
