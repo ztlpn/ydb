@@ -31,7 +31,7 @@ public:
     TTxType GetTxType() const override { return TXTYPE_CDC_STREAM_EMIT_HEARTBEATS; }
 
     bool Execute(TTransactionContext& txc, const TActorContext&) override {
-        if (Self->State != TShardState::Ready || Self->DatabaseFreeze.GetStage() >= NKikimrTxDataShard::TDatabaseFreezeState::DRAIN_CDC) {
+        if (Self->State != TShardState::Ready && Self->State != TShardState::SplitSrcWaitForNoTxInFlight) {
             return true;
         }
 
@@ -40,6 +40,12 @@ public:
             {"tabletId", Self->TabletID()});
 
         NIceDb::TNiceDb db(txc.DB);
+        if (!Self->ProgressCdcChecksumFences(db, Edge, ChangeRecords)) {
+            return false;
+        }
+        if (Self->State != TShardState::Ready || Self->DatabaseFreeze.GetStage() >= NKikimrTxDataShard::TDatabaseFreezeState::DRAIN_CDC) {
+            return true;
+        }
         const auto heartbeats = Self->GetCdcStreamHeartbeatManager().EmitHeartbeats(txc.DB, Edge);
 
         for (const auto& [streamPathId, info] : heartbeats) {
@@ -71,12 +77,14 @@ public:
         return true;
     }
 
-    void Complete(const TActorContext&) override {
+    void Complete(const TActorContext& ctx) override {
         YDB_LOG_INFO("[CdcStreamHeartbeat] Enqueuing CDC stream heartbeat change records",
             {"changeRecordsCount", ChangeRecords.size()},
             {"tabletId", Self->TabletID()});
         Self->EnqueueChangeRecords(std::move(ChangeRecords));
+        Self->CdcHeartbeatTxInFlight = false;
         Self->EmitHeartbeats();
+        Self->CheckSplitCanStart(ctx);
     }
 
 }; // TTxCdcStreamEmitHeartbeats
@@ -85,11 +93,13 @@ void TDataShard::EmitHeartbeats() {
     YDB_LOG_DEBUG("[CdcStreamHeartbeat] Scheduling CDC stream heartbeat emission",
         {"tabletId", TabletID()});
 
-    if (State != TShardState::Ready || DatabaseFreeze.GetStage() >= NKikimrTxDataShard::TDatabaseFreezeState::DRAIN_CDC) {
+    if (CdcHeartbeatTxInFlight || (State != TShardState::Ready && State != TShardState::SplitSrcWaitForNoTxInFlight)) {
         return;
     }
 
-    const auto lowest = CdcStreamHeartbeatManager.LowestVersion();
+    const bool ordinary = State == TShardState::Ready && DatabaseFreeze.GetStage() < NKikimrTxDataShard::TDatabaseFreezeState::DRAIN_CDC;
+    const auto fence = CdcChecksumFences.empty() ? TRowVersion::Max() : TRowVersion(CdcChecksumFences.begin()->first, 0);
+    const auto lowest = Min(ordinary ? CdcStreamHeartbeatManager.LowestVersion() : TRowVersion::Max(), fence);
     if (lowest.IsMax()) {
         return;
     }
@@ -108,7 +118,13 @@ void TDataShard::EmitHeartbeats() {
         wait = false;
     }
 
-    if (CdcStreamHeartbeatManager.ShouldEmitHeartbeat(edge)) {
+    if (State == TShardState::SplitSrcWaitForNoTxInFlight && !TxInFly() && !ImmediateInFly() && !VolatileTxManager.GetTxInFlight()) {
+        edge = TRowVersion(GetMaxObservedStep(), 0);
+    }
+    const bool fenceReady = !CdcChecksumFences.empty() && (CdcChecksumFences.begin()->second.Emitted ||
+                                                              (!MediatorStateWaiting && fence.Step <= GetMaxObservedStep() && fence <= edge));
+    if (fenceReady || (ordinary && CdcStreamHeartbeatManager.ShouldEmitHeartbeat(edge))) {
+        CdcHeartbeatTxInFlight = true;
         return Execute(new TTxCdcStreamEmitHeartbeats(this, edge));
     }
 

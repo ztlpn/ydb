@@ -131,9 +131,8 @@ class TController::TTxIndexBuild: public TTxBase {
     ui64 Allocate(const TRowVersion& end, NIceDb::TNiceDb& db) {
         const ui64 txId = Self->AllocatedTxIds.front();
         Self->AllocatedTxIds.pop_front();
-        db.Table<Schema::TxIds>().Key(end.Step, end.TxId).Update(
-            NIceDb::TUpdate<Schema::TxIds::WriteTxId>(txId)
-        );
+        db.Table<Schema::TxIds>().Key(end.Step, end.TxId).Update(NIceDb::TUpdate<Schema::TxIds::WriteTxId>(txId),
+            NIceDb::TUpdate<Schema::TxIds::GridInterval>(Self->SysParams.HasGridAssignments() && Self->LegacyTxIds.empty()));
         Self->AssignedTxIds.emplace(end, txId);
         return txId;
     }
@@ -172,7 +171,7 @@ class TController::TTxIndexBuild: public TTxBase {
     }
 
     bool CanReuseLastGlobalAssignment(const TRowVersion& join) const {
-        if (Self->AssignedTxIds.size() < MaxOpenTxIds) {
+        if (Self->SysParams.HasGridAssignments() || Self->AssignedTxIds.size() < MaxOpenTxIds) {
             return false;
         }
 
@@ -208,8 +207,17 @@ class TController::TTxIndexBuild: public TTxBase {
                 const auto join = TRowVersion::FromProto(build.GetJoinVersion());
                 const bool global = build.GetPhase() != TBuild::FILLING && version >= join;
                 ui64 txId = 0;
+                const bool grid = global && Self->SysParams.HasGridAssignments();
+                if (grid) {
+                    *reply->Record.MutableWriteWindow() = Self->GetWriteWindow();
+                    join.ToProto(reply->Record.MutableWriteWindow()->MutableIndexJoin());
+                    const auto& window = reply->Record.GetWriteWindow();
+                    if (version < TRowVersion::FromProto(window.GetBegin()) || version >= TRowVersion::FromProto(window.GetEnd())) {
+                        continue;
+                    }
+                }
                 if (global) {
-                    auto assigned = Self->AssignedTxIds.lower_bound(end);
+                    auto assigned = grid && Self->LegacyTxIds.empty() ? Self->AssignedTxIds.find(end) : Self->AssignedTxIds.lower_bound(end);
                     if (assigned != Self->AssignedTxIds.end()) {
                         end = assigned->first;
                         txId = assigned->second;
@@ -222,7 +230,8 @@ class TController::TTxIndexBuild: public TTxBase {
                             NIceDb::TUpdate<Schema::TxIds::WriteTxId>(txId)
                         );
                         Self->AssignedTxIds.insert(std::move(node));
-                    } else if (!Self->AllocatedTxIds.empty() && Self->AssignedTxIds.size() < MaxOpenTxIds + 1) {
+                    } else if ((!grid || Self->LegacyTxIds.empty()) && !Self->AllocatedTxIds.empty() &&
+                               Self->AssignedTxIds.size() < MaxOpenTxIds + 1) {
                         txId = Allocate(end, db);
                     }
                 } else {
@@ -273,10 +282,13 @@ class TController::TTxIndexBuild: public TTxBase {
                 auto& assigned = *reply->Record.AddVersionTxIds();
                 end.ToProto(assigned.MutableVersion());
                 assigned.SetTxId(txId);
-                (global ? join : TRowVersion::Min()).ToProto(assigned.MutableBegin());
+                (grid && Self->LegacyTxIds.empty() ? Max(join, TRowVersion(end.Step - interval, 0))
+                    : global                       ? join
+                                                   : TRowVersion::Min())
+                    .ToProto(assigned.MutableBegin());
             }
 
-            if (reply->Record.VersionTxIdsSize()) {
+            if (reply->Record.VersionTxIdsSize() || reply->Record.HasWriteWindow()) {
                 Assignments.emplace_back((*it)->Sender.NodeId(), std::move(reply));
             }
 

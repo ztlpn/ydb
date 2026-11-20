@@ -125,7 +125,33 @@ namespace NKikimr::NDataShard {
     };
 
     TReplicationSourceOffsetsDb::ECleanupStatus TReplicationSourceOffsetsDb::RemoveTableBatch(const TPathId& pathId, TCleanupCursor& cursor) {
+        using Schema = TDataShard::Schema;
         NIceDb::TNiceDb db(Txc.DB);
+        // Individual replay offsets use source names, so they survive shard
+        // handoff without remapping source IDs. Remove them with the table.
+        if (Txc.DB.GetScheme().GetTableInfo(Schema::ReplicationAppliedOffsets::TableId)) {
+            auto rows = db.Table<Schema::ReplicationAppliedOffsets>().Prefix(pathId.OwnerId, pathId.LocalPathId).Select();
+            if (!rows.IsReady()) {
+                return ECleanupStatus::NotReady;
+            }
+            TVector<std::pair<TString, ui64>> offsets;
+            while (!rows.EndOfSet()) {
+                offsets.emplace_back(
+                    rows.GetValue<Schema::ReplicationAppliedOffsets::Source>(), rows.GetValue<Schema::ReplicationAppliedOffsets::Offset>());
+                if (offsets.size() == 128) {
+                    break;
+                }
+                if (!rows.Next()) {
+                    return ECleanupStatus::NotReady;
+                }
+            }
+            if (!offsets.empty()) {
+                for (const auto& [source, offset] : offsets) {
+                    db.Table<Schema::ReplicationAppliedOffsets>().Key(pathId.OwnerId, pathId.LocalPathId, source, offset).Delete();
+                }
+                return ECleanupStatus::More;
+            }
+        }
         TCleanupBatch batch;
         auto next = cursor;
         auto status = ECleanupStatus::Done;

@@ -451,7 +451,10 @@ bool TSnapshotManager::IsSnapshotReadable(NTable::TDatabase& db, const TTableId&
         return false;
     }
 
-    if (!locallyAcquired && !GetSnapshotRetentionPolicy().ShouldRetain(tableId, version)) {
+    const auto retained = Snapshots.find(TSnapshotKey(tableId.PathId, version.Step, version.TxId));
+    const bool locallyRetained = retained != Snapshots.end() && retained->second.HasFlags(TSnapshot::FlagMvccRetention) &&
+                                 !retained->second.HasFlags(TSnapshot::FlagRemoved);
+    if (!locallyAcquired && !locallyRetained && !GetSnapshotRetentionPolicy().ShouldRetain(tableId, version)) {
         return false;
     }
 
@@ -576,7 +579,7 @@ TDuration TSnapshotManager::GetCleanupSnapshotPeriod() const {
 
 const TSnapshot* TSnapshotManager::FindAvailable(const TSnapshotKey& key) const {
     auto it = Snapshots.find(key);
-    if (it != Snapshots.end() && !it->second.HasFlags(TSnapshot::FlagRemoved)) {
+    if (it != Snapshots.end() && !it->second.HasFlags(TSnapshot::FlagRemoved) && !it->second.HasFlags(TSnapshot::FlagMvccRetention)) {
         return &it->second;
     }
     return nullptr;
@@ -598,7 +601,7 @@ TSnapshotKey TSnapshotManager::ExpandSnapshotKey(ui64 ownerId, ui64 pathId, ui64
 
 bool TSnapshotManager::AcquireReference(const TSnapshotKey& key) {
     auto it = Snapshots.find(key);
-    if (it == Snapshots.end() || it->second.HasFlags(TSnapshot::FlagRemoved)) {
+    if (it == Snapshots.end() || it->second.HasFlags(TSnapshot::FlagRemoved) || it->second.HasFlags(TSnapshot::FlagMvccRetention)) {
         return false;
     }
 

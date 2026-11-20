@@ -103,11 +103,30 @@ public:
         if (!checksum.GetResult()) {
             checksum.SetSnapshotStep(op->GetStep());
             checksum.SetSnapshotTxId(op->GetTxId());
-            const TSnapshotKey key(pathId, op->GetStep(), op->GetTxId());
+            if (const auto period = checksum.GetAlignmentPeriodMs()) {
+                const auto floor = Max(op->GetStep(), checksum.GetCommitBoundaryStep());
+                const auto boundary = (floor / period + 1) * period;
+                checksum.SetCommitBoundaryStep(boundary);
+                checksum.SetLastReservedBoundaryStep(boundary);
+                checksum.SetSnapshotStep(boundary - 1);
+                checksum.SetSnapshotTxId(Max<ui64>());
+                NIceDb::TNiceDb db(txc.DB);
+                DataShard.ArmCdcChecksum(db, checksum);
+            }
+            const TSnapshotKey key(pathId, checksum.GetSnapshotStep(), checksum.GetSnapshotTxId());
             const auto deadline = TInstant::MicroSeconds(checksum.GetDeadlineUs());
             const auto timeout = deadline > ctx.Now() ? deadline - ctx.Now() : TDuration::MilliSeconds(1);
-            if (DataShard.GetSnapshotManager().AddSnapshot(txc.DB, key,
-                checksum.GetCheckpointId(), TSnapshot::FlagTimeout, timeout))
+            bool added = false;
+            if (checksum.HasCommitBoundaryStep()) {
+                // Retention only: normal writes must still be allowed below H.
+                NIceDb::TNiceDb db(txc.DB);
+                DataShard.GetSnapshotManager().PersistAddSnapshot(
+                    db, key, checksum.GetCheckpointId(), TSnapshot::FlagTimeout | TSnapshot::FlagMvccRetention, timeout);
+                added = true;
+            } else {
+                added = DataShard.GetSnapshotManager().AddSnapshot(txc.DB, key, checksum.GetCheckpointId(), TSnapshot::FlagTimeout, timeout);
+            }
+            if (added)
             {
                 DataShard.GetSnapshotManager().InitSnapshotExpireTime(key, ctx.Now());
                 DataShard.PlanCleanup(ctx);
@@ -116,7 +135,8 @@ public:
             DataShard.GetSnapshotManager().RemoveSnapshot(txc.DB,
                 TSnapshotKey(pathId, checksum.GetSnapshotStep(), checksum.GetSnapshotTxId()));
         }
-        if (!checksum.GetResult() || DataShard.TabletID() == params.GetChecksumEmitterTabletId()) {
+        if ((!checksum.GetResult() && !checksum.HasCommitBoundaryStep()) ||
+            (checksum.GetResult() && DataShard.TabletID() == params.GetChecksumEmitterTabletId())) {
             NIceDb::TNiceDb db(txc.DB);
             for (const auto& stream : checksum.GetStreams()) {
                 auto record = TChangeRecordBuilder(checksum.GetResult()

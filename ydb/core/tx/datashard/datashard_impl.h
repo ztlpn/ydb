@@ -890,6 +890,41 @@ class TDataShard
             >;
         };
 
+        struct ReplicationAppliedOffsets: Table<45> {
+            struct PathOwnerId: Column<1, NScheme::NTypeIds::Uint64> {};
+
+            struct TablePathId: Column<2, NScheme::NTypeIds::Uint64> {};
+
+            struct Source: Column<3, NScheme::NTypeIds::String> {
+                using Type = TString;
+            };
+
+            struct Offset: Column<4, NScheme::NTypeIds::Uint64> {};
+
+            using TKey = TableKey<PathOwnerId, TablePathId, Source, Offset>;
+            using TColumns = TableColumns<PathOwnerId, TablePathId, Source, Offset>;
+        };
+
+        struct CdcChecksumFences: Table<43> {
+            struct Boundary: Column<1, NScheme::NTypeIds::Uint64> {};
+
+            struct Record: Column<2, NScheme::NTypeIds::String> {
+                using Type = TString;
+            };
+
+            struct Emitted: Column<3, NScheme::NTypeIds::Bool> {};
+
+            using TKey = TableKey<Boundary>;
+            using TColumns = TableColumns<Boundary, Record, Emitted>;
+        };
+
+        struct CdcChecksumDeferred: Table<44> {
+            struct Order: Column<1, NScheme::NTypeIds::Uint64> {};
+
+            using TKey = TableKey<Order>;
+            using TColumns = TableColumns<Order>;
+        };
+
         struct ChangeRecords : Table<17> {
             struct Order :       Column<1, NScheme::NTypeIds::Uint64> {};
             struct Group :       Column<2, NScheme::NTypeIds::Uint64> {};
@@ -1246,16 +1281,13 @@ class TDataShard
             using TColumns = TableColumns<LockId, TabletId, WriterIndex, WriteSeqNum, WriteResult>;
         };
 
-        using TTables = SchemaTables<Sys, UserTables, TxMain, TxDetails, InReadSets, OutReadSets, PlanQueue,
-            DeadlineQueue, SchemaOperations, SplitSrcSnapshots, SplitDstReceivedSnapshots, TxArtifacts, ScanProgress,
-            Snapshots, S3Uploads, S3Downloads, ChangeRecords, ChangeRecordDetails, ChangeSenders, S3UploadedParts,
-            SrcChangeSenderActivations, DstChangeSenderActivations,
-            ReplicationSourceOffsets, ReplicationSources, DstReplicationSourceOffsetsReceived,
-            UserTablesStats, SchemaSnapshots, Locks, LockRanges, LockConflicts,
-            LockChangeRecords, LockChangeRecordDetails, ChangeRecordCommits,
-            TxVolatileDetails, TxVolatileParticipants, CdcStreamScans,
-            LockVolatileDependencies, CdcStreamHeartbeats, MultiTxIds, MultiTxIdGraph, IndexBuildScans,
-            LockWriteSeqNums, AncestorShardsLocks, AncestorLockWriteSeqNums>;
+        using TTables = SchemaTables<Sys, UserTables, TxMain, TxDetails, InReadSets, OutReadSets, PlanQueue, DeadlineQueue, SchemaOperations,
+            SplitSrcSnapshots, SplitDstReceivedSnapshots, TxArtifacts, ScanProgress, Snapshots, S3Uploads, S3Downloads, ChangeRecords,
+            ChangeRecordDetails, ChangeSenders, S3UploadedParts, SrcChangeSenderActivations, DstChangeSenderActivations,
+            ReplicationSourceOffsets, ReplicationSources, ReplicationAppliedOffsets, DstReplicationSourceOffsetsReceived, UserTablesStats,
+            SchemaSnapshots, Locks, LockRanges, LockConflicts, LockChangeRecords, LockChangeRecordDetails, ChangeRecordCommits,
+            TxVolatileDetails, TxVolatileParticipants, CdcStreamScans, LockVolatileDependencies, CdcStreamHeartbeats, CdcChecksumFences,
+            CdcChecksumDeferred, MultiTxIds, MultiTxIdGraph, IndexBuildScans, LockWriteSeqNums, AncestorShardsLocks, AncestorLockWriteSeqNums>;
 
         // These settings are persisted on each Init. So we use empty settings in order not to overwrite what
         // was changed by the user
@@ -2415,6 +2447,10 @@ public:
     ui64 GetNextChangeRecordLockOffset(ui64 lockId);
     void FillUserCtxColumns(TIntrusivePtr<NACLib::TUserContext> userCtx, TString& userSID, TString& userTraceId);
     void PersistChangeRecord(NIceDb::TNiceDb& db, const TChangeRecord& record);
+    void ArmCdcChecksum(NIceDb::TNiceDb& db, const NKikimrChangeExchange::TCdcChecksum& record);
+    void DeferCdcChecksumRecord(NIceDb::TNiceDb& db, ui64 order, const TPathId& stream, const TRowVersion& version, bool terminal = false);
+    bool LoadCdcChecksumFences(NIceDb::TNiceDb& db);
+    bool ProgressCdcChecksumFences(NIceDb::TNiceDb& db, const TRowVersion& edge, TVector<IDataShardChangeCollector::TChange>& records);
     bool HasLockChangeRecords(ui64 lockId) const;
     void CommitLockChangeRecords(NIceDb::TNiceDb& db, ui64 lockId, ui64 group, const TRowVersion& rowVersion, TVector<IDataShardChangeCollector::TChange>& collected);
     void MoveChangeRecord(NIceDb::TNiceDb& db, ui64 order, const TPathId& pathId);
@@ -3205,13 +3241,9 @@ private:
     std::shared_ptr<NKikimrTxDataShard::TSplitMergeDescription> SrcSplitDescription;
     THashSet<TActorId> SrcAckSplitTo;
     THashMap<TActorId, THashSet<ui64>> SrcAckPartitioningChangedTo;
-    const ui32 SysTablesToTransferAtSplit[4] = {
-            Schema::TxMain::TableId,
-            Schema::TxDetails::TableId,
-            // Schema::InReadSets::TableId, // need to fix InReadSets cleanup
-            Schema::PlanQueue::TableId,
-            Schema::DeadlineQueue::TableId
-        };
+    const ui32 SysTablesToTransferAtSplit[5] = { Schema::ReplicationAppliedOffsets::TableId, Schema::TxMain::TableId, Schema::TxDetails::TableId,
+        // Schema::InReadSets::TableId, // need to fix InReadSets cleanup
+        Schema::PlanQueue::TableId, Schema::DeadlineQueue::TableId };
     THashSet<ui64> SysTablesPartOwners;
 
     // Sys table contents
@@ -3363,6 +3395,16 @@ private:
     TConflictsCache ConflictsCache;
     TCdcStreamScanManager CdcStreamScanManager;
     TCdcStreamHeartbeatManager CdcStreamHeartbeatManager;
+
+    struct TCdcChecksumFence {
+        NKikimrChangeExchange::TCdcChecksum Record;
+        bool Emitted = false;
+    };
+
+    TMap<ui64, TCdcChecksumFence> CdcChecksumFences;
+    TSet<ui64> CdcChecksumDeferred;
+    bool PromotingCdcChecksum = false;
+    bool CdcHeartbeatTxInFlight = false;
     TMultiTxIdManager MultiTxIdManager;
     TBuildIndexScanManager BuildIndexScanManager;
     THashMap<ui64, THolder<TEvDataShard::TEvBuildIndexProgressResponse>> PendingBuildIndexFinalResponses;

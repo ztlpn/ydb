@@ -73,6 +73,10 @@ bool TDataShard::TTxInit::Execute(TTransactionContext& txc, const TActorContext&
         Self->S3Downloads.Reset();
         Self->CdcStreamScanManager.Reset();
         Self->CdcStreamHeartbeatManager.Reset();
+        Self->CdcChecksumFences.clear();
+        Self->CdcChecksumDeferred.clear();
+        Self->PromotingCdcChecksum = false;
+        Self->CdcHeartbeatTxInFlight = false;
         Self->BuildIndexScanManager.Reset();
         Self->PendingBuildIndexFinalResponses.clear();
 
@@ -340,6 +344,8 @@ bool TDataShard::TTxInit::ReadEverything(TTransactionContext &txc) {
         PRECHARGE_SYS_TABLE(Schema::TxVolatileParticipants);
         PRECHARGE_SYS_TABLE(Schema::CdcStreamScans);
         PRECHARGE_SYS_TABLE(Schema::CdcStreamHeartbeats);
+        PRECHARGE_SYS_TABLE(Schema::CdcChecksumFences);
+        PRECHARGE_SYS_TABLE(Schema::CdcChecksumDeferred);
         PRECHARGE_SYS_TABLE(Schema::MultiTxIds);
         PRECHARGE_SYS_TABLE(Schema::MultiTxIdGraph);
         PRECHARGE_SYS_TABLE(Schema::IndexBuildScans);
@@ -735,6 +741,12 @@ bool TDataShard::TTxInit::ReadEverything(TTransactionContext &txc) {
     }
     if (Self->State != TShardState::Offline && txc.DB.GetScheme().GetTableInfo(Schema::IndexBuildScans::TableId)) {
         if (!Self->BuildIndexScanManager.Load(db)) {
+            return false;
+        }
+    }
+
+    if (Self->State != TShardState::Offline && txc.DB.GetScheme().GetTableInfo(Schema::CdcChecksumFences::TableId)) {
+        if (!Self->LoadCdcChecksumFences(db)) {
             return false;
         }
     }

@@ -159,6 +159,14 @@ bool TProposeAtTable::HandleReply(TEvPrivate::TEvOperationPlan::TPtr& ev, TOpera
         if (!table->CdcChecksum.GetResult()) {
             table->CdcChecksum.SetSnapshotStep(ev->Get()->StepId);
             table->CdcChecksum.SetSnapshotTxId(ui64(OperationId.GetTxId()));
+            if (const auto period = table->CdcChecksum.GetAlignmentPeriodMs()) {
+                const auto floor = Max(ev->Get()->StepId, table->CdcChecksum.GetCommitBoundaryStep());
+                const auto boundary = (floor / period + 1) * period;
+                table->CdcChecksum.SetCommitBoundaryStep(boundary);
+                table->CdcChecksum.SetLastReservedBoundaryStep(boundary);
+                table->CdcChecksum.SetSnapshotStep(boundary - 1);
+                table->CdcChecksum.SetSnapshotTxId(Max<ui64>());
+            }
         }
         db.Table<Schema::CdcChecksumAttempts>().Key(pathId.OwnerId, pathId.LocalPathId).Update(
             NIceDb::TUpdate<Schema::CdcChecksumAttempts::Record>(table->CdcChecksum.SerializeAsString()));

@@ -198,6 +198,65 @@ Y_UNIT_TEST_SUITE(AssignTxId) {
             {TRowVersion(20000, 0), txIds[1]},
         });
     }
+
+    Y_UNIT_TEST(GridKeepsHolesAndBoundsTheWindow) {
+        TFeatureFlags flags;
+        flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        TEnv env(flags);
+
+        env.GetRuntime().RegisterService(
+            MakeReplicationServiceId(env.GetRuntime().GetNodeId(0)), env.GetRuntime().Register(CreateReplicationMockService(env.GetSender())));
+
+        NYdb::NTable::TTableClient client(
+            env.GetDriver(), NYdb::NTable::TClientSettings().DiscoveryEndpoint(env.GetEndpoint()).Database(env.GetDatabase()));
+
+        auto session = client.CreateSession().GetValueSync().GetSession();
+        const auto result = session
+                                .ExecuteSchemeQuery(Sprintf(R"(
+                CREATE ASYNC REPLICATION `replication` FOR
+                    `/Root/table` AS `/Root/replica`
+                WITH (
+                    CONNECTION_STRING = "grpc://%s/?database=/Root",
+                    CONSISTENCY_LEVEL = "GLOBAL",
+                    COMMIT_INTERVAL = Interval("PT10S")
+                );
+            )", env.GetEndpoint().c_str()))
+                                .GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(result.GetStatus(), NYdb::EStatus::SUCCESS, result.GetIssues().ToString());
+
+        const auto tabletId = env.GetDescription("/Root/replication").GetPathDescription().GetReplicationDescription().GetControllerId();
+
+        const auto assign = [&](ui64 step) {
+            auto reply = env.Send<TEvService::TEvTxIdResult>(tabletId, new TEvService::TEvGetTxId(TVector<TRowVersion>{ TRowVersion(step, 0) }));
+            // Window broadcasts can arrive while the allocator supplies IDs.
+            while (!reply->Get()->Record.VersionTxIdsSize()) {
+                reply = env.GetRuntime().GrabEdgeEvent<TEvService::TEvTxIdResult>(env.GetSender());
+            }
+            return reply;
+        };
+
+        TVector<ui64> txIds;
+        for (const auto step : { 1, 20000, 30000, 40000 }) {
+            auto ev = assign(step);
+            const auto& versionTxId = ev->Get()->Record.GetVersionTxIds(0);
+            UNIT_ASSERT_VALUES_EQUAL(Count(txIds, versionTxId.GetTxId()), 0);
+            txIds.push_back(versionTxId.GetTxId());
+        }
+
+        auto ev = assign(10000);
+
+        CheckTxIdResult(ev->Get()->Record, {
+                                               { TRowVersion(20000, 0), 0 },
+                                           });
+        UNIT_ASSERT_VALUES_EQUAL(TRowVersion::FromProto(ev->Get()->Record.GetVersionTxIds(0).GetBegin()), TRowVersion(10000, 0));
+        UNIT_ASSERT(Find(txIds, ev->Get()->Record.GetVersionTxIds(0).GetTxId()) == txIds.end());
+        auto deferred = env.Send<TEvService::TEvTxIdResult>(tabletId, new TEvService::TEvGetTxId(TVector<TRowVersion>{
+                                                                          TRowVersion(50000, 0), TRowVersion(90000, 0),
+                                                                      }));
+        UNIT_ASSERT_VALUES_EQUAL(deferred->Get()->Record.VersionTxIdsSize(), 0);
+        UNIT_ASSERT(deferred->Get()->Record.HasWriteWindow());
+        UNIT_ASSERT_VALUES_EQUAL(TRowVersion::FromProto(deferred->Get()->Record.GetWriteWindow().GetEnd()), TRowVersion(50000, 0));
+    }
 }
 
 }

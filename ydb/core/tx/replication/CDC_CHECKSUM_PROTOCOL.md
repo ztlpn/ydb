@@ -36,10 +36,11 @@ A checkpoint has this native-JSON envelope:
 ```json
 {
   "checksum_checkpoint": {
-    "version": 1,
+    "version": 2,
     "id": "checkpoint-id",
     "table": [42, 17],
-    "snapshot": [100, 20],
+    "snapshot": [999, 18446744073709551615],
+    "commit_boundary": 1000,
     "schema": "canonical-column-description",
     "algorithm": "CityHash64",
     "algorithm_version": 1
@@ -58,47 +59,74 @@ controls when comparisons are disabled.
 
 ## Ordering and snapshots
 
-Each DataShard atomically retains snapshot `S` and queues a checkpoint in a
-coordinated scheme transaction. Its dependencies include preceding volatile
-transactions. Every topic partition receives the checkpoint after all changes
-through `S`, before later changes from any producer.
+With heartbeat-enabled feeds, publication uses protocol version 2. The source
+chooses a common grid from the least common multiple of the selected feeds'
+positive heartbeat intervals. The coordinated arming transaction reserves the
+next boundary `H` strictly after its plan step and the previous reserved boundary.
+The source snapshot is `S = H.Prev()`, or `(H.Step - 1, UINT64_MAX)`.
+
+Each shard retains S without advancing its write version. Retention alone does
+not make a future snapshot readable: checksum scans use ordinary MVCC admission
+and wait for preceding transactions. The arming transaction completes promptly;
+heartbeat processing finishes publication independently of the RPC.
+
+Records at or beyond H stay in the durable source change queue. Once all writes
+below H have resolved, each shard queues the checkpoint before releasing those
+records. Released records receive fresh, increasing producer sequence numbers,
+preserving their original order. This also covers locked/volatile writes,
+heartbeats, and a terminal failure that arrives before H. Restart reloads fences
+and deferred records. A source split drains pending fences on its old producer
+before capturing the handoff snapshot.
 
 Checkpoints use the existing opaque PQ schema-barrier transport. A producer
 cannot send past a checkpoint until PQ acknowledges its durable emission after
-all producers arrive. Each coordinated operation has a distinct `(step, txId)`;
-the payload carries its checkpoint ID. This sender invariant prevents the
-watermark-based transport from coalescing consecutive checkpoints. Source shard
-handoff drains the old producer before registering its successors.
+all producers arrive. Results use one current shard to broadcast to all topic
+partitions and do not introduce another quorum barrier.
 
-The terminal operation chooses one current DataShard to broadcast the result
-to every partition. Ordinary producer sequence-number deduplication handles
-retries. Results do not introduce another PQ quorum barrier.
+GLOBAL assignments cover exact half-open intervals `[begin, end)`. A bounded
+window admits five ordinary intervals. Empty intervals can be skipped only when
+all participants have proved sufficient progress. Existing merged assignments
+are drained under their old routing before strict assignments begin.
 
-Destination workers use the durable control-record handshake also used for
-schema changes. They drain the data preceding a checkpoint and park. GLOBAL
-replication flushes staged writes for the selected destination table, retaining
-the globally assigned transaction IDs for the subsequent ordinary commit. ROW
-replication has already committed its prefix.
+Workers may scan beyond records outside the admitted window to find a heartbeat
+or control record. They retain the earliest deferred source offset and the minimum
+unapplied version separately: the former caps CDC acknowledgements, and the latter
+caps reported resolved progress. When the window advances, they replay the
+uncommitted prefix from CDC. Destination deduplication records individual applied
+offsets above that prefix, so later offsets cannot hide deferred records. These
+entries survive shard handoff and are retired as the processed prefix advances.
+Prefix proofs travel with those deletions, so merging independently advanced
+shards cannot make an already applied offset appear new. A deferred prefix also
+retains checksum results for replay while the worker scans ahead to a heartbeat;
+the result's older snapshot version cannot resolve that prefix.
+Partition-end notifications wait until deferred records drain.
 
-Later records can still carry a GLOBAL interval's already committed transaction
-ID. They must receive a fresh local MVCC version rather than inherit that ID's
-earlier commit version, which would change the retained checksum snapshot.
+A drained checkpoint proves resolved progress H. The checked table's workers
+park while the controller finishes normal all-table commits through H. Once all
+participants have reached H and those commits have finished, it retains a fresh
+destination snapshot D. It persists D and release state before resuming workers.
+Checksum checks do not flush only the selected table, reset heartbeat progress,
+or enter schema-change verification. GLOBAL atomic visibility is preserved.
+An overlapping schema verification that would create a circular wait fails the
+comparison; existing schema-change behavior is otherwise unchanged.
 
-While workers are parked, the controller creates a fresh retained snapshot `D`.
-It persists `D` and the worker release state together. Workers then resume while
-the local checksum runs at `D`. Source and destination hashes are joined by
-checkpoint ID. Waiting for a source result never holds workers at the checkpoint.
-Replicated schema changes wait while a local scan depends on the earlier schema.
+ROW workers already commit their prefix before parking. If no selected feed has
+a positive heartbeat interval, publication retains the original protocol v1
+coordinated checkpoint, without `commit_boundary`. GLOBAL comparisons require v2,
+an aligned H, and drained legacy assignments; incompatible controls are consumed
+with a failed comparison status.
 
-GLOBAL target flushing can temporarily expose changes to this table before
-changes to other tables from the same source transaction. This is the accepted
-table-scoped consistency relaxation for a manual check.
+Local checksum scans run at the retained D after workers resume. Results are
+joined by checkpoint ID. Waiting for the source result never holds a worker at
+the checkpoint. Replicated schema changes wait while a local scan depends on the
+earlier schema.
 
 ## Failures and recovery
 
 The source scan belongs to the RPC. It is not resumed after node loss. A
-checkpoint without a terminal result can therefore occur; source reservations
-and snapshots expire, and the destination terminates the attempt after one hour.
+checkpoint without a terminal result can therefore occur. An armed fence still
+finishes publication even if the RPC disappears; source snapshots expire, and the
+destination terminates the attempt after one hour.
 Concurrent source attempts for the table return `OVERLOADED`.
 
 Destination membership, offsets, snapshot identity, local checksum, and join

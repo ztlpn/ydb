@@ -292,8 +292,10 @@ public:
         TReplicationSourceOffsetsDb rdb(txc);
         auto& source = replicatedTable->EnsureSource(rdb, msg.GetSource());
 
-        if (userTable.HasAsyncIndexes()) {
-            // Index collection may fault while reading the old row. Restore the
+        if (userTable.HasAsyncIndexes() || AnyOf(msg.GetChanges(), [](const auto& change) {
+                return change.HasSourceOffsetFloor();
+            })) {
+            // Index collection and gap-aware deduplication may fault while reading the old row. Restore the
             // in-memory source state together with the database transaction.
             const ui64 sourceId = source.Id;
             const TString sourceName = source.Name;
@@ -423,6 +425,65 @@ public:
             return true;
         }
 
+        NIceDb::TNiceDb db(txc.DB);
+        TVector<ui64> obsoleteOffsets;
+        TVector<ui64> obsoleteFloors;
+        TString appliedSource;
+        TString floorSource;
+        ui64 sourceFloor = change.GetSourceOffsetFloor();
+        if (change.HasSourceOffsetFloor()) {
+            if (sourceOffset < 0 || sourceFloor > ui64(sourceOffset)) {
+                Result = MakeHolder<TEvDataShard::TEvApplyReplicationChangesResult>(
+                    NKikimrTxDataShard::TEvApplyReplicationChangesResult::STATUS_REJECTED,
+                    NKikimrTxDataShard::TEvApplyReplicationChangesResult::REASON_BAD_REQUEST, "Invalid source offset floor");
+                return false;
+            }
+            // Tagged source names separate exact offsets from processed-prefix
+            // markers in the same borrowed table. Encoding the floor in the key
+            // preserves the maximum across a merge of independently written parts.
+            appliedSource = TStringBuilder() << "a:" << source.Name;
+            floorSource = TStringBuilder() << "f:" << source.Name;
+            auto latest = db.Table<Schema::ReplicationAppliedOffsets>()
+                              .Reverse()
+                              .Range(source.PathId.OwnerId, source.PathId.LocalPathId, floorSource)
+                              .Select();
+            if (!latest.IsReady()) {
+                throw TNotReadyTabletException();
+            }
+            if (!latest.EndOfSet()) {
+                sourceFloor = Max(sourceFloor, latest.GetValue<Schema::ReplicationAppliedOffsets::Offset>());
+                if (ui64(sourceOffset) < sourceFloor) {
+                    return true;
+                }
+            }
+            auto applied = db.Table<Schema::ReplicationAppliedOffsets>()
+                               .Key(source.PathId.OwnerId, source.PathId.LocalPathId, appliedSource, ui64(sourceOffset))
+                               .Select();
+            if (!applied.IsReady()) {
+                throw TNotReadyTabletException();
+            }
+            if (applied.IsValid()) {
+                return true;
+            }
+            const auto collectObsolete = [&](const TString& name, TVector<ui64>& offsets) {
+                auto old = db.Table<Schema::ReplicationAppliedOffsets>().Prefix(source.PathId.OwnerId, source.PathId.LocalPathId, name).Select();
+                if (!old.IsReady()) {
+                    throw TNotReadyTabletException();
+                }
+                while (!old.EndOfSet() && old.GetValue<Schema::ReplicationAppliedOffsets::Offset>() < sourceFloor) {
+                    offsets.push_back(old.GetValue<Schema::ReplicationAppliedOffsets::Offset>());
+                    if (offsets.size() == 128) {
+                        break;
+                    }
+                    if (!old.Next()) {
+                        throw TNotReadyTabletException();
+                    }
+                }
+            };
+            collectObsolete(appliedSource, obsoleteOffsets);
+            collectObsolete(floorSource, obsoleteFloors);
+        }
+
         TVector<TRawTypeValue> key;
         key.reserve(keyCellVec.GetCells().size());
         for (size_t i = 0; i < keyCellVec.GetCells().size(); ++i) {
@@ -462,7 +523,27 @@ public:
 
         // Rejected records must not advance the persisted deduplication offset.
         TReplicationSourceOffsetsDb rdb(txc);
-        source.AdvanceMaxOffset(rdb, keyCellVec.GetCells(), sourceOffset);
+        if (change.HasSourceOffsetFloor()) {
+            if (sourceFloor) {
+                source.AdvanceMaxOffset(rdb, keyCellVec.GetCells(), sourceFloor - 1);
+                // A child may delete an offset copied from another key range.
+                // Its prefix proof must survive the same handoff as that tombstone.
+                db.Table<Schema::ReplicationAppliedOffsets>()
+                    .Key(source.PathId.OwnerId, source.PathId.LocalPathId, floorSource, sourceFloor)
+                    .Update();
+            }
+            for (const auto old : obsoleteOffsets) {
+                db.Table<Schema::ReplicationAppliedOffsets>().Key(source.PathId.OwnerId, source.PathId.LocalPathId, appliedSource, old).Delete();
+            }
+            for (const auto old : obsoleteFloors) {
+                db.Table<Schema::ReplicationAppliedOffsets>().Key(source.PathId.OwnerId, source.PathId.LocalPathId, floorSource, old).Delete();
+            }
+            db.Table<Schema::ReplicationAppliedOffsets>()
+                .Key(source.PathId.OwnerId, source.PathId.LocalPathId, appliedSource, ui64(sourceOffset))
+                .Update();
+        } else {
+            source.AdvanceMaxOffset(rdb, keyCellVec.GetCells(), sourceOffset);
+        }
 
         // A table-scoped replication barrier may commit an interval before
         // its global transaction id is retired. Further records in that

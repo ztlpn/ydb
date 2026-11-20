@@ -65,6 +65,12 @@ message TCdcChecksum {
     }
     repeated TStream Streams = 14;
     optional uint64 TableSchemaVersion = 15;
+    // v2: exclusive GLOBAL commit boundary; Snapshot is its predecessor.
+    optional uint64 CommitBoundaryStep = 16;
+    // Source coordination metadata, not part of the JSON control envelope.
+    optional uint64 AlignmentPeriodMs = 17;
+    // Preserve reservations even across intervening checks on feeds without heartbeats.
+    optional uint64 LastReservedBoundaryStep = 18;
 }
 
 message TChangeRecord {

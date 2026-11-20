@@ -1026,6 +1026,8 @@ void TDataShard::PersistChangeRecord(NIceDb::TNiceDb& db, const TChangeRecord& r
         }
 
         CommittingChangeRecords.push_back(record.GetOrder());
+        DeferCdcChecksumRecord(db, record.GetOrder(), record.GetPathId(), TRowVersion(record.GetStep(), record.GetTxId()),
+            record.GetKind() == TChangeRecord::EKind::CdcChecksumResult);
     } else {
         auto& state = LockChangeRecords[lockId];
         Y_ENSURE(state.Changes.empty() || state.Changes.back().LockOffset < record.GetLockOffset(),
@@ -1112,6 +1114,7 @@ void TDataShard::CommitLockChangeRecords(NIceDb::TNiceDb& db, ui64 lockId, ui64 
         committed.Step = rowVersion.Step;
         committed.TxId = rowVersion.TxId;
         collected.push_back(committed);
+        DeferCdcChecksumRecord(db, committed.Order, committed.PathId, rowVersion);
 
         auto res = ChangesQueue.emplace(committed.Order, committed);
         Y_ENSURE(res.second, "Duplicate change record: " << committed.Order);
@@ -1197,6 +1200,9 @@ void TDataShard::RemoveChangeRecord(NIceDb::TNiceDb& db, ui64 order) {
         {"order", order},
         {"tabletId", TabletID()});
 
+    if (CdcChecksumDeferred.erase(order)) {
+        db.Table<Schema::CdcChecksumDeferred>().Key(order).Delete();
+    }
     auto it = ChangesQueue.find(order);
     if (it == ChangesQueue.end()) {
         return;
@@ -1291,7 +1297,9 @@ void TDataShard::EnqueueChangeRecords(TVector<IDataShardChangeCollector::TChange
             continue;
         }
 
-        forward.emplace_back(record.Order, record.PathId, record.BodySize);
+        if (!CdcChecksumDeferred.contains(record.Order)) {
+            forward.emplace_back(record.Order, record.PathId, record.BodySize);
+        }
 
         it->second.PathId = record.PathId;
         it->second.EnqueuedAt = now;

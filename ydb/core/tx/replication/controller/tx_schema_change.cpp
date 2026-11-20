@@ -41,7 +41,8 @@ public:
 bool IsValidSchemaChange(const NKikimrReplication::TSchemaChange& schema) {
     if (schema.HasChecksum()) {
         return schema.HasVersion() && !schema.GetChecksum().GetCheckpointId().empty() &&
-            schema.GetChecksum().GetProtocolVersion() == 1;
+               (schema.GetChecksum().GetProtocolVersion() == 1 ||
+                   (schema.GetChecksum().GetProtocolVersion() == 2 && schema.GetChecksum().HasCommitBoundaryStep()));
     }
     if (!schema.HasVersion() || !schema.GetSourceSchemaVersion()) {
         return false;
@@ -621,6 +622,11 @@ class TController::TTxSchemaChangeReport: public TTxBase {
                 {"targetId", key.second},
                 {"workers", barrier.ExpectedWorkers.size()});
             auto replication = Self->Find(key.first);
+            if (barrier.Schema.HasChecksum() && replication && IsGlobalConsistency(*replication)) {
+                Self->AdvanceChecksumBarriers(db, ctx.Now());
+                RecheckHeartbeats = true;
+                return;
+            }
             NKikimrReplicationController::TSchemaBarrierFlushTxIds flushTxIds;
             const bool pendingWrites = replication && IsGlobalConsistency(*replication) && !Self->AssignedTxIds.empty();
             if (pendingWrites && !barrier.Schema.HasIndexes()) {
@@ -692,6 +698,9 @@ public:
         }
 
         NIceDb::TNiceDb db(txc.DB);
+        if (schema.HasChecksum()) {
+            Self->EnableGridAssignments(db);
+        }
         if (schema.HasChecksum() && Self->ObserveChecksum(key, schema.GetChecksum(), db, ctx.Now())) {
             ReporterReply = record.GetCompleted() ? EReporterReply::Completed
                 : record.GetApplied() ? EReporterReply::Applied : EReporterReply::Release;
@@ -1143,7 +1152,7 @@ public:
             }
         }
 
-        AwaitPostSchemaHeartbeats = replication && IsGlobalConsistency(*replication);
+        AwaitPostSchemaHeartbeats = !it->second.Schema.HasChecksum() && replication && IsGlobalConsistency(*replication);
         it->second.Phase = AwaitPostSchemaHeartbeats
             ? ESchemaBarrierPhase::Verifying
             : ESchemaBarrierPhase::Applied;

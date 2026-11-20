@@ -41,6 +41,8 @@ public:
         FlagTimeout = (1ULL << 1),
         // Snapshot created using a scheme tx (only another scheme tx may delete it)
         FlagScheme = (1ULL << 2),
+        // Retains history without bypassing MVCC admission or dependencies.
+        FlagMvccRetention = (1ULL << 3),
         // Flag for removed (but not yet deleted) snapshots
         FlagRemoved = (1ULL << 63),
     };

@@ -20,6 +20,9 @@ NJson::TJsonValue SerializeCdcChecksum(const NKikimrChangeExchange::TCdcChecksum
     value["table"].AppendValue(record.GetTableId().GetLocalId());
     value["snapshot"].AppendValue(record.GetSnapshotStep());
     value["snapshot"].AppendValue(record.GetSnapshotTxId());
+    if (record.HasCommitBoundaryStep()) {
+        value["commit_boundary"] = record.GetCommitBoundaryStep();
+    }
     value["schema"] = record.GetSchema();
     value["algorithm"] = record.GetAlgorithm();
     value["algorithm_version"] = record.GetAlgorithmVersion();
@@ -45,12 +48,11 @@ bool ParseCdcChecksum(const NJson::TJsonValue& json,
         error = "Invalid or unsupported CDC checksum control record";
         return false;
     };
-    if (!IsCdcChecksum(json) || (result && json.Has("checksum_checkpoint")) ||
-        !value.IsMap() || !value["version"].IsUInteger() || value["version"].GetUInteger() != 1 ||
-        !value["id"].IsString() || value["id"].GetString().empty() ||
-        !value["schema"].IsString() ||
-        !value["algorithm"].IsString() || value["algorithm"].GetString() != "CityHash64" ||
-        !value["algorithm_version"].IsUInteger() || value["algorithm_version"].GetUInteger() != 1)
+    if (!IsCdcChecksum(json) || (result && json.Has("checksum_checkpoint")) || !value.IsMap() || !value["version"].IsUInteger() ||
+        (value["version"].GetUInteger() != 1 && value["version"].GetUInteger() != 2) || !value["id"].IsString() ||
+        value["id"].GetString().empty() || !value["schema"].IsString() || !value["algorithm"].IsString() ||
+        value["algorithm"].GetString() != "CityHash64" || !value["algorithm_version"].IsUInteger() ||
+        value["algorithm_version"].GetUInteger() != 1)
     {
         return fail();
     }
@@ -63,7 +65,17 @@ bool ParseCdcChecksum(const NJson::TJsonValue& json,
             return fail();
         }
     }
-    record.SetProtocolVersion(1);
+    record.SetProtocolVersion(value["version"].GetUInteger());
+    if (record.GetProtocolVersion() == 2) {
+        if (!value["commit_boundary"].IsUInteger() || !value["commit_boundary"].GetUInteger() ||
+            value["snapshot"][0].GetUInteger() != value["commit_boundary"].GetUInteger() - 1 ||
+            value["snapshot"][1].GetUInteger() != Max<ui64>()) {
+            return fail();
+        }
+        record.SetCommitBoundaryStep(value["commit_boundary"].GetUInteger());
+    } else if (value.Has("commit_boundary")) {
+        return fail();
+    }
     record.SetCheckpointId(value["id"].GetString());
     record.MutableTableId()->SetOwnerId(value["table"][0].GetUInteger());
     record.MutableTableId()->SetLocalId(value["table"][1].GetUInteger());

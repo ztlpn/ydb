@@ -6,14 +6,16 @@
 #include <ydb/core/base/tablet_pipecache.h>
 #include <ydb/core/change_exchange/change_sender.h>
 #include <ydb/core/change_exchange/util.h>
+#include <ydb/core/protos/change_exchange.pb.h>
 #include <ydb/core/tablet_flat/flat_row_eggs.h>
 #include <ydb/core/tx/datashard/datashard.h>
 #include <ydb/core/tx/replication/common/schema_change.h>
 #include <ydb/core/tx/replication/ydb_proxy/topic_message.h>
 #include <ydb/core/tx/scheme_cache/helpers.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
-#include <ydb/library/actors/core/actor_bootstrapped.h>
+
 #include <ydb/library/actors/core/actor.h>
+#include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/hfunc.h>
 #include <ydb/library/actors/core/log.h>
 #include <ydb/library/services/services.pb.h>
@@ -23,6 +25,8 @@
 #include <util/generic/maybe.h>
 #include <util/generic/set.h>
 #include <util/string/builder.h>
+
+#include <optional>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::REPLICATION_SERVICE
 
@@ -496,16 +500,26 @@ class TLocalTableWriter
         return new TTablePartitionWriter(SelfId(), Database, partitionId, tableId, Serializer->Clone());
     }
 
+    bool IsGridVersion(const TRowVersion& version) const {
+        return WriteWindow && (!IndexBuild || (WriteWindow->HasIndexJoin() && version >= TRowVersion::FromProto(WriteWindow->GetIndexJoin())));
+    }
+
     void Handle(TEvWorker::TEvData::TPtr& ev) {
         YDB_LOG_DEBUG("Handle",
             {"ev", ev->Get()->ToString()});
 
         Y_ABORT_UNLESS(PendingRecords.empty());
+        BatchInProgress = true;
+        if (!ev->Get()->Records.empty() && !SourceOffsetFloor) {
+            SourceOffsetFloor = ev->Get()->Records.front().GetOffset();
+        }
+        BatchProcessedOffset = SourceOffsetFloor.GetOrElse(0);
         TVector<NChangeExchange::TEvChangeExchange::TEvEnqueueRecords::TRecordInfo> records(::Reserve(ev->Get()->Records.size()));
         TSet<TRowVersion> versionsWithoutTxId;
 
         for (auto& r : ev->Get()->Records) {
             auto offset = r.GetOffset();
+            BatchProcessedOffset = offset + r.GetLogicalMessageCount();
             if (IndexBuild && offset < BuildProgress.GetOffset()) {
                 continue; // Durable apply may be ahead of the CDC checkpoint.
             }
@@ -526,7 +540,15 @@ class TLocalTableWriter
             case IChangeRecordParser::ESchemaChangeResult::NotSchemaChange:
                 break;
             }
+            if (PendingSchemaChange && DeferredOffset && schema.HasChecksum() && schema.GetChecksum().GetResult()) {
+                // A result refers to an older snapshot; it cannot resolve the
+                // deferred prefix. Keep scanning for a heartbeat and replay
+                // this control with the uncommitted source prefix later.
+                PendingSchemaChange.Reset();
+                continue;
+            }
             if (PendingSchemaChange) {
+                BatchProcessedOffset = offset;
                 if (IndexBuild && !schema.HasChecksum()) {
                     return LogCritAndLeave("Schema changes during replicated index build are not supported");
                 }
@@ -562,8 +584,21 @@ class TLocalTableWriter
                     continue;
                 }
 
-                if (auto it = TxIds.upper_bound(version); !IndexBuild && it != TxIds.end()) {
+                if (IsGridVersion(version)) {
+                    if (version < TRowVersion::FromProto(WriteWindow->GetBegin())) {
+                        continue;   // A replay of an already committed prefix.
+                    }
+                    if (version >= TRowVersion::FromProto(WriteWindow->GetEnd())) {
+                        DeferRecord(offset, version);
+                        continue;
+                    }
+                }
+                if (auto it = TxIds.upper_bound(version); (!IndexBuild || WriteWindow) && it != TxIds.end() &&
+                                                          (!TxIdBegins.contains(it->first) || TxIdBegins.at(it->first) <= version)) {
                     record->RewriteTxId(it->second);
+                    if (WriteWindow) {
+                        record->RewriteSourceOffsetFloor(SourceOffsetFloor.GetOrElse(0));
+                    }
                     if (PendingTxId.empty()) {
                         records.emplace_back(record->GetOrder(), TablePathId, record->GetBody().size());
                     } else {
@@ -597,6 +632,30 @@ class TLocalTableWriter
         }
     }
 
+    void SendEndIfDrained() {
+        if (EndOfData && !BatchInProgress && !DeferredOffset) {
+            Send(Worker, EndOfData.Release());
+        }
+    }
+
+    void Handle(TEvWorker::TEvDataEnd::TPtr& ev) {
+        EndOfData.Reset(ev->Release().Release());
+        if (!BatchInProgress && DeferredOffset) {
+            ResolvedVersion = TRowVersion::Max();
+            if (IndexBuild) {
+                DeferredVersion.ToProto(BuildProgress.MutableHeartbeat());
+                auto progress = MakeHolder<TEvService::TEvIndexBuildProgress>();
+                progress->Record.SetScanAhead(true);
+                *progress->Record.MutableProgress() = BuildProgress;
+                Send(Worker, std::move(progress));
+            } else {
+                Send(Worker, new TEvService::TEvHeartbeat(DeferredVersion));
+            }
+            MaybeReplay();
+        }
+        SendEndIfDrained();
+    }
+
     void Handle(TEvWorker::TEvTerminateWriter::TPtr& ev) {
         YDB_LOG_DEBUG("Handle",
             {"ev", ev->Get()->ToString()});
@@ -612,7 +671,13 @@ class TLocalTableWriter
             {"ev", ev->Get()->ToString()});
 
         TVector<NChangeExchange::TEvChangeExchange::TEvEnqueueRecords::TRecordInfo> records;
-        if (IndexBuild) {
+        if (ev->Get()->Record.HasWriteWindow()) {
+            const auto& window = ev->Get()->Record.GetWriteWindow();
+            if (!WriteWindow || TRowVersion::FromProto(window.GetBegin()) >= TRowVersion::FromProto(WriteWindow->GetBegin())) {
+                WriteWindow = window;
+            }
+        }
+        if (IndexBuild && !WriteWindow) {
             for (const auto& assignment : ev->Get()->Record.GetVersionTxIds()) {
                 const auto begin = TRowVersion::FromProto(assignment.GetBegin());
                 const auto end = TRowVersion::FromProto(assignment.GetVersion());
@@ -641,6 +706,58 @@ class TLocalTableWriter
                 }
             }
 
+            return;
+        }
+
+        if (WriteWindow) {
+            const auto begin = TRowVersion::FromProto(WriteWindow->GetBegin());
+            const auto end = TRowVersion::FromProto(WriteWindow->GetEnd());
+            TxIds.erase(TxIds.begin(), TxIds.upper_bound(begin));
+            TxIdBegins.erase(TxIdBegins.begin(), TxIdBegins.upper_bound(begin));
+            for (const auto& assignment : ev->Get()->Record.GetVersionTxIds()) {
+                const auto upper = TRowVersion::FromProto(assignment.GetVersion());
+                if (!IndexBuild && upper <= begin) {
+                    continue;
+                }
+                TxIds[upper] = assignment.GetTxId();
+                if (assignment.HasBegin()) {
+                    TxIdBegins[upper] = TRowVersion::FromProto(assignment.GetBegin());
+                }
+            }
+            for (auto it = PendingTxId.begin(); it != PendingTxId.end();) {
+                auto& record = PendingRecords.at(*it);
+                const auto version = TRowVersion(record->GetStep(), record->GetTxId());
+                if (IsGridVersion(version) && (version < begin || version >= end)) {
+                    if (version >= end) {
+                        DeferRecord(*it, version);
+                    }
+                    PendingRecords.erase(*it);
+                    it = PendingTxId.erase(it);
+                } else if (auto assigned = TxIds.upper_bound(version);
+                           assigned != TxIds.end() && (!TxIdBegins.contains(assigned->first) || TxIdBegins.at(assigned->first) <= version)) {
+                    record->RewriteTxId(assigned->second);
+                    if (WriteWindow) {
+                        record->RewriteSourceOffsetFloor(SourceOffsetFloor.GetOrElse(0));
+                    }
+                    BlockedRecords.insert(*it);
+                    it = PendingTxId.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            MaybeReplay();
+            if (PendingTxId.empty()) {
+                for (const auto offset : BlockedRecords) {
+                    const auto& record = PendingRecords.at(offset);
+                    records.emplace_back(offset, TablePathId, record->GetBody().size());
+                }
+                BlockedRecords.clear();
+                if (!records.empty()) {
+                    EnqueueRecords(std::move(records));
+                } else if (PendingRecords.empty() && BatchInProgress) {
+                    FinishBatch();
+                }
+            }
             return;
         }
 
@@ -737,18 +854,93 @@ class TLocalTableWriter
     void Handle(TEvService::TEvIndexBuildProgressResult::TPtr& ev) {
         if (IndexBuild) {
             BuildProgress.CopyFrom(ev->Get()->Record.GetProgress());
+            ResolvedVersion = Max(ResolvedVersion, TRowVersion::FromProto(BuildProgress.GetHeartbeat()));
         }
     }
 
-    void FinishBatch() {
+    void DeferRecord(ui64 offset, const TRowVersion& version) {
+        DeferredOffset = Min(DeferredOffset.GetOrElse(Max<ui64>()), offset);
+        DeferredVersion = Min(DeferredVersion, version);
+    }
+
+    void MaybeReplay() {
+        if (!ReplayRequested && DeferredOffset && WriteWindow && DeferredVersion < TRowVersion::FromProto(WriteWindow->GetEnd())) {
+            ReplayRequested = true;
+            Send(Worker, new TEvWorker::TEvReplay(*DeferredOffset));
+        }
+    }
+
+    void Handle(TEvWorker::TEvReplayStarted::TPtr&) {
+        Y_ENSURE(!BatchInProgress && PendingRecords.empty() && PendingTxId.empty());
+        EndOfData.Reset();
+        Terminating = false;
+        DeferredOffset.Clear();
+        DeferredVersion = TRowVersion::Max();
+        ResolvedVersion = WriteWindow ? TRowVersion::FromProto(WriteWindow->GetBegin()) : TRowVersion::Min();
         if (IndexBuild) {
-            PendingHeartbeat = TRowVersion::Min();
+            // The persisted checkpoint already proves this prefix. A replay
+            // may span several batches before seeing another heartbeat.
+            ResolvedVersion = Max(ResolvedVersion, TRowVersion::FromProto(BuildProgress.GetHeartbeat()));
+        }
+        PendingHeartbeat = TRowVersion::Min();
+        ReplayRequested = false;
+        PendingSchemaChange.Reset();
+    }
+
+    void FinishBatch() {
+        BatchInProgress = false;
+        if (EndOfData && DeferredOffset) {
+            PendingHeartbeat = TRowVersion::Max();
+        }
+        SourceOffsetFloor = Min(BatchProcessedOffset, DeferredOffset.GetOrElse(Max<ui64>()));
+        if (DeferredOffset && PendingSchemaChange && PendingSchemaChange->Schema.HasChecksum() &&
+            PendingSchemaChange->Schema.GetChecksum().GetResult()) {
+            // The window arrived after parsing stopped at the result. Re-read
+            // this batch with its known bounds to scan the remaining suffix.
+            PendingSchemaChange.Reset();
+            if (!ReplayRequested) {
+                ReplayRequested = true;
+                Send(Worker, new TEvWorker::TEvReplay(*DeferredOffset));
+            }
+        }
+        if (IndexBuild) {
+            ResolvedVersion = Max(ResolvedVersion, std::exchange(PendingHeartbeat, TRowVersion::Min()));
+            if (WriteWindow) {
+                BuildProgress.SetOffset(*SourceOffsetFloor);
+                Min(ResolvedVersion, DeferredVersion).ToProto(BuildProgress.MutableHeartbeat());
+                MaybeReplay();
+            }
             auto progress = MakeHolder<TEvService::TEvIndexBuildProgress>();
+            progress->Record.SetScanAhead(bool(DeferredOffset));
             progress->Record.MutableProgress()->CopyFrom(BuildProgress);
             Send(Worker, std::move(progress));
+            SendEndIfDrained();
             return;
         }
 
+        if (WriteWindow) {
+            ResolvedVersion = Max(ResolvedVersion, std::exchange(PendingHeartbeat, TRowVersion::Min()));
+            if (PendingSchemaChange) {
+                const auto& schema = PendingSchemaChange->Schema;
+                const auto boundary = schema.HasChecksum() && schema.GetChecksum().HasCommitBoundaryStep()
+                                          ? TRowVersion(schema.GetChecksum().GetCommitBoundaryStep(), 0)
+                                          : TRowVersion::FromProto(schema.GetVersion());
+                ResolvedVersion = Max(ResolvedVersion, boundary);
+            }
+            const auto progress = Min(ResolvedVersion, DeferredVersion);
+            if (progress) {
+                Send(Worker, new TEvService::TEvHeartbeat(progress));
+            }
+            MaybeReplay();
+            if (DeferredOffset || !PendingSchemaChange) {
+                auto poll = MakeHolder<TEvWorker::TEvPoll>(true);
+                poll->CommitOffset = DeferredOffset;
+                poll->StopPolling = bool(PendingSchemaChange);
+                Send(Worker, std::move(poll));
+                SendEndIfDrained();
+                return;
+            }
+        }
         if (const auto maxVersion = std::exchange(PendingHeartbeat, TRowVersion::Min())) {
             TxIds.erase(TxIds.begin(), TxIds.upper_bound(maxVersion));
             Send(Worker, new TEvService::TEvHeartbeat(maxVersion));
@@ -758,6 +950,7 @@ class TLocalTableWriter
         } else {
             Send(Worker, new TEvWorker::TEvPoll());
         }
+        SendEndIfDrained();
     }
 
     void Handle(TEvService::TEvSchemaChangeResult::TPtr& ev) {
@@ -866,6 +1059,7 @@ public:
     {
         if (IndexBuild) {
             BuildProgress.CopyFrom(settings->GetIndexBuildProgress());
+            ResolvedVersion = TRowVersion::FromProto(BuildProgress.GetHeartbeat());
         }
     }
 
@@ -879,6 +1073,8 @@ public:
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvWorker::TEvHandshake, Handle);
             hFunc(TEvWorker::TEvData, Handle);
+            hFunc(TEvWorker::TEvReplayStarted, Handle);
+            hFunc(TEvWorker::TEvDataEnd, Handle);
             hFunc(TEvWorker::TEvTerminateWriter, Handle);
             hFunc(TEvService::TEvTxIdResult, Handle);
             hFunc(TEvService::TEvSchemaChangeResult, Handle);
@@ -917,6 +1113,16 @@ private:
 
     THashMap<ui64, NChangeExchange::IChangeRecord::TPtr> PendingRecords;
     TMap<TRowVersion, ui64> TxIds; // key is non-inclusive right hand edge
+    TMap<TRowVersion, TRowVersion> TxIdBegins;
+    std::optional<NKikimrReplication::TGlobalWriteWindow> WriteWindow;
+    TMaybe<ui64> DeferredOffset;
+    TRowVersion DeferredVersion = TRowVersion::Max();
+    TRowVersion ResolvedVersion = TRowVersion::Min();
+    bool ReplayRequested = false;
+    THolder<TEvWorker::TEvDataEnd> EndOfData;
+    bool BatchInProgress = false;
+    TMaybe<ui64> SourceOffsetFloor;
+    ui64 BatchProcessedOffset = 0;
     TSet<ui64> PendingTxId;
     TSet<ui64> BlockedRecords;
     TRowVersion PendingHeartbeat = TRowVersion::Min();

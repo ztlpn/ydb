@@ -1213,6 +1213,108 @@ Y_UNIT_TEST_SUITE(Worker) {
         UNIT_ASSERT_VALUES_EQUAL(poll->Sender, reader);
     }
 
+    Y_UNIT_TEST(GridWriterRestartCompletesPendingIndexProgress) {
+        class TPeer final: public TActor<TPeer> {
+        public:
+            TPeer(TActorId edge, bool reader, TActorId& latest)
+                : TActor(&TThis::StateWork)
+                , Edge(edge)
+                , Reader(reader)
+                , Latest(latest)
+            {
+            }
+
+        private:
+            void Handle(TEvWorker::TEvHandshake::TPtr& ev) {
+                Latest = SelfId();
+                Send(ev->Sender, new TEvWorker::TEvHandshake());
+                if (Reader) {
+                    Send(ev->Sender, new TEvWorker::TEvReaderStarted(1));
+                }
+                Send(Edge, new TEvents::TEvWakeup());
+            }
+
+            STFUNC(StateWork) {
+                switch (ev->GetTypeRewrite()) {
+                    hFunc(TEvWorker::TEvHandshake, Handle);
+                    sFunc(TEvents::TEvPoison, PassAway);
+                    default:
+                        ev->Sender = SelfId();
+                        Send(ev->Forward(Edge));
+                }
+            }
+
+            const TActorId Edge;
+            const bool Reader;
+            TActorId& Latest;
+        };
+
+        TEnv env{ true, ERuntimeMode::Simulated };
+        auto& runtime = env.GetRuntime();
+        const auto edge = env.GetSender();
+        TActorId reader;
+        TActorId writer;
+        const auto worker = runtime.Register(CreateWorker(
+            edge,
+            [&] {
+                return new TPeer(edge, true, reader);
+            },
+            [&] {
+                return new TPeer(edge, false, writer);
+            }));
+        runtime.GrabEdgeEventRethrow<TEvents::TEvWakeup>(edge);
+        runtime.GrabEdgeEventRethrow<TEvents::TEvWakeup>(edge);
+        runtime.GrabEdgeEventRethrow<TEvWorker::TEvPoll>(edge);
+
+        const auto window = [](ui64 begin, ui64 end) {
+            auto result = MakeHolder<TEvService::TEvTxIdResult>();
+            TRowVersion(begin, 0).ToProto(result->Record.MutableWriteWindow()->MutableBegin());
+            TRowVersion(end, 0).ToProto(result->Record.MutableWriteWindow()->MutableEnd());
+            return result;
+        };
+        env.SendAsync(worker, window(0, 50));
+        runtime.GrabEdgeEventRethrow<TEvService::TEvTxIdResult>(edge);
+        runtime.Send(new IEventHandle(worker, reader, new TEvWorker::TEvData(0, "source", { TTopicMessage(1, "row") })));
+        runtime.GrabEdgeEventRethrow<TEvWorker::TEvData>(edge);
+        auto progress = MakeHolder<TEvService::TEvIndexBuildProgress>();
+        progress->Record.SetScanAhead(true);
+        progress->Record.MutableProgress()->SetOffset(1);
+        TRowVersion(61, 0).ToProto(progress->Record.MutableProgress()->MutableHeartbeat());
+        runtime.Send(new IEventHandle(worker, writer, progress.Release()));
+        const auto pending = runtime.GrabEdgeEventRethrow<TEvService::TEvIndexBuildProgress>(edge);
+
+        const auto oldReader = reader;
+        const auto oldWriter = writer;
+        runtime.Send(new IEventHandle(worker, writer, new TEvWorker::TEvGone(TEvWorker::TEvGone::UNAVAILABLE)));
+        runtime.GrabEdgeEventRethrow<TEvents::TEvWakeup>(edge);
+        runtime.GrabEdgeEventRethrow<TEvents::TEvWakeup>(edge);
+        runtime.GrabEdgeEventRethrow<TEvService::TEvTxIdResult>(edge);
+        UNIT_ASSERT(reader != oldReader && writer != oldWriter);
+        env.SendAsync(oldWriter, new TEvents::TEvPoison());
+
+        // The raw batch has been discarded for replay, but this acknowledgement
+        // must still reach the replacement writer and resume its reader.
+        auto ack = MakeHolder<TEvService::TEvIndexBuildProgressResult>();
+        *ack->Record.MutableProgress() = pending->Get()->Record.GetProgress();
+        env.SendAsync(worker, std::move(ack));
+        const auto restored = runtime.GrabEdgeEventRethrow<TEvService::TEvIndexBuildProgressResult>(edge);
+        UNIT_ASSERT_VALUES_EQUAL(restored->Sender, writer);
+        UNIT_ASSERT_VALUES_EQUAL(restored->Get()->Record.GetProgress().GetOffset(), 1);
+        const auto poll = runtime.GrabEdgeEventRethrow<TEvWorker::TEvPoll>(edge);
+        UNIT_ASSERT_VALUES_EQUAL(poll->Sender, reader);
+
+        env.SendAsync(worker, window(60, 110));
+        runtime.GrabEdgeEventRethrow<TEvService::TEvTxIdResult>(edge);
+        auto stale = window(0, 50);
+        auto* assignment = stale->Record.AddVersionTxIds();
+        assignment->SetTxId(123);
+        TRowVersion(60, 0).ToProto(assignment->MutableBegin());
+        TRowVersion(70, 0).ToProto(assignment->MutableVersion());
+        const auto forwarded = env.Send<TEvService::TEvTxIdResult>(worker, std::move(stale));
+        UNIT_ASSERT_VALUES_EQUAL(TRowVersion::FromProto(forwarded->Get()->Record.GetWriteWindow().GetBegin()), TRowVersion(60, 0));
+        UNIT_ASSERT_VALUES_EQUAL(forwarded->Get()->Record.GetVersionTxIds(0).GetTxId(), 123);
+    }
+
     Y_UNIT_TEST(SchemaReleaseWaitsForReplacementWriterBarrier) {
         class TReader final : public TActor<TReader> {
         public:

@@ -50,6 +50,9 @@ bool TController::HasPendingTargetFlushTxId(const TSchemaBarrier& barrier) const
 }
 
 bool TController::BlocksGlobalCommit(const TSchemaBarrier& barrier) const {
+    if (barrier.Schema.HasChecksum()) {
+        return false;
+    }
     switch (barrier.Phase) {
     case ESchemaBarrierPhase::FlushingTarget:
         return true;
@@ -162,6 +165,9 @@ public:
             Self->PendingHeartbeats.erase(it);
         }
 
+        Self->EnableGridAssignments(db);
+        Self->AdvanceChecksumBarriers(db, ctx.Now());
+        Self->AdvanceGridFrontier(db);
         const auto participants = Self->CountHeartbeatParticipants();
         if (!participants || participants != Self->WorkersWithHeartbeat.size()) {
             return true; // no quorum
@@ -216,6 +222,11 @@ public:
             ctx.Send(MakeTxProxyID(), std::move(ev), 0, Self->CommittingTxId);
         }
 
+        Self->BroadcastWriteWindow(ctx);
+        if (!Self->PendingTxId.empty()) {
+            Self->RunTxAssignTxId(ctx);
+        }
+        Self->ProgressChecksums(ctx);
         if (HadHeartbeats && Self->ReplicationsWithSourceOffsetMismatch.empty()) {
             Self->RunTxIndexBuild(ctx);
         }
@@ -304,8 +315,11 @@ public:
             NIceDb::TUpdate<Schema::Replications::CommittedTxId>(frontier.TxId)
         );
         db.Table<Schema::TxIds>().Key(it->first.Step, it->first.TxId).Delete();
+        Self->LegacyTxIds.erase(it->first);
         it = Self->AssignedTxIds.erase(it);
         Self->CommittingTxId = 0;
+        Self->AdvanceChecksumBarriers(db, ctx.Now());
+        Self->AdvanceGridFrontier(db);
         if (Self->ReplicationsWithSourceOffsetMismatch.contains(replication->GetId())) {
             return true;
         }
@@ -354,6 +368,8 @@ public:
             ctx.Send(MakeTxProxyID(), std::move(ev), 0, Self->CommittingTxId);
         }
 
+        Self->BroadcastWriteWindow(ctx);
+        Self->ProgressChecksums(ctx);
         Self->RunTxIndexBuild(ctx);
         if (!Self->PendingTxId.empty()) {
             Self->RunTxAssignTxId(ctx);

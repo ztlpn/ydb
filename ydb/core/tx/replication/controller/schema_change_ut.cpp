@@ -1,6 +1,5 @@
-#include <ydb/core/protos/change_exchange.pb.h>
-#include "controller_impl.h"
 #include "controller.h"
+#include "controller_impl.h"
 #include "dst_alterer.h"
 #include "dst_creator.h"
 #include "dst_schema_changer.h"
@@ -9,35 +8,38 @@
 #include "target_table.h"
 
 #include <ydb/core/base/path.h>
-#include <ydb/public/api/grpc/draft/ydb_replication_v1.grpc.pb.h>
-#include <grpcpp/create_channel.h>
-#include <grpcpp/security/credentials.h>
 #include <ydb/core/base/tablet_pipecache.h>
+#include <ydb/core/protos/change_exchange.pb.h>
+#include <ydb/core/protos/schemeshard/operations.pb.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/tablet_helpers.h>
 #include <ydb/core/testlib/tx_helpers.h>
-#include <ydb/core/protos/schemeshard/operations.pb.h>
-#include <ydb/core/tx/scheme_cache/scheme_cache.h>
 #include <ydb/core/tx/replication/service/service.h>
-#include <ydb/core/tx/tx_proxy/proxy.h>
 #include <ydb/core/tx/replication/ut_helpers/mock_service.h>
 #include <ydb/core/tx/replication/ut_helpers/test_env.h>
 #include <ydb/core/tx/replication/ut_helpers/test_table.h>
+#include <ydb/core/tx/scheme_cache/scheme_cache.h>
+#include <ydb/core/tx/tx_proxy/proxy.h>
+
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/executor_pool_base.h>
 #include <ydb/library/mkql_proto/protos/minikql.pb.h>
 #include <ydb/library/testlib/helpers.h>
-#include <library/cpp/testing/unittest/registar.h>
+#include <ydb/public/api/grpc/draft/ydb_replication_v1.grpc.pb.h>
 
+#include <grpcpp/create_channel.h>
+#include <grpcpp/security/credentials.h>
+#include <library/cpp/testing/unittest/registar.h>
+#include <util/datetime/base.h>
 #include <util/generic/algorithm.h>
 #include <util/generic/scope.h>
 #include <util/string/builder.h>
 #include <util/string/join.h>
 #include <util/string/printf.h>
-#include <util/datetime/base.h>
 
 #include <atomic>
 #include <functional>
+#include <future>
 #include <memory>
 
 namespace NKikimr::NReplication::NController {
@@ -3527,7 +3529,7 @@ Y_UNIT_TEST_SUITE(AttachmentLifecycle) {
 Y_UNIT_TEST_SUITE(ChecksumBarrier) {
     using namespace NTestHelpers;
 
-    NKikimrReplication::TSchemaChange Checkpoint(const TString& id = "check-1", ui64 step = 100) {
+    NKikimrReplication::TSchemaChange Checkpoint(const TString& id = "check-1", ui64 step = 100, bool global = false) {
         NKikimrReplication::TSchemaChange control;
         control.MutableVersion()->SetStep(step);
         control.MutableVersion()->SetTxId(10);
@@ -3540,6 +3542,15 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
         checksum->SetSnapshotStep(step);
         checksum->SetSnapshotTxId(10);
         checksum->SetSchema("3:key8:Uint32:05:value6:Utf8:0");
+        if (global) {
+            const ui64 boundary = (step / 100 + 1) * 10000;
+            checksum->SetProtocolVersion(2);
+            checksum->SetCommitBoundaryStep(boundary);
+            checksum->SetSnapshotStep(boundary - 1);
+            checksum->SetSnapshotTxId(Max<ui64>());
+            control.MutableVersion()->SetStep(boundary - 1);
+            control.MutableVersion()->SetTxId(Max<ui64>());
+        }
         return control;
     }
 
@@ -3622,7 +3633,7 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
         const auto run = env.GetRuntime().GrabEdgeEvent<TEvService::TEvRunWorker>(env.GetSender());
         const auto worker = TWorkerId::Parse(run->Get()->Record.GetWorker());
         AttachWorkers(env, info.ControllerId, {worker});
-        const auto control = Checkpoint();
+        const auto control = Checkpoint("check-1", 100, global);
         env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, control));
         env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
         CompleteSchemaChange(env, info.ControllerId, worker, control);
@@ -3631,7 +3642,7 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
         }
         // A new attempt may reach the destination before an earlier result.
         // It owns the latest status, but must not hide a completed comparison.
-        const auto next = Checkpoint("check-2", 300);
+        const auto next = Checkpoint("check-2", 300, global);
         env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, next));
         env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
         CompleteSchemaChange(env, info.ControllerId, worker, next);
@@ -3694,8 +3705,8 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
         flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
         flags.FeatureFlags.SetEnableTopicAutopartitioningForReplication(false);
         TEnv env(flags);
-        const auto info =
-            StartReplication(env, 2, "root@builtin", global, false, NKikimrSchemeOp::EIndexTypeGlobal, false, true, {}, 2, TDuration::Hours(1));
+        const auto info = StartReplication(
+            env, 2, "root@builtin", global, false, NKikimrSchemeOp::EIndexTypeGlobal, false, true, {}, 2, TDuration::Seconds(1));
         auto client = CreateTableClient(env);
         auto session = CreateTableSession(env, client);
         UNIT_ASSERT_C(WaitFor([&] {
@@ -3746,7 +3757,31 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
             request.set_path("/Root/table1");
             request.mutable_operation_params()->set_operation_mode(Ydb::Operations::OperationParams::SYNC);
             Ydb::Replication::PublishTableChecksumResponse response;
-            const auto rpc = stub->PublishTableChecksum(&context, request, &response);
+            auto publicationCall = std::async(std::launch::async, [&] {
+                return stub->PublishTableChecksum(&context, request, &response);
+            });
+            const auto checkVisibility = [&] {
+                if (!global) {
+                    return;
+                }
+                const auto visible =
+                    session
+                        .ExecuteDataQuery("SELECT COUNT(*) AS n FROM `/Root/replica1`; SELECT COUNT(*) AS n FROM `/Root/replica2`;",
+                            NYdb::NTable::TTxControl::BeginTx().CommitTx())
+                        .GetValueSync();
+                if (visible.GetStatus() == NYdb::EStatus::ABORTED) {
+                    return;
+                }
+                UNIT_ASSERT_C(visible.IsSuccess(), visible.GetIssues().ToString());
+                NYdb::TResultSetParser first(visible.GetResultSet(0));
+                NYdb::TResultSetParser second(visible.GetResultSet(1));
+                UNIT_ASSERT(first.TryNextRow() && second.TryNextRow());
+                UNIT_ASSERT_VALUES_EQUAL(first.ColumnParser("n").GetUint64(), second.ColumnParser("n").GetUint64());
+            };
+            while (publicationCall.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
+                checkVisibility();
+            }
+            const auto rpc = publicationCall.get();
             UNIT_ASSERT_C(rpc.ok(), rpc.error_message());
             UNIT_ASSERT_VALUES_EQUAL_C(response.operation().status(), Ydb::StatusIds::SUCCESS, response.DebugString());
             Ydb::Replication::PublishTableChecksumResult publication;
@@ -3757,6 +3792,7 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
             // Later writes must not enter the retained destination snapshot.
             write(round + 1, "after");
             UNIT_ASSERT_C(WaitFor([&] {
+                checkVisibility();
                 const auto description = DescribeReplication(env, info);
                 UNIT_ASSERT_C(!description->Get()->Record.GetState().HasError(), description->Get()->Record.DebugString());
                 bool compared = false;
@@ -3797,6 +3833,46 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
 
     Y_UNIT_TEST(GlobalEmptyComparison) {
         CheckEmptyComparison(true);
+    }
+
+    Y_UNIT_TEST(GlobalCheckpointWaitsForAllTableCommit) {
+        TFeatureFlags flags;
+        flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        TEnv env(flags);
+        const auto info = StartReplication(env, 2, "root@builtin", true);
+        auto& runtime = env.GetRuntime();
+        const auto first = TWorkerId::Parse(runtime.GrabEdgeEvent<TEvService::TEvRunWorker>(env.GetSender())->Get()->Record.GetWorker());
+        const auto second = TWorkerId::Parse(runtime.GrabEdgeEvent<TEvService::TEvRunWorker>(env.GetSender())->Get()->Record.GetWorker());
+        AttachWorkers(env, info.ControllerId, { first, second });
+        const auto proxy = runtime.GetLocalServiceId(MakeTxProxyID());
+        runtime.RegisterService(MakeTxProxyID(), runtime.Register(new TCommitWritesRecorder(proxy, env.GetSender())));
+        runtime.GrabEdgeEvent<TEvents::TEvWakeup>(env.GetSender());
+        auto assigned =
+            env.Send<TEvService::TEvTxIdResult>(info.ControllerId, new TEvService::TEvGetTxId(TVector<TRowVersion>{ TRowVersion(5000, 0) }));
+        while (!assigned->Get()->Record.VersionTxIdsSize()) {
+            assigned = runtime.GrabEdgeEvent<TEvService::TEvTxIdResult>(env.GetSender());
+        }
+        const auto txId = assigned->Get()->Record.GetVersionTxIds(0).GetTxId();
+        const auto control = Checkpoint("all-table-commit", 100, true);
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(first, control));
+        SendHeartbeat(env, info.ControllerId, second, TRowVersion(control.GetChecksum().GetCommitBoundaryStep(), 0));
+        const auto proposal = runtime.GrabEdgeEvent<TEvTxUserProxy::TEvProposeTransaction>(env.GetSender());
+        const auto& commit = proposal->Get()->Record.GetTransaction().GetCommitWrites();
+        UNIT_ASSERT_VALUES_EQUAL(commit.GetWriteTxId(), txId);
+        TSet<TString> tables;
+        for (const auto& table : commit.GetTables()) {
+            tables.insert(table.GetTablePath());
+        }
+        UNIT_ASSERT_VALUES_EQUAL(tables, (TSet<TString>{ "/Root/replica1", "/Root/replica2" }));
+        auto completed = MakeHolder<TEvTxUserProxy::TEvProposeTransactionStatus>();
+        completed->Record.SetStatus(TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ExecComplete);
+        runtime.Send(new IEventHandle(proposal->Sender, env.GetSender(), completed.Release(), 0, txId));
+        // The checksum snapshot releases directly after the ordinary commit;
+        // a table-only flush would produce another intercepted proposal here.
+        runtime.GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, first, control);
+        UNIT_ASSERT(!DescribeReplication(env, info)->Get()->Record.GetState().HasError());
+        runtime.RegisterService(MakeTxProxyID(), proxy);
     }
 }
 

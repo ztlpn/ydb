@@ -23,9 +23,9 @@ TAttempt* FindAttempt(NKikimrReplication::TCdcChecksumState& state, const TStrin
 bool SameCheckpoint(const NKikimrChangeExchange::TCdcChecksum& lhs,
         const NKikimrChangeExchange::TCdcChecksum& rhs) {
     return lhs.GetCheckpointId() == rhs.GetCheckpointId() && Version(lhs) == Version(rhs) &&
-        TPathId::FromProto(lhs.GetTableId()) == TPathId::FromProto(rhs.GetTableId()) &&
-        lhs.GetSchema() == rhs.GetSchema() && lhs.GetAlgorithm() == rhs.GetAlgorithm() &&
-        lhs.GetAlgorithmVersion() == rhs.GetAlgorithmVersion() && lhs.GetProtocolVersion() == rhs.GetProtocolVersion();
+           TPathId::FromProto(lhs.GetTableId()) == TPathId::FromProto(rhs.GetTableId()) && lhs.GetSchema() == rhs.GetSchema() &&
+           lhs.GetAlgorithm() == rhs.GetAlgorithm() && lhs.GetAlgorithmVersion() == rhs.GetAlgorithmVersion() &&
+           lhs.GetProtocolVersion() == rhs.GetProtocolVersion() && lhs.GetCommitBoundaryStep() == rhs.GetCommitBoundaryStep();
 }
 
 void Fail(TAttempt& attempt, Ydb::StatusIds::StatusCode status, const TString& error) {
@@ -125,6 +125,13 @@ bool TController::ObserveChecksum(const TKey& key, const NKikimrChangeExchange::
             target->GetKind() != TReplication::ETargetKind::Table || target->IsIndexBuild())
         {
             Fail(*attempt, Ydb::StatusIds::UNSUPPORTED, "Checksum comparisons are disabled or unsupported for this target");
+        } else if (const auto replication = Find(key.first); replication && replication->GetConfig().GetConsistencySettings().HasGlobal()) {
+            const auto interval = replication->GetConfig().GetConsistencySettings().GetGlobal().GetCommitIntervalMilliSeconds();
+            if (control.GetProtocolVersion() != 2 || !control.GetCommitBoundaryStep() || control.GetCommitBoundaryStep() % interval ||
+                !LegacyTxIds.empty()) {
+                Fail(*attempt, Ydb::StatusIds::PRECONDITION_FAILED,
+                    "GLOBAL checksum requires an aligned checkpoint and drained legacy transaction assignments");
+            }
         }
     } else if (!SameCheckpoint(attempt->GetCheckpoint(), control)) {
         Fail(*attempt, Ydb::StatusIds::PRECONDITION_FAILED, "Conflicting checksum checkpoint metadata");
@@ -165,6 +172,71 @@ bool TController::HasChecksumReads(const TKey& key) const {
         }
     }
     return false;
+}
+
+void TController::AdvanceChecksumBarriers(NIceDb::TNiceDb& db, TInstant now) {
+    for (auto& [key, barrier] : SchemaBarriers) {
+        if (!barrier.Schema.HasChecksum() || barrier.Phase != ESchemaBarrierPhase::Collecting ||
+            barrier.ReportedWorkers.size() != barrier.ExpectedWorkers.size()) {
+            continue;
+        }
+        const auto replication = Find(key.first);
+        if (!replication || !replication->GetConfig().GetConsistencySettings().HasGlobal()) {
+            continue;
+        }
+        auto* attempt = FindAttempt(ChecksumStates.at(key), barrier.Schema.GetChecksum().GetCheckpointId());
+        if (!attempt || attempt->GetFinished()) {
+            continue;
+        }
+        const auto boundary = TRowVersion(barrier.Schema.GetChecksum().GetCommitBoundaryStep(), 0);
+        bool cycle = false;
+        for (const auto& [otherKey, other] : SchemaBarriers) {
+            if (otherKey != key && !other.Schema.HasChecksum() && other.Phase == ESchemaBarrierPhase::Verifying &&
+                TRowVersion::FromProto(other.Schema.GetVersion()) >= boundary) {
+                cycle = true;
+                break;
+            }
+        }
+        if (cycle) {
+            Fail(*attempt, Ydb::StatusIds::PRECONDITION_FAILED, "Checksum checkpoint conflicts with schema-change verification");
+            PersistChecksum(key, db, now);
+            continue;
+        }
+        // A drained checkpoint proves the same progress as its heartbeat.
+        // Reestablish it after recovery or an unrelated DDL heartbeat reset.
+        for (const auto& id : barrier.ReportedWorkers) {
+            auto it = Workers.find(id);
+            if (it == Workers.end() || (it->second.HasHeartbeat() && it->second.GetHeartbeat() >= boundary)) {
+                continue;
+            }
+            auto& worker = it->second;
+            if (worker.HasHeartbeat()) {
+                auto old = WorkersByHeartbeat.find(worker.GetHeartbeat());
+                if (old != WorkersByHeartbeat.end()) {
+                    old->second.erase(id);
+                    if (old->second.empty()) {
+                        WorkersByHeartbeat.erase(old);
+                    }
+                }
+            }
+            worker.SetHeartbeat(boundary);
+            WorkersWithHeartbeat.insert(id);
+            WorkersByHeartbeat[boundary].insert(id);
+            db.Table<Schema::Workers>()
+                .Key(id.ReplicationId(), id.TargetId(), id.WorkerId())
+                .Update(NIceDb::TUpdate<Schema::Workers::HeartbeatVersionStep>(boundary.Step),
+                    NIceDb::TUpdate<Schema::Workers::HeartbeatVersionTxId>(boundary.TxId));
+        }
+        if (CommittingTxId || !LegacyTxIds.empty() || !CanCommitIndexBuilds(boundary) || !CountHeartbeatParticipants() ||
+            CountHeartbeatParticipants() != WorkersWithHeartbeat.size() || WorkersByHeartbeat.empty() ||
+            WorkersByHeartbeat.begin()->first < boundary || (!AssignedTxIds.empty() && AssignedTxIds.begin()->first <= boundary)) {
+            continue;
+        }
+        barrier.Phase = ESchemaBarrierPhase::Altering;
+        db.Table<Schema::Targets>()
+            .Key(key.first, key.second)
+            .Update(NIceDb::TUpdate<Schema::Targets::SchemaBarrierPhase>(static_cast<ui8>(barrier.Phase)));
+    }
 }
 
 void TController::ProgressChecksums(const TActorContext& ctx) {
@@ -285,6 +357,7 @@ public:
                 continue;
             }
             Self->PersistChecksum(key, db, ctx.Now());
+            Self->AdvanceChecksumBarriers(db, ctx.Now());
             auto barrier = Self->SchemaBarriers.find(key);
             if (barrier != Self->SchemaBarriers.end() && barrier->second.Schema.HasChecksum()) {
                 auto* attempt = FindAttempt(state, barrier->second.Schema.GetChecksum().GetCheckpointId());

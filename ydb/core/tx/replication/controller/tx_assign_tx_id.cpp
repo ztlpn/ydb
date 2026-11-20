@@ -9,6 +9,7 @@ namespace NKikimr::NReplication::NController {
 class TController::TTxAssignTxId: public TTxBase {
     THashMap<ui32, THolder<TEvService::TEvTxIdResult>> Result;
     bool TxIdsExhausted = false;
+    bool WaitingForCommit = false;
 
     struct TTxId {
         ui64 Value;
@@ -57,6 +58,57 @@ class TController::TTxAssignTxId: public TTxBase {
         return result;
     }
 
+    void AssignGrid(NIceDb::TNiceDb& db) {
+        const auto window = Self->GetWriteWindow();
+        const auto begin = TRowVersion::FromProto(window.GetBegin());
+        const auto end = TRowVersion::FromProto(window.GetEnd());
+        const auto replication = Self->GetSingle();
+        const auto interval = replication->GetConfig().GetConsistencySettings().GetGlobal().GetCommitIntervalMilliSeconds();
+        for (auto it = Self->PendingTxId.begin(); it != Self->PendingTxId.end();) {
+            const auto version = it->first;
+            for (const auto nodeId : it->second) {
+                auto& reply = Result[nodeId];
+                if (!reply) {
+                    reply = MakeHolder<TEvService::TEvTxIdResult>(Self->TabletID(), Self->Executor()->Generation());
+                }
+                *reply->Record.MutableWriteWindow() = window;
+            }
+            if (version <= begin || version > end) {
+                // A bounded reply lets workers scan for resolved progress and
+                // replay the deferred records, instead of waiting for an ID.
+                it = Self->PendingTxId.erase(it);
+                continue;
+            }
+            auto assigned = window.GetLegacy() ? Self->AssignedTxIds.lower_bound(version) : Self->AssignedTxIds.find(version);
+            if (assigned == Self->AssignedTxIds.end()) {
+                if (window.GetLegacy() || Self->AssignedTxIds.size() >= MaxOpenTxIds) {
+                    WaitingForCommit = true;
+                    ++it;
+                    continue;
+                }
+                if (Self->AllocatedTxIds.empty()) {
+                    TxIdsExhausted = true;
+                    ++it;
+                    continue;
+                }
+                const auto txId = Self->AllocatedTxIds.front();
+                Self->AllocatedTxIds.pop_front();
+                db.Table<Schema::TxIds>().Key(version.Step, version.TxId).Update(NIceDb::TUpdate<Schema::TxIds::WriteTxId>(txId),
+                    NIceDb::TUpdate<Schema::TxIds::GridInterval>(true));
+                assigned = Self->AssignedTxIds.emplace(version, txId).first;
+            }
+            for (const auto nodeId : it->second) {
+                auto* item = Result.at(nodeId)->Record.AddVersionTxIds();
+                assigned->first.ToProto(item->MutableVersion());
+                item->SetTxId(assigned->second);
+                if (!window.GetLegacy()) {
+                    TRowVersion(assigned->first.Step - interval, 0).ToProto(item->MutableBegin());
+                }
+            }
+            it = Self->PendingTxId.erase(it);
+        }
+    }
+
 public:
     explicit TTxAssignTxId(TController* self)
         : TTxBase("TxAssignTxId", self)
@@ -81,6 +133,12 @@ public:
         }
 
         NIceDb::TNiceDb db(txc.DB);
+        Self->EnableGridAssignments(db);
+        if (Self->SysParams.HasGridAssignments()) {
+            Self->AdvanceGridFrontier(db);
+            AssignGrid(db);
+            return true;
+        }
 
         auto result = Process([&](const TRowVersion& version) -> TAssignResult {
             auto it = Self->IndexBuilds.empty()
@@ -182,9 +240,10 @@ public:
             }
         }
 
+        Self->BroadcastWriteWindow(ctx);
         Self->AllocateTxIds(ctx);
 
-        if (!TxIdsExhausted && Self->PendingTxId) {
+        if (!TxIdsExhausted && !WaitingForCommit && Self->PendingTxId) {
             Self->Execute(new TTxAssignTxId(Self), ctx);
         } else {
             Self->AssignTxIdInFlight = false;
@@ -192,6 +251,83 @@ public:
     }
 
 }; // TTxAssignTxId
+
+void TController::EnableGridAssignments(NIceDb::TNiceDb& db) {
+    if (SysParams.HasGridAssignments() || !AppData()->FeatureFlags.GetEnableAsyncReplicationChecksumCheck()) {
+        return;
+    }
+    const auto replication = GetSingle();
+    if (!replication || !replication->GetConfig().GetConsistencySettings().HasGlobal()) {
+        return;
+    }
+    LegacyTxIds.clear();
+    for (const auto& [end, _] : AssignedTxIds) {
+        LegacyTxIds.insert(end);
+    }
+    SysParams.EnableGridAssignments(db);
+}
+
+NKikimrReplication::TGlobalWriteWindow TController::GetWriteWindow() const {
+    NKikimrReplication::TGlobalWriteWindow result;
+    const auto replication = GetSingle();
+    if (!replication) {
+        return result;
+    }
+    const auto interval = replication->GetConfig().GetConsistencySettings().GetGlobal().GetCommitIntervalMilliSeconds();
+    const auto it = CommittedVersions.find(replication->GetId());
+    const auto begin = it == CommittedVersions.end() ? TRowVersion::Min() : it->second;
+    begin.ToProto(result.MutableBegin());
+    if (!LegacyTxIds.empty()) {
+        LegacyTxIds.rbegin()->ToProto(result.MutableEnd());
+        result.SetLegacy(true);
+    } else {
+        const auto available = (Max<ui64>() - begin.Step) / interval;
+        TRowVersion(begin.Step + Min<ui64>(MaxOpenTxIds, available) * interval, 0).ToProto(result.MutableEnd());
+    }
+    return result;
+}
+
+void TController::AdvanceGridFrontier(NIceDb::TNiceDb& db) {
+    if (!SysParams.HasGridAssignments() || !LegacyTxIds.empty() || CommittingTxId || WorkersByHeartbeat.empty() ||
+        !CountHeartbeatParticipants() || CountHeartbeatParticipants() != WorkersWithHeartbeat.size()) {
+        return;
+    }
+    const auto replication = GetSingle();
+    if (!replication) {
+        return;
+    }
+    const auto interval = replication->GetConfig().GetConsistencySettings().GetGlobal().GetCommitIntervalMilliSeconds();
+    auto next = TRowVersion(WorkersByHeartbeat.begin()->first.Step / interval * interval, 0);
+    if (!AssignedTxIds.empty()) {
+        next = Min(next, TRowVersion(AssignedTxIds.begin()->first.Step - interval, 0));
+    }
+    if (!CanCommitIndexBuilds(next)) {
+        return;
+    }
+    auto& frontier = CommittedVersions[replication->GetId()];
+    if (next > frontier) {
+        frontier = next;
+        db.Table<Schema::Replications>().Key(replication->GetId()).Update(NIceDb::TUpdate<Schema::Replications::CommittedStep>(frontier.Step),
+            NIceDb::TUpdate<Schema::Replications::CommittedTxId>(frontier.TxId));
+    }
+}
+
+void TController::BroadcastWriteWindow(const TActorContext& ctx) {
+    if (!SysParams.HasGridAssignments()) {
+        return;
+    }
+    const auto window = GetWriteWindow();
+    const auto encoded = window.SerializeAsString();
+    if (encoded == LastBroadcastWriteWindow) {
+        return;
+    }
+    LastBroadcastWriteWindow = encoded;
+    for (const auto& [nodeId, _] : Sessions) {
+        auto reply = MakeHolder<TEvService::TEvTxIdResult>(TabletID(), Executor()->Generation());
+        *reply->Record.MutableWriteWindow() = window;
+        ctx.Send(MakeReplicationServiceId(nodeId), std::move(reply));
+    }
+}
 
 void TController::AllocateTxIds(const TActorContext& ctx) {
     const auto replication = GetSingle();

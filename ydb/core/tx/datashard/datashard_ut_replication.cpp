@@ -60,6 +60,91 @@ namespace {
 } // anonymous namespace
 
 Y_UNIT_TEST_SUITE(DataShardReplication) {
+    Y_UNIT_TEST_QUAD(GapAwareOffsetsSurviveReplay, Reboot, Split) {
+        TPortManager pm;
+        TServerSettings settings(pm.GetPort(2134));
+        settings.SetDomainName("Root").SetUseRealThreads(false);
+        Tests::TServer::TPtr server = new TServer(settings);
+        auto& runtime = *server->GetRuntime();
+        const auto sender = runtime.AllocateEdgeActor();
+        InitRoot(server, sender);
+        CreateShardedTable(server, sender, "/Root", "table-1", TShardedTableOptions().Replicated(true));
+        const auto tableId = ResolveTableId(server, sender, "/Root/table-1");
+        auto shard = GetTableShards(server, sender, "/Root/table-1").at(0);
+        const auto apply = [&](ui64 offset, ui32 value, ui64 floor) {
+            auto request = MakeApplyRequest(tableId, offset, 2, value);
+            request->Record.MutableChanges(0)->SetSourceOffsetFloor(floor);
+            runtime.SendToPipe(shard, sender, request.Release(), 0, GetPipeConfigWithRetries());
+            auto reply = runtime.GrabEdgeEventRethrow<TEvDataShard::TEvApplyReplicationChangesResult>(sender);
+            UNIT_ASSERT_VALUES_EQUAL(static_cast<ui32>(reply->Get()->Record.GetStatus()),
+                static_cast<ui32>(NKikimrTxDataShard::TEvApplyReplicationChangesResult::STATUS_OK));
+        };
+        apply(2, 20, 0);
+        if (Reboot) {
+            RebootTablet(runtime, shard, sender);
+        }
+        if (Split) {
+            SetSplitMergePartCountLimit(server->GetRuntime(), -1);
+            const auto txId = AsyncSplitTable(server, sender, "/Root/table-1", shard, 5);
+            WaitTxNotification(server, sender, txId);
+            shard = GetTableShards(server, sender, "/Root/table-1").at(0);
+        }
+        apply(1, 10, 0);   // Offset 2 must not hide the deferred offset 1.
+        UNIT_ASSERT_VALUES_EQUAL(ReadShardedTable(server, "/Root/table-1"), "key = 1, value = 10\n");
+        apply(2, 200, 0);   // Replayed completed records remain deduplicated.
+        UNIT_ASSERT_VALUES_EQUAL(ReadShardedTable(server, "/Root/table-1"), "key = 1, value = 10\n");
+        if (Split) {
+            const auto txId = AsyncMergeTable(server, sender, "/Root/table-1", GetTableShards(server, sender, "/Root/table-1"));
+            WaitTxNotification(server, sender, txId);
+            shard = GetTableShards(server, sender, "/Root/table-1").at(0);
+            apply(2, 200, 0);
+            UNIT_ASSERT_VALUES_EQUAL(ReadShardedTable(server, "/Root/table-1"), "key = 1, value = 10\n");
+        }
+        apply(3, 30, 3);   // Close the hole and retire individual offset entries.
+        apply(1, 100, 0);
+        UNIT_ASSERT_VALUES_EQUAL(ReadShardedTable(server, "/Root/table-1"), "key = 1, value = 30\n");
+    }
+
+    Y_UNIT_TEST(GapAwarePrefixSurvivesMergeFromAnotherKeyRange) {
+        TPortManager pm;
+        TServerSettings settings(pm.GetPort(2134));
+        settings.SetDomainName("Root").SetUseRealThreads(false);
+        Tests::TServer::TPtr server = new TServer(settings);
+        auto& runtime = *server->GetRuntime();
+        const auto sender = runtime.AllocateEdgeActor();
+        InitRoot(server, sender);
+        CreateShardedTable(server, sender, "/Root", "table-1", TShardedTableOptions().Replicated(true));
+        const auto tableId = ResolveTableId(server, sender, "/Root/table-1");
+        const auto apply = [&](ui64 shard, ui64 offset, ui32 key, ui32 value, ui64 floor) {
+            auto request = MakeApplyRequest(tableId, offset, 2, value);
+            auto* change = request->Record.MutableChanges(0);
+            change->SetSourceOffsetFloor(floor);
+            const auto cell = TCell::Make<ui32>(key);
+            change->SetKey(TSerializedCellVec::Serialize({ &cell, 1 }));
+            runtime.SendToPipe(shard, sender, request.Release(), 0, GetPipeConfigWithRetries());
+            const auto reply = runtime.GrabEdgeEventRethrow<TEvDataShard::TEvApplyReplicationChangesResult>(sender);
+            UNIT_ASSERT_VALUES_EQUAL(static_cast<ui32>(reply->Get()->Record.GetStatus()),
+                static_cast<ui32>(NKikimrTxDataShard::TEvApplyReplicationChangesResult::STATUS_OK));
+        };
+        const auto parent = GetTableShards(server, sender, "/Root/table-1").at(0);
+        apply(parent, 2, 1, 20, 0);
+        SetSplitMergePartCountLimit(&runtime, -1);
+        WaitTxNotification(server, sender, AsyncSplitTable(server, sender, "/Root/table-1", parent, 5));
+        const auto children = GetTableShards(server, sender, "/Root/table-1");
+        apply(children.at(0), 1, 1, 10, 0);
+        // The right child retires the copied entry for offset 2, although that
+        // row belongs to the left child. The merge must retain its prefix proof.
+        apply(children.at(1), 3, 5, 30, 3);
+        WaitTxNotification(server, sender, AsyncMergeTable(server, sender, "/Root/table-1", children));
+        const auto merged = GetTableShards(server, sender, "/Root/table-1").at(0);
+        for (ui32 round = 0; round < 2; ++round) {
+            apply(merged, 2, 1, 200, 0);
+            UNIT_ASSERT_VALUES_EQUAL(ReadShardedTable(server, "/Root/table-1"), "key = 1, value = 10\nkey = 5, value = 30\n");
+            if (!round) {
+                RebootTablet(runtime, merged, sender);
+            }
+        }
+    }
 
     Y_UNIT_TEST_TWIN(IncrementalRestoreConfigSurvivesSchemaAlter, WeakConsistency) {
         NKikimrSchemeOp::TTableDescription schema;

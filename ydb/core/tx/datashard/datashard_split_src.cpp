@@ -180,6 +180,13 @@ public:
             }
         }
 
+        if (!Self->CdcChecksumFences.empty()) {
+            // Drain the armed checkpoint and its suffix on the original
+            // producer before handing the table to its child shards.
+            Self->EmitHeartbeats();
+            return true;
+        }
+
         Self->SplitStarted = true;
 
         // We need to remove all locks that we won't be transferring to dst shards first,

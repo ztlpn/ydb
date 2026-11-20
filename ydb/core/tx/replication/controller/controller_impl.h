@@ -172,6 +172,11 @@ private:
     void Handle(TEvService::TEvRunWorker::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvService::TEvWorkerDataEnd::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvService::TEvGetTxId::TPtr& ev, const TActorContext& ctx);
+    void EnableGridAssignments(NIceDb::TNiceDb& db);
+    NKikimrReplication::TGlobalWriteWindow GetWriteWindow() const;
+    void AdvanceGridFrontier(NIceDb::TNiceDb& db);
+    void AdvanceChecksumBarriers(NIceDb::TNiceDb& db, TInstant now);
+    void BroadcastWriteWindow(const TActorContext& ctx);
     void Handle(TEvService::TEvHeartbeat::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvService::TEvIndexBuildProgress::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvService::TEvSchemaChangeReport::TPtr& ev, const TActorContext& ctx);
@@ -399,7 +404,9 @@ private:
     THashMap<std::pair<ui64, ui64>, TActorId> IndexReadyActors;
     bool IndexBuildTxInFlight = false;
     TMap<ui64, TRowVersion> CommittedVersions; // Completed global frontier per replication.
-    TMap<TRowVersion, ui64> AssignedTxIds; // tx ids assigned to version
+    TMap<TRowVersion, ui64> AssignedTxIds;   // tx ids assigned to exclusive upper bound
+    TSet<TRowVersion> LegacyTxIds;
+    TString LastBroadcastWriteWindow;
     TMap<TRowVersion, THashSet<ui32>> PendingTxId;
     bool AssignTxIdInFlight = false;
 

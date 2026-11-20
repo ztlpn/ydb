@@ -21,6 +21,7 @@ public:
 class TSysParams {
     enum class ESysParam: ui32 {
         NextReplicationId = 1,
+        GridAssignments = 2,
     };
 
 public:
@@ -31,8 +32,15 @@ public:
 
     ui64 AllocateReplicationId(NIceDb::TNiceDb& db);
 
+    bool HasGridAssignments() const {
+        return GridAssignments;
+    }
+
+    void EnableGridAssignments(NIceDb::TNiceDb& db);
+
 private:
     ui64 NextReplicationId;
+    bool GridAssignments = false;
 
 }; // TSysParams
 

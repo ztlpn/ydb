@@ -1,12 +1,14 @@
 #include "schemeshard__operation_alter_cdc_stream.h"
-
 #include "schemeshard__operation_common.h"
 #include "schemeshard__operation_part.h"
 #include "schemeshard_cdc_stream_common.h"
 
-#include <ydb/library/actors/core/log.h>
 #include <ydb/core/scheme/scheme_type_info.h>
+
+#include <ydb/library/actors/core/log.h>
 #include <ydb/public/api/protos/draft/ydb_replication.pb.h>
+
+#include <numeric>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::FLAT_TX_SCHEMESHARD
 
@@ -398,9 +400,9 @@ public:
         auto table = context.SS->Tables.at(path.Base()->PathId);
         auto checksum = request.GetChecksum();
         const auto now = context.Ctx.Now();
-        if (checksum.GetCheckpointId().empty() || checksum.GetProtocolVersion() != 1 ||
-            checksum.GetAlgorithm() != "CityHash64" || checksum.GetAlgorithmVersion() != 1 ||
-            TPathId::FromProto(checksum.GetTableId()) != path.Base()->PathId)
+        const bool supportedVersion = checksum.GetProtocolVersion() == 1 || (checksum.GetResult() && checksum.GetProtocolVersion() == 2);
+        if (checksum.GetCheckpointId().empty() || !supportedVersion || checksum.GetAlgorithm() != "CityHash64" ||
+            checksum.GetAlgorithmVersion() != 1 || TPathId::FromProto(checksum.GetTableId()) != path.Base()->PathId)
         {
             return reject(NKikimrScheme::StatusInvalidParameter, "Invalid checksum request");
         }
@@ -431,6 +433,9 @@ public:
                 return reject(NKikimrScheme::StatusInvalidParameter, "Invalid checksum deadline");
             }
             checksum.ClearStreams();
+            checksum.SetLastReservedBoundaryStep(
+                Max(table->CdcChecksum.GetLastReservedBoundaryStep(), table->CdcChecksum.GetCommitBoundaryStep()));
+            ui64 period = 0;
             for (const auto& [name, id] : path.Base()->GetChildren()) {
                 auto* streamPtr = context.SS->CdcStreams.FindPtr(id);
                 if (!streamPtr || context.SS->PathsById.at(id)->Dropped()) {
@@ -449,9 +454,27 @@ public:
                     return reject(NKikimrScheme::StatusPreconditionFailed,
                         "Every active user feed must be ready and use native JSON");
                 }
+                const auto interval = stream.ResolvedTimestamps.MilliSeconds();
+                if (interval) {
+                    const auto factor = interval / std::gcd(period, interval);
+                    if (period && period > Max<ui64>() / factor) {
+                        return reject(NKikimrScheme::StatusInvalidParameter, "CDC heartbeat grid overflows");
+                    }
+                    period = period ? period * factor : interval;
+                }
                 auto* selected = checksum.AddStreams();
                 id.ToProto(selected->MutablePathId());
                 selected->SetName(name);
+            }
+            if (period) {
+                const auto floor = Max(now.MilliSeconds(), checksum.GetLastReservedBoundaryStep());
+                if (floor / period >= Max<ui64>() / period) {
+                    return reject(NKikimrScheme::StatusInvalidParameter, "CDC checksum boundary overflows");
+                }
+                checksum.SetProtocolVersion(2);
+                checksum.SetAlignmentPeriodMs(period);
+                // This is the last reserved boundary until the plan step is known.
+                checksum.SetCommitBoundaryStep(checksum.GetLastReservedBoundaryStep());
             }
             if (checksum.StreamsSize() == 0) {
                 return reject(NKikimrScheme::StatusPreconditionFailed, "No eligible CDC feeds");

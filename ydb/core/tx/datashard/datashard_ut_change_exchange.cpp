@@ -6215,6 +6215,78 @@ Y_UNIT_TEST_SUITE(Cdc) {
         checkAwsRegion("/Root/Table/Stream2", "customRegion");
     }
 
+    Y_UNIT_TEST_TWIN(ChecksumFenceSurvivesHandoff, Split) {
+        TTestPqEnv env(SimpleTable(), WithResolvedTimestamps(TDuration::Seconds(3), Updates(NKikimrSchemeOp::ECdcStreamFormatJson)), false);
+        auto server = env.GetServer();
+        auto& runtime = *server->GetRuntime();
+        const auto sender = env.GetEdgeActor();
+        runtime.GetAppData().FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        ExecSQL(server, sender, "UPSERT INTO `/Root/Table` (key, value) VALUES (1, 10);");
+        const auto tableId = ResolveTableId(server, sender, "/Root/Table");
+        const auto shard = GetTableShards(server, sender, "/Root/Table").at(0);
+        auto request = MakeHolder<TEvTxUserProxy::TEvProposeTransaction>();
+        auto* scheme = request->Record.MutableTransaction()->MutableModifyScheme();
+        scheme->SetOperationType(NKikimrSchemeOp::ESchemeOpAlterCdcStream);
+        scheme->SetWorkingDir("/Root");
+        auto* alter = scheme->MutableAlterCdcStream();
+        alter->SetTableName("Table");
+        auto* checksum = alter->MutableChecksum();
+        checksum->SetCheckpointId("handoff-check");
+        tableId.PathId.ToProto(checksum->MutableTableId());
+        checksum->SetTableSchemaVersion(tableId.SchemaVersion);
+        checksum->SetSchema("source-schema");
+        checksum->SetDeadlineUs((runtime.GetCurrentTime() + TDuration::Hours(1)).MicroSeconds());
+        runtime.Send(new IEventHandle(MakeTxProxyID(), sender, request.Release()));
+        const auto accepted = runtime.GrabEdgeEventRethrow<TEvTxUserProxy::TEvProposeTransactionStatus>(sender);
+        UNIT_ASSERT_VALUES_EQUAL_C(accepted->Get()->Record.GetStatus(), TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::ExecInProgress,
+            accepted->Get()->Record.DebugString());
+        WaitTxNotification(server, sender, accepted->Get()->Record.GetTxId());
+        auto* source = dynamic_cast<TDataShard*>(runtime.FindActor(ResolveTablet(runtime, shard)));
+        UNIT_ASSERT(source);
+        TRowVersion snapshot = TRowVersion::Min();
+        for (const auto& [key, retained] : source->GetSnapshotManager().GetSnapshots()) {
+            if (retained.Name == "handoff-check") {
+                snapshot = TRowVersion(key.Step, key.TxId);
+                UNIT_ASSERT(retained.HasFlags(TSnapshot::FlagMvccRetention));
+            }
+        }
+        UNIT_ASSERT(snapshot);
+        UNIT_ASSERT_VALUES_EQUAL(snapshot.TxId, Max<ui64>());
+        UNIT_ASSERT(source->GetSnapshotManager().GetMinWriteVersion() < snapshot);
+        if (Split) {
+            SetSplitMergePartCountLimit(&runtime, -1);
+            WaitTxNotification(server, sender, AsyncSplitTable(server, sender, "/Root/Table", shard, 2));
+        } else {
+            RebootTablet(runtime, shard, sender);
+        }
+        runtime.SimulateSleep(TDuration::Seconds(5));
+        ExecSQL(server, sender, "UPSERT INTO `/Root/Table` (key, value) VALUES (2, 20);");
+        for (ui32 attempt = 0; attempt < 30; ++attempt) {
+            ui32 checkpoints = 0;
+            ui32 rows = 0;
+            for (const auto& [_, body] : GetRecords(runtime, sender, "/Root/Table/Stream", 0)) {
+                NJson::TJsonValue json;
+                UNIT_ASSERT(NJson::ReadJsonTree(body, &json));
+                if (json.Has("checksum_checkpoint")) {
+                    ++checkpoints;
+                    const auto& control = json["checksum_checkpoint"];
+                    UNIT_ASSERT_VALUES_EQUAL(control["id"].GetStringSafe(), "handoff-check");
+                    UNIT_ASSERT_VALUES_EQUAL(control["snapshot"][0].GetUIntegerSafe(), snapshot.Step);
+                    UNIT_ASSERT_VALUES_EQUAL(control["commit_boundary"].GetUIntegerSafe(), snapshot.Step + 1);
+                } else if (json.Has("key")) {
+                    ++rows;
+                    UNIT_ASSERT_VALUES_EQUAL(checkpoints, json["key"][0].GetUIntegerSafe() == 1 ? 0 : 1);
+                }
+            }
+            if (rows == 2) {
+                UNIT_ASSERT_VALUES_EQUAL(checkpoints, 1);
+                return;
+            }
+            runtime.SimulateSleep(TDuration::Seconds(1));
+        }
+        UNIT_FAIL("Checkpoint and suffix did not survive source handoff");
+    }
+
     Y_UNIT_TEST(ResolvedTimestamps) {
         TPortManager portManager;
         TServer::TPtr server = new TServer(TServerSettings(portManager.GetPort(2134), {}, DefaultPQConfig())

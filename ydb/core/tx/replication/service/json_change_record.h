@@ -41,6 +41,10 @@ public:
     void Accept(NChangeExchange::IVisitor& visitor) const override;
     void RewriteTxId(ui64 value) override;
 
+    void RewriteSourceOffsetFloor(ui64 value) override {
+        SourceOffsetFloor = value;
+    }
+
     // Parses the complete snapshot in a CDC schema record. Unlike the row-data
     // parser this is fallible: malformed control records must put replication
     // into an error state, never terminate an actor process.
@@ -52,6 +56,7 @@ private:
     TString JsonError;
     TLightweightSchema::TCPtr Schema;
     ui64 WriteTxId = 0;
+    TMaybe<ui64> SourceOffsetFloor;
 
     mutable TMaybe<TOwnedCellVec> Key;
 

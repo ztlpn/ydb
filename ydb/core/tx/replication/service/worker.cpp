@@ -257,6 +257,10 @@ class TWorker: public TActorBootstrapped<TWorker> {
     }
 
     void PollSource(bool skipCommit = false) {
+        if (PausedForWriteWindow || PendingDataEnd || PendingBuildProgress) {
+            return;
+        }
+        skipCommit |= bool(GridWindow);
         if (TrackSourceOffsets) {
             if (!Reader || !IsReaderValidated() || ReadRequested || InFlightData || TerminateWriter || PendingSchemaChange) {
                 return;
@@ -348,6 +352,11 @@ class TWorker: public TActorBootstrapped<TWorker> {
 
             Writer.Registered();
             Writer.ResetCreateAttempt();
+            if (GridWindow) {
+                auto window = MakeHolder<TEvService::TEvTxIdResult>();
+                *window->Record.MutableWriteWindow() = *GridWindow;
+                Send(Writer, std::move(window));
+            }
             if (LastBuildProgress) {
                 auto progress = MakeHolder<TEvService::TEvIndexBuildProgressResult>();
                 progress->Record.MutableProgress()->CopyFrom(*LastBuildProgress);
@@ -359,6 +368,7 @@ class TWorker: public TActorBootstrapped<TWorker> {
             } else if (TerminateWriter) {
                 Send(Writer, new TEvWorker::TEvTerminateWriter(TerminateWriter->PartitionId));
             }
+            SendDataEndToWriter();
         } else {
             YDB_LOG_WARN("Handshake from unknown actor",
                 {"sender", ev->Sender});
@@ -367,10 +377,11 @@ class TWorker: public TActorBootstrapped<TWorker> {
     }
 
     void Handle(TEvService::TEvIndexBuildProgress::TPtr& ev) {
-        if (ev->Sender != Writer || !InFlightData) {
+        if (ev->Sender != Writer || (!InFlightData && !PendingDataEnd)) {
             return;
         }
 
+        BuildScanAhead = ev->Get()->Record.GetScanAhead();
         PendingBuildProgress = MakeHolder<NKikimrReplication::TIndexBuildProgress>(ev->Get()->Record.GetProgress());
         Forward(ev);
     }
@@ -389,8 +400,8 @@ class TWorker: public TActorBootstrapped<TWorker> {
     }
 
     void Handle(TEvService::TEvIndexBuildProgressResult::TPtr& ev) {
-        if (!PendingBuildProgress || !InFlightData
-            || ev->Get()->Record.GetProgress().SerializeAsString() != PendingBuildProgress->SerializeAsString())
+        if (!PendingBuildProgress || (!InFlightData && !PendingDataEnd && !GridWindow) ||
+            ev->Get()->Record.GetProgress().SerializeAsString() != PendingBuildProgress->SerializeAsString())
         {
             return;
         }
@@ -400,6 +411,28 @@ class TWorker: public TActorBootstrapped<TWorker> {
         const auto offset = LastBuildProgress->GetOffset();
         AdvanceCompletedSourceOffset(offset);
         UpdateLag();
+        if (!InFlightData) {
+            if (DeferredReplayOffset) {
+                ReplaySource();
+            } else {
+                ForwardDataEnd();
+                if (Reader) {
+                    PollSource(true);
+                }
+            }
+            return;
+        }
+        if (BuildScanAhead) {
+            InFlightData.Reset();
+            TerminateWriter.Reset();
+            BatchEnd.Clear();
+            if (DeferredReplayOffset) {
+                ReplaySource();
+            } else {
+                PollSource(true);
+            }
+            return;
+        }
         auto& records = InFlightData->Records;
         const auto firstNew = FindIf(records, [offset](const auto& record) { return record.GetOffset() >= offset; });
         records.erase(records.begin(), firstNew);
@@ -408,6 +441,7 @@ class TWorker: public TActorBootstrapped<TWorker> {
         } else {
             InFlightData.Reset();
             TerminateWriter.Reset();
+            ForwardDataEnd();
             if (Reader) {
                 PollSource();
             }
@@ -431,14 +465,54 @@ class TWorker: public TActorBootstrapped<TWorker> {
         // the writer must never drop that retained suffix.
         Y_ABORT_UNLESS(!PendingSchemaChange);
 
-        if (BatchEnd && !ev->Get()->SkipCommit) {
-            AdvanceCompletedSourceOffset(*BatchEnd);
+        if (BatchEnd) {
+            if (GridWindow) {
+                // Looking ahead must never acknowledge a hole in the source
+                // prefix. Deferred messages remain durable in the CDC topic.
+                const auto offset = Min(*BatchEnd, ev->Get()->CommitOffset.GetOrElse(*BatchEnd));
+                AdvanceCompletedSourceOffset(offset);
+                if (!TrackSourceOffsets) {
+                    CommitSource(offset);
+                }
+            } else if (!ev->Get()->SkipCommit) {
+                AdvanceCompletedSourceOffset(*BatchEnd);
+            }
         }
         InFlightData.Reset();
         TerminateWriter.Reset();
-        if (Reader) {
+        PausedForWriteWindow = ev->Get()->StopPolling;
+        ForwardDataEnd();
+        if (DeferredReplayOffset) {
+            ReplaySource();
+        } else if (Reader) {
             PollSource(ev->Get()->SkipCommit);
         }
+    }
+
+    void Handle(TEvWorker::TEvReplay::TPtr& ev) {
+        if (ev->Sender != Writer) {
+            return;
+        }
+        DeferredReplayOffset = Min(DeferredReplayOffset.GetOrElse(Max<ui64>()), ev->Get()->Offset);
+        if (!InFlightData && !PendingSchemaChange && !PendingBuildProgress) {
+            ReplaySource();
+        }
+    }
+
+    void ReplaySource() {
+        Y_ENSURE(!InFlightData && !PendingSchemaChange && DeferredReplayOffset);
+        PendingDataEnd.Reset();
+        DataEndDrained = false;
+        TerminateWriter.Reset();
+        ReaderReplayBoundary = DeferredReplayOffset;
+        DeferredReplayOffset.Clear();
+        PausedForWriteWindow = false;
+        ReadRequested = false;
+        ReaderSessionStarted = false;
+        BatchEnd.Clear();
+        Send(Writer, new TEvWorker::TEvReplayStarted());
+        Send(Reader, new TEvents::TEvPoison());
+        Reader.Register(this);
     }
 
     void Handle(TEvWorker::TEvCommit::TPtr& ev) {
@@ -764,6 +838,7 @@ class TWorker: public TActorBootstrapped<TWorker> {
 
         if (records.empty()) {
             InFlightData.Reset();
+            ForwardDataEnd();
             PollSource();
         } else {
             Send(Writer, new TEvWorker::TEvData(InFlightData->PartitionId, InFlightData->Source, InFlightData->Records));
@@ -845,6 +920,34 @@ class TWorker: public TActorBootstrapped<TWorker> {
         CommitPendingSourceOffset();
     }
 
+    void ForwardDataEnd() {
+        if (PendingDataEnd && DataEndDrained && !InFlightData && !PendingSchemaChange && !PendingBuildProgress) {
+            Send(Parent, PendingDataEnd.Release());
+        }
+    }
+
+    void SendDataEndToWriter() {
+        if (PendingDataEnd && Writer) {
+            Send(Writer, new TEvWorker::TEvDataEnd(PendingDataEnd->PartitionId, TVector<ui64>(PendingDataEnd->AdjacentPartitionsIds),
+                             TVector<ui64>(PendingDataEnd->ChildPartitionsIds)));
+        }
+    }
+
+    void Handle(TEvWorker::TEvDataEnd::TPtr& ev) {
+        if (ev->Sender == Reader) {
+            if (!DrainDataEnd && !GridWindow) {
+                Forward(ev);
+                return;
+            }
+            PendingDataEnd.Reset(ev->Release().Release());
+            DataEndDrained = false;
+            SendDataEndToWriter();
+        } else if (ev->Sender == Writer && PendingDataEnd) {
+            DataEndDrained = true;
+            ForwardDataEnd();
+        }
+    }
+
     void Handle(TEvWorker::TEvTerminateWriter::TPtr& ev) {
         YDB_LOG_DEBUG("Handle",
             {"ev", ev->Get()->ToString()});
@@ -889,7 +992,18 @@ class TWorker: public TActorBootstrapped<TWorker> {
                 SchemaApplied = false;
                 WriterHasSchemaBarrier = false;
             }
+            const bool replay = GridWindow && !PendingSchemaChange && ev->Get()->Status == TEvWorker::TEvGone::UNAVAILABLE &&
+                                Writer.GetCreateAttempt() < MaxAttempts;
             MaybeRecreateActor(ev, Writer);
+            if (replay) {
+                // A replacement writer has lost its deferred-version minimum.
+                // Rebuild the pass from the durable source prefix, not the last
+                // in-memory batch, before reporting any more progress.
+                InFlightData.Reset();
+                TerminateWriter.Reset();
+                DeferredReplayOffset = ReaderCommittedOffset.GetOrElse(0);
+                ReplaySource();
+            }
         } else {
             YDB_LOG_WARN("Unknown actor has gone",
                 {"sender", ev->Sender});
@@ -940,6 +1054,14 @@ class TWorker: public TActorBootstrapped<TWorker> {
     void Handle(TEvService::TEvTxIdResult::TPtr& ev) {
         YDB_LOG_DEBUG("Handle",
             {"ev", ev->Get()->ToString()});
+        if (ev->Get()->Record.HasWriteWindow()) {
+            const auto& window = ev->Get()->Record.GetWriteWindow();
+            if (GridWindow && TRowVersion::FromProto(window.GetBegin()) < TRowVersion::FromProto(GridWindow->GetBegin())) {
+                // An old window can still carry a needed index assignment.
+                *ev->Get()->Record.MutableWriteWindow() = *GridWindow;
+            }
+            GridWindow = window;
+        }
         Send(ev->Forward(Writer));
     }
 
@@ -1042,14 +1164,12 @@ public:
         return NKikimrServices::TActivity::REPLICATION_WORKER;
     }
 
-    explicit TWorker(
-            const TActorId& parent,
-            std::function<IActor*(void)>&& createReaderFn,
-            std::function<IActor*(void)>&& createWriterFn,
-            bool trackSourceOffsets, TMaybe<ui64> processedSourceOffset)
+    explicit TWorker(const TActorId& parent, std::function<IActor*(void)>&& createReaderFn, std::function<IActor*(void)>&& createWriterFn,
+        bool trackSourceOffsets, TMaybe<ui64> processedSourceOffset, bool drainDataEnd)
         : Parent(parent)
         , Reader(std::move(createReaderFn))
         , Writer(std::move(createWriterFn))
+        , DrainDataEnd(drainDataEnd)
         , TrackSourceOffsets(trackSourceOffsets)
         , PersistedSourceOffset(processedSourceOffset)
         , Lag(TDuration::Zero())
@@ -1079,13 +1199,14 @@ public:
             hFunc(TEvWorker::TEvHandshake, Handle);
             hFunc(TEvService::TEvSourceOffsetResult, Handle);
             hFunc(TEvWorker::TEvPoll, Handle);
+            hFunc(TEvWorker::TEvReplay, Handle);
             hFunc(TEvWorker::TEvCommit, Handle);
             hFunc(TEvWorker::TEvCommitResult, Handle);
             hFunc(TEvWorker::TEvReaderStarted, Handle);
             hFunc(TEvWorker::TEvSchemaChange, Handle);
             hFunc(TEvWorker::TEvSchemaChangeApplied, Handle);
             hFunc(TEvWorker::TEvData, Handle);
-            hFunc(TEvWorker::TEvDataEnd, Forward);
+            hFunc(TEvWorker::TEvDataEnd, Handle);
             hFunc(TEvWorker::TEvGone, Handle);
             hFunc(TEvWorker::TEvTerminateWriter, Handle);
             hFunc(TEvWorker::TEvStatus, Handle);
@@ -1130,6 +1251,13 @@ private:
     bool RecoveredCompletionReported = false;
     TMaybe<ui64> ReaderCommittedOffset;
     TMaybe<ui64> ReaderReplayBoundary;
+    TMaybe<ui64> DeferredReplayOffset;
+    std::optional<NKikimrReplication::TGlobalWriteWindow> GridWindow;
+    bool PausedForWriteWindow = false;
+    bool BuildScanAhead = false;
+    THolder<TEvWorker::TEvDataEnd> PendingDataEnd;
+    bool DataEndDrained = false;
+    const bool DrainDataEnd;
     TMaybe<ui64> PendingWriterCheckpoint;
     bool ReaderSessionStarted = false;
     const bool TrackSourceOffsets;
@@ -1147,13 +1275,9 @@ private:
     TInstant StartTime = TInstant::Zero();
 };
 
-IActor* CreateWorker(
-        const TActorId& parent,
-        std::function<IActor*(void)>&& createReaderFn,
-        std::function<IActor*(void)>&& createWriterFn,
-        bool trackSourceOffsets, TMaybe<ui64> processedSourceOffset)
+IActor* CreateWorker(const TActorId& parent, std::function<IActor*(void)>&& createReaderFn, std::function<IActor*(void)>&& createWriterFn,
+    bool trackSourceOffsets, TMaybe<ui64> processedSourceOffset, bool drainDataEnd)
 {
-    return new TWorker(parent, std::move(createReaderFn), std::move(createWriterFn), trackSourceOffsets, processedSourceOffset);
+    return new TWorker(parent, std::move(createReaderFn), std::move(createWriterFn), trackSourceOffsets, processedSourceOffset, drainDataEnd);
 }
-
 }

@@ -232,6 +232,8 @@ void TController::Reset() {
     UpdateLagCounters();
     UnresolvedDatabaseReplications.clear();
     AssignedTxIds.clear();
+    LegacyTxIds.clear();
+    LastBroadcastWriteWindow.clear();
     CommittedVersions.clear();
     Workers.clear();
     LagExpiryQueue.Clear();

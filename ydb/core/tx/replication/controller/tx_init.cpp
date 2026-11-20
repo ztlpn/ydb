@@ -217,6 +217,9 @@ class TController::TTxInit: public TTxBase {
                 rowset.GetValue<Schema::TxIds::VersionTxId>()
             );
 
+            if (!rowset.GetValueOrDefault<Schema::TxIds::GridInterval>(false)) {
+                Self->LegacyTxIds.insert(version);
+            }
             auto res = Self->AssignedTxIds.emplace(version, txId);
             Y_VERIFY_S(res.second, "Duplicate version: " << version);
 

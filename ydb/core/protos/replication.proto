@@ -390,6 +390,7 @@ message TEvIndexBuildProgress {
     optional TControllerIdentity Controller = 1;
     optional TWorkerIdentity Worker = 2;
     optional TIndexBuildProgress Progress = 3;
+    optional bool ScanAhead = 4;
 }
 
 message TLocalTableWriterSettings {
@@ -509,6 +510,15 @@ message TEvGetTxId {
     optional TWorkerIdentity Worker = 2;
 }
 
+// The source-version window currently admitted for GLOBAL writes. Older data
+// has already committed; later data must remain replayable in the source topic.
+message TGlobalWriteWindow {
+    optional NKikimrProto.TRowVersion Begin = 1;
+    optional NKikimrProto.TRowVersion End = 2;
+    optional bool Legacy = 3 [default = false];
+    optional NKikimrProto.TRowVersion IndexJoin = 4;
+}
+
 message TEvTxIdResult {
     message TVersionTxId {
         optional NKikimrProto.TRowVersion Version = 1;
@@ -519,6 +529,7 @@ message TEvTxIdResult {
     optional TControllerIdentity Controller = 1;
     repeated TVersionTxId VersionTxIds = 2;
     optional TWorkerIdentity Worker = 3;
+    optional TGlobalWriteWindow WriteWindow = 4;
 }
 
 message TEvHeartbeat {

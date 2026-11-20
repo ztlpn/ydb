@@ -54,6 +54,10 @@ public:
 
     virtual void RewriteTxId(ui64 value) = 0;
 
+    virtual void RewriteSourceOffsetFloor(ui64) {
+        Y_ABORT("unsupported replay record");
+    }
+
     virtual TString ToString() const = 0;
     virtual void Out(IOutputStream& out) const = 0;
 

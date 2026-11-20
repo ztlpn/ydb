@@ -565,7 +565,7 @@ Y_UNIT_TEST_SUITE(JsonChangeRecord) {
         UNIT_ASSERT_VALUES_EQUAL(record->GetTxId(), 20);
     }
 
-    Y_UNIT_TEST(ChecksumControlRoundTrip) {
+    Y_UNIT_TEST_TWIN(ChecksumControlRoundTrip, Grid) {
         NKikimrChangeExchange::TCdcChecksum control;
         control.SetProtocolVersion(1);
         control.SetCheckpointId("checkpoint-1");
@@ -573,6 +573,11 @@ Y_UNIT_TEST_SUITE(JsonChangeRecord) {
         control.MutableTableId()->SetLocalId(17);
         control.SetSnapshotStep(100);
         control.SetSnapshotTxId(20);
+        if (Grid) {
+            control.SetProtocolVersion(2);
+            control.SetCommitBoundaryStep(101);
+            control.SetSnapshotTxId(Max<ui64>());
+        }
         control.SetSchema("3:key8:Uint64:0");
         control.SetAlgorithm("CityHash64");
         control.SetAlgorithmVersion(1);
@@ -588,7 +593,7 @@ Y_UNIT_TEST_SUITE(JsonChangeRecord) {
             UNIT_ASSERT_VALUES_EQUAL(record->GetKind(), result
                 ? TChangeRecord::EKind::CdcChecksumResult : TChangeRecord::EKind::CdcChecksumCheckpoint);
             UNIT_ASSERT_VALUES_EQUAL(record->GetStep(), 100);
-            UNIT_ASSERT_VALUES_EQUAL(record->GetTxId(), 20);
+            UNIT_ASSERT_VALUES_EQUAL(record->GetTxId(), Grid ? Max<ui64>() : 20);
             NKikimrReplication::TSchemaChange parsed;
             TString error;
             UNIT_ASSERT_C(record->TryGetSchemaChange(parsed, error), error);

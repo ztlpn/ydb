@@ -307,6 +307,109 @@ Y_UNIT_TEST_SUITE(LocalTableWriter) {
         UNIT_ASSERT_STRINGS_EQUAL(StripInPlace(shared), "key = 1, value = local\nkey = 2, value = global");
     }
 
+    Y_UNIT_TEST_TWIN(IndexGridReplayKeepsHeartbeat, Reboot) {
+        TEnv env;
+        CreateIndexBuildTable(env);
+        NKikimrReplication::TLocalTableWriterSettings settings;
+        settings.SetIndexBuild(true);
+        settings.MutableIndexBuildProgress()->SetSwitchOffset(1);
+        settings.MutableIndexBuildProgress()->SetOffset(1);
+        auto writer = StartIndexBuildWriter(env, settings);
+        const auto window = [](ui64 begin, ui64 end) {
+            auto result = MakeHolder<TEvService::TEvTxIdResult>();
+            TRowVersion(begin, 0).ToProto(result->Record.MutableWriteWindow()->MutableBegin());
+            TRowVersion(end, 0).ToProto(result->Record.MutableWriteWindow()->MutableEnd());
+            TRowVersion::Min().ToProto(result->Record.MutableWriteWindow()->MutableIndexJoin());
+            return result;
+        };
+        env.SendAsync(writer, window(0, 50));
+        const auto progress = env.Send<TEvService::TEvIndexBuildProgress>(
+            writer, new TEvWorker::TEvData(0, "TestSource",
+                        {
+                            TRecord(1, R"({"key":[1],"update":{"value":"deferred"},"ts":[61,0]})"), TRecord(2, R"({"resolved":[100,0]})"),
+                        }));
+        UNIT_ASSERT(progress->Get()->Record.GetScanAhead());
+        UNIT_ASSERT_VALUES_EQUAL(progress->Get()->Record.GetProgress().GetOffset(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(TRowVersion::FromProto(progress->Get()->Record.GetProgress().GetHeartbeat()), TRowVersion(61, 0));
+        if (Reboot) {
+            env.SendAsync(writer, new TEvents::TEvPoison());
+            *settings.MutableIndexBuildProgress() = progress->Get()->Record.GetProgress();
+            writer = StartIndexBuildWriter(env, settings);
+            env.SendAsync(writer, window(60, 110));
+        } else {
+            auto ack = MakeHolder<TEvService::TEvIndexBuildProgressResult>();
+            *ack->Record.MutableProgress() = progress->Get()->Record.GetProgress();
+            env.SendAsync(writer, std::move(ack));
+            env.Send<TEvWorker::TEvReplay>(writer, window(60, 110));
+            env.SendAsync(writer, new TEvWorker::TEvReplayStarted());
+        }
+        // Replaying the deferred row can finish a batch before its heartbeat.
+        env.Send<TEvService::TEvGetTxId>(writer, new TEvWorker::TEvData(0, "TestSource",
+                                                     {
+                                                         TRecord(1, R"({"key":[1],"update":{"value":"deferred"},"ts":[61,0]})"),
+                                                     }));
+        // Its window is stale, but the assignment is still needed.
+        auto assigned = window(0, 50);
+        auto* id = assigned->Record.AddVersionTxIds();
+        TRowVersion(60, 0).ToProto(id->MutableBegin());
+        TRowVersion(70, 0).ToProto(id->MutableVersion());
+        id->SetTxId(123);
+        const auto replayed = env.Send<TEvService::TEvIndexBuildProgress>(writer, std::move(assigned));
+        UNIT_ASSERT_VALUES_EQUAL(replayed->Get()->Record.GetProgress().GetOffset(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(TRowVersion::FromProto(replayed->Get()->Record.GetProgress().GetHeartbeat()), TRowVersion(61, 0));
+        CommitWrites(env.GetRuntime(), { "/Root/Table" }, 123);
+        auto content = ReadShardedTable(env.GetRuntime(), "/Root/Table");
+        UNIT_ASSERT_STRINGS_EQUAL(StripInPlace(content), "key = 1, value = deferred");
+    }
+
+    Y_UNIT_TEST_TWIN(GridScansPastDeferredChecksumResult, WindowBeforeData) {
+        TEnv env;
+        CreateIndexBuildTable(env);
+        const auto writer = env.GetRuntime().Register(CreateLocalTableWriter("/Root", env.GetPathId("/Root/Table"), EWriteMode::Consistent));
+        env.Send<TEvWorker::TEvHandshake>(writer, new TEvWorker::TEvHandshake());
+        const auto window = [](ui64 begin, ui64 end) {
+            auto result = MakeHolder<TEvService::TEvTxIdResult>();
+            TRowVersion(begin, 0).ToProto(result->Record.MutableWriteWindow()->MutableBegin());
+            TRowVersion(end, 0).ToProto(result->Record.MutableWriteWindow()->MutableEnd());
+            return result;
+        };
+        const auto data = [] {
+            return new TEvWorker::TEvData(0, "TestSource",
+                {
+                    TRecord(1, R"({"key":[1],"update":{"value":"deferred"},"ts":[61,0]})"),
+                    TRecord(2, R"({"checksum_result":{"version":2,"id":"earlier-check","table":[42,17],
+                    "snapshot":[19,18446744073709551615],"commit_boundary":20,"schema":"",
+                    "algorithm":"CityHash64","algorithm_version":1,"status":400000,
+                    "row_count":0,"hash":"0000000000000000"}})"), TRecord(3, R"({"resolved":[100,0]})"),
+                });
+        };
+        if (WindowBeforeData) {
+            env.SendAsync(writer, window(0, 50));
+        } else {
+            env.Send<TEvService::TEvGetTxId>(writer, data());
+            env.Send<TEvWorker::TEvReplay>(writer, window(0, 50));
+            env.GetRuntime().GrabEdgeEvent<TEvWorker::TEvPoll>(env.GetSender());
+            env.SendAsync(writer, new TEvWorker::TEvReplayStarted());
+        }
+        const auto heartbeat = env.Send<TEvService::TEvHeartbeat>(writer, data());
+        UNIT_ASSERT_VALUES_EQUAL(TRowVersion::FromProto(heartbeat->Get()->Record.GetVersion()), TRowVersion(61, 0));
+        const auto poll = env.GetRuntime().GrabEdgeEvent<TEvWorker::TEvPoll>(env.GetSender());
+        UNIT_ASSERT_VALUES_EQUAL(poll->Get()->CommitOffset.GetOrElse(0), 1);
+        UNIT_ASSERT(!poll->Get()->StopPolling);
+        env.Send<TEvWorker::TEvReplay>(writer, window(60, 110));
+        env.SendAsync(writer, new TEvWorker::TEvReplayStarted());
+        env.Send<TEvService::TEvGetTxId>(writer, data());
+        auto assignment = window(60, 110);
+        auto* id = assignment->Record.AddVersionTxIds();
+        TRowVersion(60, 0).ToProto(id->MutableBegin());
+        TRowVersion(70, 0).ToProto(id->MutableVersion());
+        id->SetTxId(123);
+        const auto result = env.Send<TEvWorker::TEvSchemaChange>(writer, std::move(assignment));
+        UNIT_ASSERT_VALUES_EQUAL(result->Get()->Offset, 2);
+        // The result is processed normally after the deferred prefix drains.
+        UNIT_ASSERT(result->Get()->Schema.HasChecksum());
+    }
+
     Y_UNIT_TEST(ConsistentWrite) {
         TEnv env;
         env.GetRuntime().SetLogPriority(NKikimrServices::REPLICATION_SERVICE, NLog::PRI_DEBUG);
@@ -530,6 +633,75 @@ Y_UNIT_TEST_SUITE(LocalTableWriter) {
             {TRowVersion(10, 0), 1},
         }));
         env.GetRuntime().GrabEdgeEvent<TEvWorker::TEvPoll>(env.GetSender());
+    }
+
+    Y_UNIT_TEST(GridReplayPreservesOffsetsAndAssignmentBounds) {
+        TEnv env;
+        env.GetRuntime().SetLogPriority(NKikimrServices::REPLICATION_SERVICE, NLog::PRI_DEBUG);
+
+        env.CreateTable("/Root", *MakeTableDescription(TTestTableDescription{
+            .Name = "Table",
+            .KeyColumns = {"key"},
+            .Columns = {
+                {.Name = "key", .Type = "Uint32"},
+                {.Name = "value", .Type = "Utf8"},
+            },
+            .ReplicationConfig = TTestTableDescription::TReplicationConfig{
+                .Mode = TTestTableDescription::TReplicationConfig::MODE_READ_ONLY,
+                .ConsistencyLevel = TTestTableDescription::TReplicationConfig::CONSISTENCY_LEVEL_GLOBAL,
+            },
+        }));
+
+        auto writer = env.GetRuntime().Register(CreateLocalTableWriter("/Root", env.GetPathId("/Root/Table"), EWriteMode::Consistent));
+        env.Send<TEvWorker::TEvHandshake>(writer, new TEvWorker::TEvHandshake());
+
+        const auto reply = [](ui64 begin, ui64 end, const TMap<TRowVersion, ui64>& ids) {
+            auto result = MakeTxIdResult(ids);
+            TRowVersion(begin, 0).ToProto(result->Record.MutableWriteWindow()->MutableBegin());
+            TRowVersion(end, 0).ToProto(result->Record.MutableWriteWindow()->MutableEnd());
+            for (auto& item : *result->Record.MutableVersionTxIds()) {
+                TRowVersion(item.GetVersion().GetStep() - 10, 0).ToProto(item.MutableBegin());
+            }
+            return result;
+        };
+        const auto data = [] {
+            return new TEvWorker::TEvData(0, "TestSource",
+                {
+                    TRecord(1, R"({"key":[1], "update":{"value":"late-1"}, "ts":[61,0]})"),
+                    TRecord(2, R"({"key":[2], "update":{"value":"early-2"}, "ts":[11,0]})"),
+                    TRecord(3, R"({"key":[3], "update":{"value":"early-3"}, "ts":[1,0]})"),
+                    TRecord(4, R"({"key":[4], "update":{"value":"late-4"}, "ts":[71,0]})"), TRecord(5, R"({"resolved":[100,0]})"),
+                });
+        };
+        env.SendAsync(writer, reply(0, 50, {}));
+        const auto ids = env.Send<TEvService::TEvGetTxId>(writer, data());
+        UNIT_ASSERT_VALUES_EQUAL(ids->Get()->Record.VersionsSize(), 2);
+        // [10,20) must not cover the missing [0,10) interval.
+        env.SendAsync(writer, reply(0, 50, { { TRowVersion(20, 0), 2 } }));
+        auto heartbeat = env.Send<TEvService::TEvHeartbeat>(writer, reply(0, 50, { { TRowVersion(10, 0), 1 } }));
+        UNIT_ASSERT_VALUES_EQUAL(TRowVersion::FromProto(heartbeat->Get()->Record.GetVersion()), TRowVersion(61, 0));
+        const auto poll = env.GetRuntime().GrabEdgeEvent<TEvWorker::TEvPoll>(env.GetSender());
+        UNIT_ASSERT(poll->Get()->CommitOffset);
+        UNIT_ASSERT_VALUES_EQUAL(*poll->Get()->CommitOffset, 1);
+        env.Send<TEvService::TEvHeartbeat>(writer, new TEvWorker::TEvDataEnd(0, {}, {}));
+        CommitWrites(env.GetRuntime(), { "/Root/Table" }, 1);
+        CommitWrites(env.GetRuntime(), { "/Root/Table" }, 2);
+        auto content = ReadShardedTable(env.GetRuntime(), "/Root/Table");
+        UNIT_ASSERT_STRINGS_EQUAL(StripInPlace(content), "key = 2, value = early-2\nkey = 3, value = early-3");
+
+        const auto replay = env.Send<TEvWorker::TEvReplay>(writer, reply(60, 110, {}));
+        UNIT_ASSERT_VALUES_EQUAL(replay->Get()->Offset, 1);
+        env.SendAsync(writer, new TEvWorker::TEvReplayStarted());
+        env.Send<TEvService::TEvGetTxId>(writer, data());
+        heartbeat = env.Send<TEvService::TEvHeartbeat>(writer, reply(60, 110, { { TRowVersion(70, 0), 3 }, { TRowVersion(80, 0), 4 } }));
+        UNIT_ASSERT_VALUES_EQUAL(TRowVersion::FromProto(heartbeat->Get()->Record.GetVersion()), TRowVersion(100, 0));
+        env.GetRuntime().GrabEdgeEvent<TEvWorker::TEvPoll>(env.GetSender());
+        env.Send<TEvWorker::TEvDataEnd>(writer, new TEvWorker::TEvDataEnd(0, {}, {}));
+        CommitWrites(env.GetRuntime(), { "/Root/Table" }, 3);
+        CommitWrites(env.GetRuntime(), { "/Root/Table" }, 4);
+        content = ReadShardedTable(env.GetRuntime(), "/Root/Table");
+        UNIT_ASSERT_STRINGS_EQUAL(
+            StripInPlace(content), "key = 1, value = late-1\nkey = 2, value = early-2\nkey = 3, value = early-3\nkey = 4, value = late-4");
     }
 
     Y_UNIT_TEST(ApplyInCorrectOrder) {

@@ -2759,6 +2759,10 @@ message TEvApplyReplicationChanges {
         // Offset of the change within a particular source
         optional int64 SourceOffset = 1;
 
+        // Gap-aware replay: all offsets below this exclusive floor have been
+        // applied. Offsets above it are deduplicated individually.
+        optional uint64 SourceOffsetFloor = 7;
+
         // Changes will be applied using the specified uncommitted TxId
         optional uint64 WriteTxId = 2;
 

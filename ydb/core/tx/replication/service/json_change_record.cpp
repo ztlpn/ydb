@@ -372,6 +372,9 @@ static bool TransformValue(NKikimrTxDataShard::TEvApplyReplicationChanges::TUpda
 void TChangeRecord::Serialize(NKikimrTxDataShard::TEvApplyReplicationChanges_TChange& record, TMemoryPool& pool) const {
     pool.Clear();
     record.SetSourceOffset(GetOrder());
+    if (SourceOffsetFloor) {
+        record.SetSourceOffsetFloor(*SourceOffsetFloor);
+    }
     if (WriteTxId) {
         record.SetWriteTxId(WriteTxId);
     }

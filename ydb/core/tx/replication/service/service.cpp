@@ -299,6 +299,7 @@ public:
         }
 
         IndexBuildWorkers.erase(id);
+        IndexWriteWindows.erase(id);
         PendingIndexTxIds.erase(id);
         DataEnded.erase(id);
         Workers.erase(it);
@@ -313,6 +314,7 @@ public:
         SendWorkerStatus(ops, it->second, NKikimrReplication::TEvWorkerStatus::STATUS_STOPPED, std::forward<Args>(args)...);
 
         IndexBuildWorkers.erase(it->second);
+        IndexWriteWindows.erase(it->second);
         PendingIndexTxIds.erase(it->second);
         DataEnded.erase(it->second);
         Workers.erase(it->second);
@@ -418,7 +420,12 @@ public:
 
         for (const auto& v : ev->Get()->Record.GetVersions()) {
             const auto version = TRowVersion::FromProto(v);
-            if (auto it = TxIds.upper_bound(version); it != TxIds.end()) {
+            if (WriteWindow &&
+                (version < TRowVersion::FromProto(WriteWindow->GetBegin()) || version >= TRowVersion::FromProto(WriteWindow->GetEnd()))) {
+                continue;
+            }
+            if (auto it = TxIds.upper_bound(version);
+                it != TxIds.end() && (!TxIdBegins.contains(it->first) || TxIdBegins.at(it->first) <= version)) {
                 result[it->first] = it->second;
             } else {
                 versionsWithoutTxId.push_back(version);
@@ -430,7 +437,7 @@ public:
             ops->Send(ActorId, new TEvService::TEvGetTxId(versionsWithoutTxId));
         }
 
-        if (result) {
+        if (result || WriteWindow) {
             SendTxIdResult(ops, ev->Sender, result);
         }
     }
@@ -442,7 +449,21 @@ public:
                 return;
             }
 
+            if (ev->Get()->Record.HasWriteWindow()) {
+                IndexWriteWindows[id] = ev->Get()->Record.GetWriteWindow();
+            }
             auto& pending = PendingIndexTxIds[id];
+            if (const auto& record = ev->Get()->Record; record.HasWriteWindow()) {
+                const auto& window = record.GetWriteWindow();
+                for (auto it = pending.begin(); it != pending.end();) {
+                    if (*it >= TRowVersion::FromProto(window.GetIndexJoin()) &&
+                        (*it < TRowVersion::FromProto(window.GetBegin()) || *it >= TRowVersion::FromProto(window.GetEnd()))) {
+                        it = pending.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
             for (const auto& assignment : ev->Get()->Record.GetVersionTxIds()) {
                 const auto begin = TRowVersion::FromProto(assignment.GetBegin());
                 const auto end = TRowVersion::FromProto(assignment.GetVersion());
@@ -451,6 +472,50 @@ public:
                 }
             }
             ops->Send(GetWorkerActorId(id), ev->ReleaseBase().Release(), ev->Flags, ev->Cookie);
+            return;
+        }
+
+        if (ev->Get()->Record.HasWriteWindow()) {
+            const auto& window = ev->Get()->Record.GetWriteWindow();
+            if (WriteWindow && TRowVersion::FromProto(window.GetBegin()) < TRowVersion::FromProto(WriteWindow->GetBegin())) {
+                *ev->Get()->Record.MutableWriteWindow() = *WriteWindow;
+            }
+            WriteWindow = window;
+            const auto begin = TRowVersion::FromProto(window.GetBegin());
+            const auto end = TRowVersion::FromProto(window.GetEnd());
+            TxIds.erase(TxIds.begin(), TxIds.upper_bound(begin));
+            TxIdBegins.erase(TxIdBegins.begin(), TxIdBegins.upper_bound(begin));
+            for (const auto& assignment : ev->Get()->Record.GetVersionTxIds()) {
+                const auto upper = TRowVersion::FromProto(assignment.GetVersion());
+                if (upper <= begin) {
+                    continue;
+                }
+                TxIds[upper] = assignment.GetTxId();
+                if (assignment.HasBegin()) {
+                    TxIdBegins[upper] = TRowVersion::FromProto(assignment.GetBegin());
+                }
+            }
+            for (auto it = PendingTxId.begin(); it != PendingTxId.end();) {
+                const auto assigned = TxIds.upper_bound(it->first);
+                if (it->first < begin || it->first >= end ||
+                    (assigned != TxIds.end() && (!TxIdBegins.contains(assigned->first) || TxIdBegins.at(assigned->first) <= it->first))) {
+                    it = PendingTxId.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (const auto& [id, _] : Workers) {
+                if (!IndexBuildWorkers.contains(id) || IndexWriteWindows.contains(id)) {
+                    auto reply = MakeHolder<TEvService::TEvTxIdResult>();
+                    reply->Record.CopyFrom(ev->Get()->Record);
+                    if (IndexWriteWindows.contains(id)) {
+                        TRowVersion::FromProto(IndexWriteWindows.at(id).GetIndexJoin())
+                            .ToProto(reply->Record.MutableWriteWindow()->MutableIndexJoin());
+                        reply->Record.ClearVersionTxIds();
+                    }
+                    ops->Send(GetWorkerActorId(id), reply.Release());
+                }
+            }
             return;
         }
 
@@ -537,13 +602,19 @@ public:
     }
 
 private:
-    static void SendTxIdResult(IActorOps* ops, const TActorId& recipient, const TMap<TRowVersion, ui64>& result) {
+    void SendTxIdResult(IActorOps* ops, const TActorId& recipient, const TMap<TRowVersion, ui64>& result) const {
         auto ev = MakeHolder<TEvService::TEvTxIdResult>();
 
+        if (WriteWindow) {
+            *ev->Record.MutableWriteWindow() = *WriteWindow;
+        }
         for (const auto& [version, txId] : result) {
             auto& item = *ev->Record.AddVersionTxIds();
             version.ToProto(item.MutableVersion());
             item.SetTxId(txId);
+            if (const auto it = TxIdBegins.find(version); it != TxIdBegins.end()) {
+                it->second.ToProto(item.MutableBegin());
+            }
         }
 
         ops->Send(recipient, ev.Release());
@@ -563,6 +634,9 @@ private:
     THashMap<TWorkerId, TSet<TRowVersion>> PendingIndexTxIds;
     THashMap<TWorkerId, NKikimrReplication::TEvWorkerDataEnd> DataEnded;
     TMap<TRowVersion, ui64> TxIds;
+    TMap<TRowVersion, TRowVersion> TxIdBegins;
+    std::optional<NKikimrReplication::TGlobalWriteWindow> WriteWindow;
+    THashMap<TWorkerId, NKikimrReplication::TGlobalWriteWindow> IndexWriteWindows;
     TMap<TRowVersion, THashSet<TActorId>> PendingTxId;
     THashSet<TWorkerId> WorkersWithHeartbeat;
     TMap<TRowVersion, THashSet<TWorkerId>> WorkersByHeartbeat;
@@ -883,16 +957,12 @@ class TReplicationService: public TActorBootstrapped<TReplicationService> {
             Y_ABORT("Unsupported");
         }
         const auto actorId = session.RegisterWorker(this, id,
-            CreateWorker(
-                SelfId(),
-                ReaderFn(cmd.GetDatabase(), readerSettings, autoCommit, reportStats,
-                    cmd.HasLocalTableWriter() && AppData()->ReplicationConfig.GetEnableDataLossDetection()),
+            CreateWorker(SelfId(), ReaderFn(cmd.GetDatabase(), readerSettings, autoCommit, reportStats,
+                                       cmd.HasLocalTableWriter() && AppData()->ReplicationConfig.GetEnableDataLossDetection()),
                 std::move(writerFn), cmd.GetTrackSourceOffsets(),
-                cmd.HasProcessedSourceOffset() ? TMaybe<ui64>(cmd.GetProcessedSourceOffset()) : Nothing()),
-            poolId,
-            cmd.GetReplicationLocation(),
-            cmd.GetMetricsLevel()
-        );
+                cmd.HasProcessedSourceOffset() ? TMaybe<ui64>(cmd.GetProcessedSourceOffset()) : Nothing(),
+                cmd.HasLocalTableWriter() && cmd.GetConsistencySettings().HasGlobal()), poolId, cmd.GetReplicationLocation(),
+            cmd.GetMetricsLevel());
         WorkerActorIdToSession[actorId] = controller.GetTabletId();
     }
 

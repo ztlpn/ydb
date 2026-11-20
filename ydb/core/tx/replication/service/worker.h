@@ -50,6 +50,8 @@ struct TEvWorker {
         EvStatsWakeup,
         EvSchemaChange,
         EvSchemaChangeApplied,
+        EvReplay,
+        EvReplayStarted,
         EvEnd,
     };
 
@@ -59,10 +61,23 @@ struct TEvWorker {
 
     struct TEvPoll: public TEventLocal<TEvPoll, EvPoll> {
         bool SkipCommit;
+        TMaybe<ui64> CommitOffset;
+        bool StopPolling = false;
 
         explicit TEvPoll(bool skipCommit = false);
         TString ToString() const override;
     };
+
+    struct TEvReplay: public TEventLocal<TEvReplay, EvReplay> {
+        ui64 Offset;
+
+        explicit TEvReplay(ui64 offset)
+            : Offset(offset)
+        {
+        }
+    };
+
+    struct TEvReplayStarted: public TEventLocal<TEvReplayStarted, EvReplayStarted> {};
 
     struct TEvCommit: public TEventLocal<TEvCommit, EvCommit> {
         size_t Offset;
@@ -171,12 +186,8 @@ struct TEvWorker {
     };
 };
 
-IActor* CreateWorker(
-    const TActorId& parent,
-    std::function<IActor*(void)>&& createReaderFn,
-    std::function<IActor*(void)>&& createWriterFn,
-    bool trackSourceOffsets = false,
-    TMaybe<ui64> processedSourceOffset = Nothing());
+IActor* CreateWorker(const TActorId& parent, std::function<IActor*(void)>&& createReaderFn, std::function<IActor*(void)>&& createWriterFn,
+    bool trackSourceOffsets = false, TMaybe<ui64> processedSourceOffset = Nothing(), bool drainDataEnd = false);
 
 } // NService
 } // NKikimr::NReplication
