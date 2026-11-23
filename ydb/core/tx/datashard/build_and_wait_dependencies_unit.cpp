@@ -167,7 +167,7 @@ void TBuildAndWaitDependenciesUnit::BuildDependencies(const TOperation::TPtr &op
 
 bool TBuildAndWaitDependenciesUnit::BuildVolatileDependencies(const TOperation::TPtr &op) {
     // Scheme operations need to wait for all volatile transactions below them
-    if (op->IsSchemeTx()) {
+    if (op->IsSchemeTx() || (op->IsSnapshotTx() && op->HasGlobalWriterFlag())) {
         TRowVersion current(op->GetStep(), op->GetTxId());
         for (auto* info : DataShard.GetVolatileTxManager().GetVolatileTxByVersion()) {
             if (current < info->Version) {

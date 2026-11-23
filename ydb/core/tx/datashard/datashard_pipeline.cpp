@@ -1608,7 +1608,11 @@ TOperation::TPtr TPipeline::BuildOperation(TEvDataShard::TEvProposeTransaction::
             return tx;
         }
 
-        if (tx->GetSnapshotTx().HasCreateVolatileSnapshot()) {
+        if (tx->GetSnapshotTx().HasPublishChecksum()) {
+            tx->SetProposeBlockerFlag();
+            tx->SetGlobalReaderFlag();
+            tx->SetGlobalWriterFlag();
+        } else if (tx->GetSnapshotTx().HasCreateVolatileSnapshot()) {
             tx->SetReadOnlyFlag();
             tx->SetGlobalReaderFlag();
         } else if (tx->GetSnapshotTx().HasDropVolatileSnapshot()) {

@@ -446,9 +446,7 @@ bool TActiveTransaction::BuildSnapshotTx()
         return false;
     }
 
-    size_t count = (
-        SnapshotTx->HasCreateVolatileSnapshot() +
-        SnapshotTx->HasDropVolatileSnapshot());
+    size_t count = (SnapshotTx->HasPublishChecksum() + SnapshotTx->HasCreateVolatileSnapshot() + SnapshotTx->HasDropVolatileSnapshot());
     if (count != 1) {
         return false;
     }

@@ -506,6 +506,7 @@ PEERDIR(
     ydb/library/chunks_limiter
     ydb/library/json_index
     ydb/library/protobuf_printer
+    ydb/library/table_digest
     ydb/library/yql/dq/actors
     ydb/public/api/protos
     ydb/services/lib/sharding
@@ -535,7 +536,6 @@ ELSE()
     PEERDIR(
         contrib/libs/apache/arrow
         ydb/core/formats/arrow
-        ydb/library/table_digest
     )
 ENDIF()
 

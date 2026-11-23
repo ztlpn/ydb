@@ -56,11 +56,18 @@ void AddWords(TWords& destination, const TWords& source, size_t wordCount) {
 
 } // namespace
 
-EAlgorithm ParseAlgorithm(TStringBuf name) {
+TMaybe<EAlgorithm> TryParseAlgorithm(TStringBuf name) {
     for (const auto& info : Algorithms) {
         if (info.Name == name) {
             return info.Algorithm;
         }
+    }
+    return Nothing();
+}
+
+EAlgorithm ParseAlgorithm(TStringBuf name) {
+    if (const auto algorithm = TryParseAlgorithm(name)) {
+        return *algorithm;
     }
     ythrow yexception() << "Unsupported Digest algorithm: " << name;
 }
@@ -71,6 +78,11 @@ TStringBuf GetAlgorithmName(EAlgorithm algorithm) {
 
 size_t GetWordCount(EAlgorithm algorithm) {
     return GetAlgorithmInfo(algorithm).WordCount;
+}
+
+bool IsValidHexDigest(EAlgorithm algorithm, TStringBuf digest) {
+    return digest.size() == GetWordCount(algorithm) * sizeof(ui64) * 2
+        && digest.find_first_not_of("0123456789ABCDEF") == TStringBuf::npos;
 }
 
 TState::TState(EAlgorithm algorithm)

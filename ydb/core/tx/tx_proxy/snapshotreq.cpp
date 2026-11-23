@@ -1,12 +1,12 @@
 #include "proxy.h"
 #include "resolvereq.h"
 
-#include <ydb/core/tx/long_tx_service/public/events.h>
-#include <ydb/core/tx/datashard/datashard.h>
-
 #include <ydb/core/actorlib_impl/long_timer.h>
 #include <ydb/core/base/path.h>
 #include <ydb/core/base/tablet_pipecache.h>
+#include <ydb/core/protos/change_exchange.pb.h>
+#include <ydb/core/tx/datashard/datashard.h>
+#include <ydb/core/tx/long_tx_service/public/events.h>
 
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/hfunc.h>
@@ -270,10 +270,22 @@ public:
 
         TxProxyMon->TxPrepareResolveHgram->Collect((WallClockResolved - WallClockResolveStarted).MicroSeconds());
 
+        const auto& params = Request->Record.GetTransaction().GetCreateVolatileSnapshot();
         bool hasColumnTable = false;
         for (const auto& entry : msg->Tables) {
             // N.B. we create all keys as a read operation
             ui32 access = 0;
+            if (params.HasPublishChecksum()) {
+                const auto& checksum = params.GetPublishChecksum();
+                if (!AppData(ctx)->FeatureFlags.GetEnableAsyncReplicationChecksumCheck() || params.TablesSize() != 1 ||
+                    params.GetTables(0).HasKeyRange() || entry.Kind != NSchemeCache::TSchemeCacheNavigate::KindTable ||
+                    TPathId::FromProto(checksum.GetTableId()) != entry.KeyDescription->TableId.PathId) {
+                    IssueManager.RaiseIssue(MakeIssue(NKikimrIssues::TIssuesIds::GENERIC_RESOLVE_ERROR, "Invalid checksum publication target"));
+                    ReportStatus(TEvTxUserProxy::TResultStatus::ResolveError, NKikimrIssues::TStatusIds::SCHEME_ERROR, true, ctx);
+                    return Die(ctx);
+                }
+                access = NACLib::DescribeSchema | NACLib::SelectRow | NACLib::AlterSchema;
+            }
             switch (entry.KeyDescription->RowOperation) {
                 case TKeyDesc::ERowOperation::Update:
                     access |= NACLib::EAccessRights::UpdateRow;
@@ -369,7 +381,10 @@ public:
 
         SelectedCoordinator = SelectCoordinator(msg->FindDomainInfo(), ctx);
 
-        const auto& params = Request->Record.GetTransaction().GetCreateVolatileSnapshot();
+        if (params.HasPublishChecksum() && params.GetPublishChecksum().GetResult()) {
+            // One producer broadcasts the terminal record to every partition.
+            PerShardStates.erase(std::next(PerShardStates.begin()), PerShardStates.end());
+        }
 
         for (auto& kv : PerShardStates) {
             ui64 shardId = kv.first;
@@ -383,14 +398,19 @@ public:
             auto path = tableId.PathId;
 
             NKikimrTxDataShard::TSnapshotTransaction tx;
-            auto* op = tx.MutableCreateVolatileSnapshot();
-            op->SetOwnerId(path.OwnerId);
-            op->SetPathId(path.LocalPathId);
-            if (params.HasName()) {
-                op->SetName(params.GetName());
-            }
-            if (params.HasTimeoutMs()) {
-                op->SetTimeoutMs(params.GetTimeoutMs());
+            if (params.HasPublishChecksum()) {
+                *tx.MutablePublishChecksum() = params.GetPublishChecksum();
+                state.AffectedFlags |= TPerShardState::AffectedWrite;
+            } else {
+                auto* op = tx.MutableCreateVolatileSnapshot();
+                op->SetOwnerId(path.OwnerId);
+                op->SetPathId(path.LocalPathId);
+                if (params.HasName()) {
+                    op->SetName(params.GetName());
+                }
+                if (params.HasTimeoutMs()) {
+                    op->SetTimeoutMs(params.GetTimeoutMs());
+                }
             }
 
             const TString txBody = tx.SerializeAsString();
@@ -585,6 +605,7 @@ public:
                 TxProxyMon->TxResultCancelled->Inc();
                 return Die(ctx);
             case NKikimrTxDataShard::TEvProposeTransactionResult::BAD_REQUEST:
+                CancelProposal();
                 state.Status = TPerShardState::EStatus::Error;
                 ExtractDatashardErrors(record);
                 ReportStatus(TEvTxUserProxy::TEvProposeTransactionStatus::EStatus::WrongRequest, NKikimrIssues::TStatusIds::BAD_REQUEST, true, ctx);

@@ -1,5 +1,6 @@
 option cc_enable_arenas = true;
 
+import "ydb/core/protos/change_exchange.proto";
 import "ydb/library/actors/protos/actors.proto";
 import "ydb/core/protos/base.proto";
 import "ydb/core/scheme/protos/type_info.proto";
@@ -517,6 +518,7 @@ message TDropVolatileSnapshot {
 message TSnapshotTransaction {
     optional TCreateVolatileSnapshot CreateVolatileSnapshot = 1;
     optional TDropVolatileSnapshot DropVolatileSnapshot = 2;
+    optional NKikimrChangeExchange.TCdcChecksum PublishChecksum = 3;
 }
 
 message TMvccRemovedRowVersions {

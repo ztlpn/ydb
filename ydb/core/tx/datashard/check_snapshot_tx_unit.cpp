@@ -2,6 +2,9 @@
 #include "datashard_pipeline.h"
 #include "execution_unit_ctors.h"
 
+#include <ydb/core/protos/change_exchange.pb.h>
+#include <ydb/library/table_digest/aggregate.h>
+
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::TX_DATASHARD
 
 namespace NKikimr {
@@ -81,9 +84,8 @@ public:
 
         const auto& txBody = tx->GetSnapshotTx();
 
-        size_t count = (
-            (size_t)txBody.HasCreateVolatileSnapshot() +
-            (size_t)txBody.HasDropVolatileSnapshot());
+        size_t count =
+            ((size_t)txBody.HasPublishChecksum() + (size_t)txBody.HasCreateVolatileSnapshot() + (size_t)txBody.HasDropVolatileSnapshot());
 
         if (count != 1) {
             BuildResult(op, NKikimrTxDataShard::TEvProposeTransactionResult::BAD_REQUEST)->AddError(
@@ -95,6 +97,40 @@ public:
             return EExecutionStatus::Executed;
         }
 
+        if (txBody.HasPublishChecksum()) {
+            const auto& checksum = txBody.GetPublishChecksum();
+            const auto id = TPathId::FromProto(checksum.GetTableId());
+            if (!CheckTable(op, id.OwnerId, id.LocalPathId)) {
+                return EExecutionStatus::Executed;
+            }
+            const auto& table = *DataShard.GetUserTables().at(id.LocalPathId);
+            const bool failure = checksum.GetResult() && checksum.GetStatus() != Ydb::StatusIds::SUCCESS;
+            if (op->IsImmediate() || !AppData(ctx)->FeatureFlags.GetEnableAsyncReplicationChecksumCheck() ||
+                checksum.GetProtocolVersion() != 1 || !NYql::NDigest::TryParseAlgorithm(checksum.GetAlgorithm()) ||
+                checksum.GetAlgorithmVersion() != 1 || table.IsBackup || table.IsReplicated() ||
+                (!failure && table.GetTableSchemaVersion() != checksum.GetTableSchemaVersion())) {
+                BuildResult(op, NKikimrTxDataShard::TEvProposeTransactionResult::BAD_REQUEST)->AddError(NKikimrTxDataShard::TError::BAD_ARGUMENT,
+                    "Invalid checksum publication or changed table schema");
+                op->Abort(EExecutionUnitKind::FinishPropose);
+                return EExecutionStatus::Executed;
+            }
+            for (const auto& stream : checksum.GetStreams()) {
+                if (stream.GetPartitionIds().empty()) {
+                    BuildResult(op, NKikimrTxDataShard::TEvProposeTransactionResult::BAD_REQUEST)
+                        ->AddError(NKikimrTxDataShard::TError::BAD_ARGUMENT, "Missing checksum partition membership");
+                    op->Abort(EExecutionUnitKind::FinishPropose);
+                    return EExecutionStatus::Executed;
+                }
+                const auto* feed = table.CdcStreams.FindPtr(TPathId::FromProto(stream.GetPathId()));
+                if (!failure &&
+                    (!feed || feed->State != NKikimrSchemeOp::ECdcStreamStateReady || feed->Format != NKikimrSchemeOp::ECdcStreamFormatJson)) {
+                    BuildResult(op, NKikimrTxDataShard::TEvProposeTransactionResult::BAD_REQUEST)
+                        ->AddError(NKikimrTxDataShard::TError::SCHEME_ERROR, "Selected changefeed changed");
+                    op->Abort(EExecutionUnitKind::FinishPropose);
+                    return EExecutionStatus::Executed;
+                }
+            }
+        }
         if (txBody.HasCreateVolatileSnapshot()) {
             const auto& params = txBody.GetCreateVolatileSnapshot();
 

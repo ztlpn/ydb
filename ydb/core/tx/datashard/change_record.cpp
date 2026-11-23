@@ -48,6 +48,10 @@ void TChangeRecord::Serialize(NKikimrChangeExchange::TChangeRecord& record) cons
             return;
         case EKind::CdcSchemaChange:
             return ParseBody(*record.MutableCdcSchemaChange(), Body);
+        case EKind::CdcChecksumCheckpoint:
+            return ParseBody(*record.MutableCdcChecksumCheckpoint(), Body);
+        case EKind::CdcChecksumResult:
+            return ParseBody(*record.MutableCdcChecksumResult(), Body);
         case EKind::CdcHeartbeat:
             return;
     }
@@ -72,6 +76,8 @@ TConstArrayRef<TCell> TChangeRecord::GetKey() const {
         }
 
         case EKind::CdcSchemaChange:
+        case EKind::CdcChecksumCheckpoint:
+        case EKind::CdcChecksumResult:
         case EKind::CdcHeartbeat: {
             Y_ENSURE(false, "Not supported");
         }
@@ -95,6 +101,7 @@ TInstant TChangeRecord::GetApproximateCreationDateTime() const {
 bool TChangeRecord::IsBroadcast() const {
     switch (Kind) {
         case EKind::CdcSchemaChange:
+        case EKind::CdcChecksumCheckpoint:
         case EKind::CdcHeartbeat:
             return true;
         default:

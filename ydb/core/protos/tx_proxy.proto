@@ -1,3 +1,4 @@
+import "ydb/core/protos/change_exchange.proto";
 import "ydb/core/protos/export.proto";
 import "ydb/core/protos/flat_scheme_op.proto";
 import "ydb/core/protos/query_stats.proto";
@@ -84,6 +85,7 @@ message TCreateVolatileSnapshotTx {
     optional string Name = 2;
     optional uint64 TimeoutMs = 3;
     optional bool IgnoreSystemViews = 4;
+    optional NKikimrChangeExchange.TCdcChecksum PublishChecksum = 5;
 }
 
 message TRefreshVolatileSnapshotTx {

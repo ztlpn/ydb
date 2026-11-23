@@ -1,4 +1,8 @@
 import "google/protobuf/empty.proto";
+import "ydb/core/scheme/protos/pathid.proto";
+import "ydb/public/api/protos/draft/ydb_replication.proto";
+import "ydb/public/api/protos/ydb_status_codes.proto";
+import "ydb/public/api/protos/ydb_issue_message.proto";
 
 package NKikimrChangeExchange;
 option java_package = "ru.yandex.kikimr.proto";
@@ -39,6 +43,31 @@ message TSchemaChange {
 message TCdcHeartbeat {
 }
 
+// A table-scoped checkpoint and its terminal result share one identity. The
+// stream membership is frozen at creation; names are never used for replay.
+message TCdcChecksum {
+    optional uint32 ProtocolVersion = 1 [default = 1];
+    optional NKikimrProto.TPathID TableId = 3;
+    optional uint64 SnapshotStep = 4;
+    optional uint64 SnapshotTxId = 5;
+    optional string Algorithm = 7 [default = "CityHash64"];
+    optional uint32 AlgorithmVersion = 8 [default = 1];
+    optional bool Result = 9 [default = false];
+    optional Ydb.Replication.TableChecksum Checksum = 10;
+    optional Ydb.StatusIds.StatusCode Status = 11;
+    repeated Ydb.Issue.IssueMessage Issues = 12;
+    optional uint64 DeadlineUs = 13;
+    message TStream {
+        optional NKikimrProto.TPathID PathId = 1;
+        optional string Name = 2;
+        repeated uint32 PartitionIds = 3;
+        optional NKikimrProto.TPathID TopicId = 4;
+    }
+    repeated TStream Streams = 14;
+    optional uint64 TableSchemaVersion = 15;
+    repeated uint32 ExpectedPartitions = 16;
+}
+
 message TChangeRecord {
     optional uint64 Order = 1;
     optional uint64 Group = 2;
@@ -52,6 +81,8 @@ message TChangeRecord {
         TCdcHeartbeat CdcHeartbeat = 9;
         TDataChange IncrementalRestore = 10;
         TSchemaChange CdcSchemaChange = 11;
+        TCdcChecksum CdcChecksumCheckpoint = 12;
+        TCdcChecksum CdcChecksumResult = 13;
     }
 }
 

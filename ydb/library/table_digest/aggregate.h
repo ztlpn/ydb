@@ -1,5 +1,6 @@
 #pragma once
 
+#include <util/generic/maybe.h>
 #include <util/generic/strbuf.h>
 #include <util/generic/string.h>
 #include <util/system/types.h>
@@ -14,9 +15,11 @@ enum class EAlgorithm: ui8 {
     Sha256 = 3,
 };
 
+TMaybe<EAlgorithm> TryParseAlgorithm(TStringBuf name);
 EAlgorithm ParseAlgorithm(TStringBuf name);
 TStringBuf GetAlgorithmName(EAlgorithm algorithm);
 size_t GetWordCount(EAlgorithm algorithm);
+bool IsValidHexDigest(EAlgorithm algorithm, TStringBuf digest);
 
 // Unsigned words, least significant first; unused words must be zero.
 using TWords = std::array<ui64, 4>;

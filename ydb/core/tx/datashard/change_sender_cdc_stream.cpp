@@ -10,10 +10,12 @@
 #include <ydb/core/change_exchange/util.h>
 #include <ydb/core/persqueue/writer/source_id_encoding.h>
 #include <ydb/core/persqueue/writer/writer.h>
+#include <ydb/core/protos/change_exchange.pb.h>
 #include <ydb/core/protos/config.pb.h>
 #include <ydb/core/tx/cdc_aggregator/public/events.h>
 #include <ydb/core/tx/scheme_cache/helpers.h>
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
+
 #include <ydb/library/aclib/user_context.h>
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/hfunc.h>
@@ -110,6 +112,7 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
             {"actorState", "StateWaitingRecords"});
         switch (ev->GetTypeRewrite()) {
             hFunc(NChangeExchange::TEvChangeExchange::TEvRecords, Handle);
+            hFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, Handle);
             sFunc(TEvPartitionWriter::TEvWriteResponse, Lost);
         default:
             return StateBase(ev);
@@ -119,9 +122,44 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
     void Handle(NChangeExchange::TEvChangeExchange::TEvRecords::TPtr& ev) {
         YDB_LOG_DEBUG("Handle",
             {"eventDetails", ev->Get()->ToString()});
-        NKikimrClient::TPersQueueRequest request;
+        auto records = std::move(ev->Get()->Records);
+        using EKind = TChangeRecord::EKind;
+        if (AnyOf(records, [this](const auto& record) {
+                return static_cast<i64>(record->GetOrder()) > MaxSeqNo &&
+                       (record->GetKind() == EKind::CdcChecksumCheckpoint || record->GetKind() == EKind::CdcChecksumResult);
+            })) {
+            // Refresh only for control records. A topic alter may have committed since enqueue.
+            PendingLayoutRecords = std::move(records);
+            using TNavigate = NSchemeCache::TSchemeCacheNavigate;
+            auto request = MakeHolder<TNavigate>();
+            auto& entry = request->ResultSet.emplace_back(NSchemeCache::TSchemeCacheHelpers::MakeNavigateEntry(TopicId, TNavigate::OpTopic));
+            entry.SyncVersion = true;
+            Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(request.Release()));
+            return;
+        }
+        WriteRecords(records);
+    }
 
-        for (auto recordPtr : ev->Get()->Records) {
+    void Handle(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
+        const auto& entries = ev->Get()->Request->ResultSet;
+        if (entries.size() != 1 || entries.front().Status != NSchemeCache::TSchemeCacheNavigate::EStatus::Ok || !entries.front().PQGroupInfo) {
+            return Leave();
+        }
+        const auto& desc = entries.front().PQGroupInfo->Description;
+        TVector<ui32> active;
+        for (const auto& partition : desc.GetPartitions()) {
+            if (partition.GetStatus() == NKikimrPQ::ETopicPartitionStatus::Active) {
+                active.push_back(partition.GetPartitionId());
+            }
+        }
+        Sort(active);
+        const bool fixed = desc.GetPQTabletConfig().GetPartitionStrategy().GetPartitionStrategyType() == NKikimrPQ::TPQTabletConfig::DISABLED;
+        WriteRecords(std::exchange(PendingLayoutRecords, {}), active, fixed);
+    }
+
+    void WriteRecords(const TVector<NChangeExchange::IChangeRecord::TPtr>& records, const TVector<ui32>& active = {}, bool fixed = true) {
+        NKikimrClient::TPersQueueRequest request;
+        for (const auto& recordPtr : records) {
             const auto& record = *recordPtr;
             const auto seqNo = static_cast<i64>(record.GetOrder());
 
@@ -133,7 +171,40 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
             cmd.SetSourceId(NSourceIdEncoding::EncodeSimple(SourceId));
             cmd.SetIgnoreQuotaDeadline(true);
 
-            Serializer->Serialize(cmd, record);
+            using EKind = TChangeRecord::EKind;
+            if (record.GetKind() == EKind::CdcChecksumCheckpoint || record.GetKind() == EKind::CdcChecksumResult) {
+                NKikimrChangeExchange::TCdcChecksum control;
+                Y_ENSURE(control.ParseFromString(record.GetBody()));
+                const auto& frozen = control.GetExpectedPartitions();
+                if (!fixed || !std::equal(active.begin(), active.end(), frozen.begin(), frozen.end()) ||
+                        control.StreamsSize() != 1 || TPathId::FromProto(control.GetStreams(0).GetTopicId()) != TopicId) {
+                    control.SetResult(true);
+                    control.ClearChecksum();
+                    control.SetStatus(Ydb::StatusIds::PRECONDITION_FAILED);
+                    control.ClearIssues();
+                    control.AddIssues()->set_message("Changefeed partition layout changed during delivery");
+                    auto failure = TChangeRecordBuilder(EKind::CdcChecksumResult)
+                                       .WithOrder(record.GetOrder())
+                                       .WithStep(record.GetStep())
+                                       .WithTxId(record.GetTxId())
+                                       .WithBody(control.SerializeAsString())
+                                       .Build();
+                    Serializer->Serialize(cmd, *failure);
+                    // Original partitions may already be waiting for this producer. Finish their quorum.
+                    // New partitions have no corresponding checkpoint and can take a regular write.
+                    if (record.GetKind() == EKind::CdcChecksumCheckpoint && std::binary_search(frozen.begin(), frozen.end(), PartitionId)) {
+                        auto& barrier = *cmd.MutableSchemaChange();
+                        barrier.SetStep(record.GetStep());
+                        barrier.SetTxId(record.GetTxId());
+                        barrier.SetData(cmd.GetData());
+                        cmd.ClearData();
+                    }
+                } else {
+                    Serializer->Serialize(cmd, record);
+                }
+            } else {
+                Serializer->Serialize(cmd, record);
+            }
 
             Pending.push_back(seqNo);
         }
@@ -278,16 +349,13 @@ public:
         return NKikimrServices::TActivity::CHANGE_SENDER_CDC_ACTOR_PARTITION;
     }
 
-    explicit TCdcChangeSenderPartition(
-            const TActorId& parent,
-            const TDataShardId& dataShard,
-            ui32 partitionId,
-            ui64 shardId,
-            const TUserTable::TCdcStream& stream)
+    explicit TCdcChangeSenderPartition(const TActorId& parent, const TDataShardId& dataShard, ui32 partitionId, ui64 shardId,
+        const TUserTable::TCdcStream& stream, const TPathId& topicId)
         : Parent(parent)
         , DataShard(dataShard)
         , PartitionId(partitionId)
         , ShardId(shardId)
+        , TopicId(topicId)
         , SourceId(ToString(DataShard.TabletId))
         , Serializer(CreateCdcStreamSerializer(stream, DataShard.TabletId))
     {
@@ -314,6 +382,8 @@ private:
     const TDataShardId DataShard;
     const ui32 PartitionId;
     const ui64 ShardId;
+    const TPathId TopicId;
+    TVector<NChangeExchange::IChangeRecord::TPtr> PendingLayoutRecords;
     const TString SourceId;
     THolder<IChangeRecordSerializer> Serializer;
 
@@ -645,7 +715,7 @@ class TCdcChangeSenderMain
     IActor* CreateSender(ui64 partitionId) const override {
         Y_ENSURE(PartitionToShard.contains(partitionId));
         const auto shardId = PartitionToShard.at(partitionId);
-        return new TCdcChangeSenderPartition(SelfId(), DataShard, partitionId, shardId, Stream);
+        return new TCdcChangeSenderPartition(SelfId(), DataShard, partitionId, shardId, Stream, TopicPathId);
     }
 
     void Handle(NChangeExchange::TEvChangeExchange::TEvEnqueueRecords::TPtr& ev) {
