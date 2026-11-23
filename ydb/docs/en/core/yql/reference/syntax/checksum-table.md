@@ -15,13 +15,14 @@ The command reads every row and returns the checksum and row count. All user col
 The statement has the following syntax. Square brackets mark an optional clause:
 
 ```yql
-CHECKSUM TABLE <table_path> [WITH (ALGORITHM = "<algorithm>")];
+CHECKSUM TABLE <table_path> [WITH (<option> [, <option> ...])];
 ```
 
 Where:
 
 - `table_path` is the table name or path. Paths follow the same rules as in [`SELECT`](select/index.md), including [`PRAGMA TablePathPrefix`](pragma.md#table-path-prefix).
-- `algorithm` is the checksum algorithm. Write its name directly in quotes, with the capitalization shown below. If the `WITH` clause is omitted, the algorithm is `CityHash64`.
+- `ALGORITHM = "<algorithm>"` is the checksum algorithm. Write its name directly in quotes, with the capitalization shown below. The default is `CityHash64`.
+- `PUBLISH_TO_CHANGEFEEDS = ('feed1', 'feed2')` publishes the checksum to the named changefeeds using the selected algorithm. Omitting it keeps the checksum local. Each selected feed must use native JSON.
 
 | Algorithm | Checksum length |
 | --- | --- |
@@ -46,16 +47,17 @@ The statement returns exactly one row with the following columns:
 | `count` | `Uint64` | Number of rows in the table. |
 | `hash` | `String` | Checksum as uppercase hexadecimal text, in the format returned by [`String::HexEncode`](../udf/list/string.md). |
 | `version` | `Uint32` | Checksum format version, currently `1`. |
+| `mvcc_timestamp` | `Struct<plan_step:Uint64,tx_id:Uint64>?` | MVCC timestamp of the snapshot. Returns `NULL` when the read includes uncommitted writes. |
 
 For an empty table, `count` is `0` and the checksum contains only `0` characters. Its length still depends on the algorithm. With the default algorithm, the result is:
 
-| algorithm | count | hash | version |
-| --- | --- | --- | --- |
-| `CityHash64` | `0` | `0000000000000000` | `1` |
+| algorithm | count | hash | version | mvcc_timestamp |
+| --- | --- | --- | --- | --- |
+| `CityHash64` | `0` | `0000000000000000` | `1` | `{plan_step: 12345, tx_id: 67}` |
 
 ## Before running
 
-- You need the same table read permissions as for `SELECT`.
+- You need the same table read permissions as for `SELECT`. Publication also requires permission to alter the table schema and must run as a standalone statement.
 - The command reads the entire table, so checking a large table can take time and add load to the database.
 
 To check selected rows or columns, or get a separate checksum for each group, use the [`DigestAggregate` examples](../udf/list/digest-aggregate.md#examples).
