@@ -112,13 +112,15 @@ TExprNode::TPtr BuildChecksum(const TExprNode::TPtr& input, TStringBuf algorithm
     });
 
     auto result = ctx.NewArgument(pos, "row");
-    auto project = ctx.NewLambda(pos, ctx.NewArguments(pos, {result}),
-                                 ctx.NewCallable(pos, "Member", {result, ctx.NewAtom(pos, "digest")}));
+    auto project = ctx.NewLambda(pos, ctx.NewArguments(pos, { result }),
+        ctx.NewCallable(pos, "AddMember", { ctx.NewCallable(pos, "Member", { result, ctx.NewAtom(pos, "digest") }),
+                                              ctx.NewAtom(pos, "mvcc_timestamp"), ctx.NewCallable(pos, "KqpChecksumTimestamp", {}) }));
     ctx.Step.Repeat(TExprStep::ExpandApplyForLambdas);
     return ctx.NewCallable(pos, "Map", {aggregate, project});
 }
 
-TExprNode::TPtr RewriteChecksumTable(const TExprNode::TPtr& input, TTypeAnnotationContext& types, TExprContext& ctx) {
+TExprNode::TPtr RewriteChecksumTable(
+    const TExprNode::TPtr& input, TKikimrSessionContext& session, TTypeAnnotationContext& types, TExprContext& ctx) {
     if (!EnsureArgsCount(*input, 4, ctx) || !EnsureTuple(*input->Child(3), ctx)) {
         return nullptr;
     }
@@ -131,11 +133,46 @@ TExprNode::TPtr RewriteChecksumTable(const TExprNode::TPtr& input, TTypeAnnotati
         }
         algorithm = option->Child(1)->Content();
     }
-    try {
-        NDigest::ParseAlgorithm(algorithm);
-    } catch (const yexception&) {
+    if (!NDigest::TryParseAlgorithm(algorithm)) {
         ctx.AddError(TIssue(ctx.GetPosition(pos), TStringBuilder()
             << "Unsupported CHECKSUM TABLE algorithm: " << algorithm));
+        return nullptr;
+    }
+
+    const auto publishOption = GetSetting(*settings, "publishtochangefeeds");
+    if (publishOption) {
+        if (!EnsureTupleSize(*publishOption, 2, ctx) || !EnsureTupleMinSize(*publishOption->Child(1), 1, ctx)) {
+            return nullptr;
+        }
+        for (const auto& name : publishOption->Child(1)->Children()) {
+            if (!EnsureAtom(*name, ctx)) {
+                return nullptr;
+            }
+        }
+        settings = RemoveSetting(*settings, "publishtochangefeeds", ctx);
+    }
+    if (session.Query().PreparingQuery) {
+        auto& physical = *session.Query().PreparingQuery->MutablePhysicalQuery();
+        physical.SetHasChecksumTable(true);
+        if (publishOption) {
+            TKikimrKey key(ctx);
+            if (!key.Extract(*input->Child(2))) {
+                return nullptr;
+            }
+            if (physical.HasChecksumPublication()) {
+                ctx.AddError(TIssue(ctx.GetPosition(pos), "Checksum publication must be a standalone statement"));
+                return nullptr;
+            }
+            const auto path = key.GetTablePath();
+            auto* publication = physical.MutableChecksumPublication();
+            publication->SetTable(session.Tables().GetTempTablePath(path).value_or(path));
+            publication->SetAlgorithm(TString(algorithm));
+            for (const auto& name : publishOption->Child(1)->Children()) {
+                publication->AddChangefeeds(TString(name->Content()));
+            }
+        }
+    } else if (publishOption) {
+        ctx.AddError(TIssue(ctx.GetPosition(pos), "Checksum publication requires a prepared execution plan"));
         return nullptr;
     }
 
@@ -155,7 +192,20 @@ TExprNode::TPtr RewriteChecksumTable(const TExprNode::TPtr& input, TTypeAnnotati
     auto read = ctx.NewCallable(pos, "Read!", {
         input->ChildPtr(0), input->ChildPtr(1), input->ChildPtr(2), ctx.NewCallable(pos, "Void", {}), settings
     });
-    auto checksum = BuildChecksum(ctx.NewCallable(pos, "Right!", {read}), algorithm, prefixes, types, ctx);
+    TExprNode::TPtr checksum;
+    if (publishOption) {
+        auto member = [&](TStringBuf name, TExprNode::TPtr value) {
+            return ctx.NewList(pos, { ctx.NewAtom(pos, name), std::move(value) });
+        };
+        auto row = ctx.NewCallable(pos, "AsStruct", { member("version", ctx.NewCallable(pos, "Uint32", { ctx.NewAtom(pos, "1") })),
+                                                        member("algorithm", ctx.NewCallable(pos, "Utf8", { ctx.NewAtom(pos, algorithm) })),
+                                                        member("count", ctx.NewCallable(pos, "KqpPublishedChecksumCount", {})),
+                                                        member("hash", ctx.NewCallable(pos, "KqpPublishedChecksumHash", {})),
+                                                        member("mvcc_timestamp", ctx.NewCallable(pos, "KqpChecksumTimestamp", {})) });
+        checksum = ctx.NewCallable(pos, "AsList", { row });
+    } else {
+        checksum = BuildChecksum(ctx.NewCallable(pos, "Right!", { read }), algorithm, prefixes, types, ctx);
+    }
     if (!checksum) {
         return nullptr;
     }
@@ -176,7 +226,7 @@ public:
 
     TStatus DoTransform(TExprNode::TPtr input, TExprNode::TPtr& output, TExprContext& ctx) override {
         if (input->IsCallable(TKiChecksumTable::CallableName())) {
-            output = RewriteChecksumTable(input, Types, ctx);
+            output = RewriteChecksumTable(input, *SessionCtx, Types, ctx);
             return output ? TStatus::Repeat : TStatus::Error;
         }
         return TKiSourceVisitorTransformer::DoTransform(input, output, ctx);

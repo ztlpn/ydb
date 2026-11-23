@@ -1,21 +1,24 @@
 #include "kqp_log_query.h"
-#include "kqp_session_actor.h"
-#include "kqp_worker_common.h"
 #include "kqp_query_state.h"
 #include "kqp_query_stats.h"
+#include "kqp_session_actor.h"
+#include "kqp_worker_common.h"
 
+#include <ydb/core/actorlib_impl/long_timer.h>
+#include <ydb/core/base/appdata.h>
+#include <ydb/core/base/cputime.h>
+#include <ydb/core/base/path.h>
 #include <ydb/core/kqp/common/buffer/buffer.h>
 #include <ydb/core/kqp/common/buffer/events.h>
+#include <ydb/core/kqp/common/kqp.h>
 #include <ydb/core/kqp/common/kqp_data_integrity_trails.h>
-#include <ydb/core/kqp/common/kqp_tli.h>
-#include <ydb/core/kqp/common/kqp_query_text_cache_events.h>
 #include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
+#include <ydb/core/kqp/common/kqp_query_text_cache_events.h>
 #include <ydb/core/kqp/common/kqp_ru_calc.h>
 #include <ydb/core/kqp/common/kqp_timeouts.h>
+#include <ydb/core/kqp/common/kqp_tli.h>
 #include <ydb/core/kqp/common/kqp_tx.h>
-#include <ydb/core/kqp/common/kqp.h>
-#include <ydb/services/workload_manager/events.h>
-#include <ydb/services/workload_manager/gateway.h>
+#include <ydb/core/kqp/common/kqp_yql.h>
 #include <ydb/core/kqp/common/simple/mvcc_version.h>
 #include <ydb/core/kqp/compile_service/kqp_compile_service.h>
 #include <ydb/core/kqp/executer_actor/kqp_executer.h>
@@ -27,43 +30,37 @@
 #include <ydb/core/kqp/opt/kqp_query_plan.h>
 #include <ydb/core/kqp/provider/yql_kikimr_provider.h>
 #include <ydb/core/kqp/provider/yql_kikimr_results.h>
-#include <ydb/services/workload_manager/query_classifier.h>
+#include <ydb/core/kqp/rm_service/kqp_rm_service.h>
 #include <ydb/core/kqp/rm_service/kqp_snapshot_manager.h>
 #include <ydb/core/kqp/session_actor/kqp_snapshot_tables.h>
 #include <ydb/core/kqp/tracing/kqp_query_stats_rendering.h>
-#include <ydb/core/ydb_convert/ydb_convert.h>
-#include <ydb/core/tx/schemeshard/schemeshard.h>
-#include <ydb/core/kqp/rm_service/kqp_rm_service.h>
-#include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/library/operation_id/operation_id.h>
-#include <ydb/core/kqp/common/kqp_yql.h>
-
-#include <ydb/core/util/ulid.h>
-#include <ydb/core/util/stlog.h>
-
-#include <ydb/core/actorlib_impl/long_timer.h>
-#include <ydb/core/base/appdata.h>
-#include <ydb/core/base/cputime.h>
-#include <ydb/core/base/path.h>
-#include <ydb/library/aclib/user_context.h>
-#include <ydb/library/wilson_ids/wilson.h>
 #include <ydb/core/protos/kqp.pb.h>
 #include <ydb/core/sys_view/service/sysview_service.h>
+#include <ydb/core/tx/replication/checksum/checksum.h>
+#include <ydb/core/tx/schemeshard/schemeshard.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
-#include <ydb/services/workload_manager/service/service.h>
+#include <ydb/core/util/stlog.h>
+#include <ydb/core/util/ulid.h>
+#include <ydb/core/ydb_convert/ydb_convert.h>
 
+#include <ydb/library/aclib/user_context.h>
 #include <ydb/library/actors/async/wait_for_event.h>
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/event_pb.h>
 #include <ydb/library/actors/core/hfunc.h>
-#include <ydb/library/security/util.h>
-
-#include <util/string/printf.h>
-#include <util/generic/overloaded.h>
-
-#include <yql/essentials/public/issue/yql_issue_message.h>
-
 #include <ydb/library/actors/wilson/wilson_span.h>
 #include <ydb/library/actors/wilson/wilson_trace.h>
+#include <ydb/library/security/util.h>
+#include <ydb/library/wilson_ids/wilson.h>
+#include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/library/operation_id/operation_id.h>
+#include <ydb/services/workload_manager/events.h>
+#include <ydb/services/workload_manager/gateway.h>
+#include <ydb/services/workload_manager/query_classifier.h>
+#include <ydb/services/workload_manager/service/service.h>
+
+#include <util/generic/overloaded.h>
+#include <util/string/printf.h>
+#include <yql/essentials/public/issue/yql_issue_message.h>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::KQP_SESSION
 
@@ -1248,6 +1245,47 @@ public:
             co_return;
         }
 
+        const auto& physical = QueryState->PreparedQuery->GetPhysicalQuery();
+        if (physical.HasChecksumPublication()) {
+            if (!AppData()->FeatureFlags.GetEnableChecksumTable()) {
+                ReplyQueryError(Ydb::StatusIds::PRECONDITION_FAILED, "CHECKSUM TABLE is disabled");
+                co_return;
+            }
+            if (!AppData()->FeatureFlags.GetEnableAsyncReplicationChecksumCheck()) {
+                ReplyQueryError(Ydb::StatusIds::PRECONDITION_FAILED, "CDC checksums are disabled");
+                co_return;
+            }
+            if ((QueryState->HasTxControl() && (!QueryState->Commit || QueryState->GetTxControl().has_tx_id())) ||
+                QueryState->ExternalMvccVersion || QueryState->SplittedExprs.size() > 1 ||
+                physical.ResultBindingsSize() != 1 || AnyOf(physical.GetTransactions(), [](const auto& tx) {
+                    return tx.GetHasEffects() || tx.GetType() == NKqpProto::TKqpPhyTx::TYPE_SCHEME;
+                })) {
+                ReplyQueryError(Ydb::StatusIds::BAD_REQUEST, "Checksum publication requires a standalone statement");
+                co_return;
+            }
+            NReplication::NChecksum::TSettings settings;
+            settings.Database = Settings.Database;
+            const auto& publication = physical.GetChecksumPublication();
+            settings.Path = publication.GetTable();
+            if (publication.HasAlgorithm()) {
+                settings.Algorithm = publication.GetAlgorithm();
+            }
+            if (!settings.Path.StartsWith('/')) {
+                settings.Path = Settings.Database + "/" + settings.Path;
+            }
+            settings.Deadline = Min(QueryState->QueryDeadlines.TimeoutAt, TActivationContext::Now() + TDuration::Hours(1));
+            if (QueryState->QueryDeadlines.CancelAt) {
+                settings.Deadline = Min(settings.Deadline, QueryState->QueryDeadlines.CancelAt);
+            }
+            if (QueryState->HasUserToken()) {
+                settings.UserToken = QueryState->UserToken->GetSerializedToken();
+            }
+            const auto& feeds = publication.GetChangefeeds();
+            ChecksumPublisher =
+                Register(NReplication::NChecksum::PublishChecksum(SelfId(), std::move(settings), { feeds.begin(), feeds.end() }));
+            co_return;
+        }
+
         if (QueryState->NeedPersistentSnapshot()) {
             AcquirePersistentSnapshot();
             co_return;
@@ -1257,6 +1295,22 @@ public:
         }
 
         // Can reply inside (in case of deferred-only transactions) and become ReadyState
+        ExecuteOrDefer();
+    }
+
+    void Handle(NReplication::NChecksum::TEvResult::TPtr& ev) {
+        if (ev->Sender != ChecksumPublisher) {
+            return;
+        }
+        ChecksumPublisher = {};
+        const auto& result = *ev->Get();
+        if (result.Status != Ydb::StatusIds::SUCCESS) {
+            ReplyQueryError(result.Status, "", MessageFromIssues(result.Issues));
+            return;
+        }
+        QueryState->QueryData->ChecksumTimestamp.emplace(result.Snapshot.Step, result.Snapshot.TxId);
+        QueryState->QueryData->PublishedChecksumCount = result.Checksum.row_count();
+        QueryState->QueryData->PublishedChecksumHash = result.Checksum.hash();
         ExecuteOrDefer();
     }
 
@@ -1650,6 +1704,10 @@ public:
         const bool allowModifications = QueryState->IsInternalCall() || QueryState->IsCreateTableAs()
             || AppData()->FeatureFlags.GetEnableClientModifications();
         if (!allowModifications) {
+            if (phyQuery.HasChecksumPublication()) {
+                ReplyQueryError(Ydb::StatusIds::PRECONDITION_FAILED, "Client data writes are disabled");
+                return false;
+            }
             for (const auto& op : phyQuery.GetTableOps()) {
                 if (TYdbOperation(op.GetOperation()) & KikimrModifyOps()) {
                     const TPosition pos(op.GetPosition().GetColumn(), op.GetPosition().GetRow());
@@ -2099,6 +2157,17 @@ public:
     }
 
     void ExecuteOrDefer() {
+        if (QueryState->PreparedQuery) {
+            const auto& physical = QueryState->PreparedQuery->GetPhysicalQuery();
+            if (physical.GetHasChecksumTable() && !physical.HasChecksumPublication()) {
+                const auto& snapshot = QueryState->TxCtx->GetSnapshot();
+                if (snapshot.IsValid() && !QueryState->TxCtx->TxHasEffects() && !physical.GetHasUncommittedChangesRead()) {
+                    QueryState->QueryData->ChecksumTimestamp.emplace(snapshot.Step, snapshot.TxId);
+                } else {
+                    QueryState->QueryData->ChecksumTimestamp.reset();
+                }
+            }
+        }
         bool haveWork = QueryState->PreparedQuery &&
                 QueryState->CurrentTx < QueryState->PreparedQuery->GetPhysicalQuery().TransactionsSize()
                     || QueryState->Commit && !QueryState->Commited;
@@ -3968,6 +4037,9 @@ public:
     }
 
     void Cleanup(bool isFinal = false) {
+        if (ChecksumPublisher) {
+            Send(std::exchange(ChecksumPublisher, TActorId{}), new TEvents::TEvPoison());
+        }
         isFinal = isFinal || QueryState && !QueryState->KeepSession;
 
         if (QueryState && QueryState->TxCtx) {
@@ -4278,6 +4350,7 @@ public:
     STFUNC(ReadyState) {
         try {
             switch (ev->GetTypeRewrite()) {
+                IgnoreFunc(NReplication::NChecksum::TEvResult);
                 // common event handles for all states.
                 hFunc(TEvents::TEvWakeup, PublishCurrentQueryStats);
                 hFunc(TEvKqp::TEvInitiateSessionShutdown, Handle);
@@ -4323,6 +4396,7 @@ public:
     STATEFN(ExecuteState) {
         try {
             switch (ev->GetTypeRewrite()) {
+                hFunc(NReplication::NChecksum::TEvResult, Handle);
                 // common event handles for all states.
                 hFunc(TEvents::TEvWakeup, PublishCurrentQueryStats);
                 hFunc(TEvKqp::TEvInitiateSessionShutdown, Handle);
@@ -4371,6 +4445,7 @@ public:
     STATEFN(CleanupState) {
         try {
             switch (ev->GetTypeRewrite()) {
+                IgnoreFunc(NReplication::NChecksum::TEvResult);
                 // common event handles for all states.
                 hFunc(TEvents::TEvWakeup, PublishCurrentQueryStats);
                 hFunc(TEvKqp::TEvInitiateSessionShutdown, Handle);
@@ -4599,6 +4674,7 @@ private:
     TKqpSettings::TConstPtr KqpSettings;
     std::optional<TActorId> WorkerId;
     Ydb::Table::QueryStatsCollection::Mode WorkerStatsMode = Ydb::Table::QueryStatsCollection::STATS_COLLECTION_NONE;
+    TActorId ChecksumPublisher;
     TActorId ExecuterId;
 
     std::shared_ptr<TKqpQueryState> QueryState;

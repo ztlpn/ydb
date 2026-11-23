@@ -346,7 +346,29 @@ bool TQueryData::AddMkqlParam(const TString& name, const NKikimrMiniKQL::TType& 
 std::pair<NKikimr::NMiniKQL::TType*, NUdf::TUnboxedValue> TQueryData::GetInternalBindingValue(
     const NKqpProto::TKqpPhyParamBinding& paramBinding)
 {
-    return AllocState->GetInternalBindingValue(paramBinding);
+    using TBinding = NKqpProto::TKqpPhyInternalBinding;
+    auto& env = TypeEnv();
+    switch (paramBinding.GetInternalBinding().GetType()) {
+        case TBinding::PARAM_CHECKSUM_TIMESTAMP: {
+            std::pair<TString, TType*> members[] = { { "plan_step", env.GetUi64Lazy() }, { "tx_id", env.GetUi64Lazy() } };
+            auto* type = TOptionalType::Create(TStructType::Create(members, 2, env), env);
+            if (!ChecksumTimestamp) {
+                return { type, TUnboxedValue{} };
+            }
+            TUnboxedValue* items = nullptr;
+            auto value = AllocState->HolderFactory.CreateDirectArrayHolder(2, items);
+            items[0] = TUnboxedValuePod(ChecksumTimestamp->first);
+            items[1] = TUnboxedValuePod(ChecksumTimestamp->second);
+            return { type, value.MakeOptional() };
+        }
+        case TBinding::PARAM_PUBLISHED_CHECKSUM_COUNT:
+            return { env.GetUi64Lazy(), TUnboxedValuePod(PublishedChecksumCount) };
+        case TBinding::PARAM_PUBLISHED_CHECKSUM_HASH:
+            return { NMiniKQL::TDataType::Create(NUdf::TDataType<char*>::Id, env),
+                MakeString(TStringRef(PublishedChecksumHash.data(), PublishedChecksumHash.size())) };
+        default:
+            return AllocState->GetInternalBindingValue(paramBinding);
+    }
 }
 
 TQueryData::TTypedUnboxedValue& TQueryData::GetParameterUnboxedValue(const TString& name) {
@@ -455,7 +477,16 @@ bool TQueryData::MaterializeParamValue(bool ensure, const NKqpProto::TKqpPhyPara
         case NKqpProto::TKqpPhyParamBinding::kInternalBinding: {
             auto guard = TypeEnv().BindAllocator();
             auto [type, value] = GetInternalBindingValue(paramBinding);
-            AddUVParam(paramBinding.GetName(), type, value);
+            using TBinding = NKqpProto::TKqpPhyInternalBinding;
+            const auto binding = paramBinding.GetInternalBinding().GetType();
+            if (binding == TBinding::PARAM_CHECKSUM_TIMESTAMP || binding == TBinding::PARAM_PUBLISHED_CHECKSUM_COUNT ||
+                binding == TBinding::PARAM_PUBLISHED_CHECKSUM_HASH) {
+                // These values belong to this execution, including when the caller supplied extra parameters.
+                UnboxedData[paramBinding.GetName()] = { type, std::move(value) };
+                ParamsProtobuf.erase(paramBinding.GetName());
+            } else {
+                AddUVParam(paramBinding.GetName(), type, value);
+            }
             return true;
         }
         default:

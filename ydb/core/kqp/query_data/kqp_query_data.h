@@ -243,6 +243,10 @@ public:
         return resultIndex < TxResults[txIndex].size();
     }
 
+    std::optional<std::pair<ui64, ui64>> ChecksumTimestamp;
+    ui64 PublishedChecksumCount = 0;
+    TString PublishedChecksumHash;
+
     void AddBuiltResultIndex(ui32 resultIndex) {
         BuiltResultIndexes.insert(resultIndex);
     }

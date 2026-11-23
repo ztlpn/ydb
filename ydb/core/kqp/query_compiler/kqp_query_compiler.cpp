@@ -163,6 +163,12 @@ NKqpProto::TKqpPhyInternalBinding::EType GetPhyInternalBindingType(const std::st
         bindingType = NKqpProto::TKqpPhyInternalBinding::PARAM_CURRENT_DATE;
     } else if (type == "CurrentUtcDatetime"sv) {
         bindingType = NKqpProto::TKqpPhyInternalBinding::PARAM_CURRENT_DATETIME;
+    } else if (type == "KqpChecksumTimestamp"sv) {
+        bindingType = NKqpProto::TKqpPhyInternalBinding::PARAM_CHECKSUM_TIMESTAMP;
+    } else if (type == "KqpPublishedChecksumCount"sv) {
+        bindingType = NKqpProto::TKqpPhyInternalBinding::PARAM_PUBLISHED_CHECKSUM_COUNT;
+    } else if (type == "KqpPublishedChecksumHash"sv) {
+        bindingType = NKqpProto::TKqpPhyInternalBinding::PARAM_PUBLISHED_CHECKSUM_HASH;
     } else if (type == "CurrentUtcTimestamp"sv) {
         bindingType = NKqpProto::TKqpPhyInternalBinding::PARAM_CURRENT_TIMESTAMP;
     } else if (type == "Random"sv) {

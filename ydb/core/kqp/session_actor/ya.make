@@ -20,6 +20,7 @@ PEERDIR(
     ydb/core/kqp/federated_query
     ydb/core/kqp/tracing
     ydb/core/path_aliasing
+    ydb/core/tx/replication/checksum
     ydb/core/tx/schemeshard
     ydb/library/security
     ydb/library/yql/dq/actors/protos

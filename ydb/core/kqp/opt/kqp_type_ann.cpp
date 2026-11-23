@@ -1846,6 +1846,23 @@ TStatus AnnotateOlapExtractMembers(const TExprNode::TPtr& node, TExprContext& ct
     return IGraphTransformer::TStatus::Ok;
 }
 
+TStatus AnnotateChecksumValue(const TExprNode::TPtr& node, TExprContext& ctx) {
+    if (!EnsureArgsCount(*node, 0, ctx)) {
+        return TStatus::Error;
+    }
+    const auto* uint64Type = ctx.MakeType<TDataExprType>(NUdf::EDataSlot::Uint64);
+    if (node->IsCallable("KqpChecksumTimestamp")) {
+        TVector<const TItemExprType*> members{ ctx.MakeType<TItemExprType>("plan_step", uint64Type),
+            ctx.MakeType<TItemExprType>("tx_id", uint64Type) };
+        node->SetTypeAnn(ctx.MakeType<TOptionalExprType>(ctx.MakeType<TStructExprType>(members)));
+    } else if (node->IsCallable("KqpPublishedChecksumCount")) {
+        node->SetTypeAnn(uint64Type);
+    } else {
+        node->SetTypeAnn(ctx.MakeType<TDataExprType>(NUdf::EDataSlot::String));
+    }
+    return TStatus::Ok;
+}
+
 TStatus AnnotateKqpTxInternalBinding(const TExprNode::TPtr& node, TExprContext& ctx) {
     if (!EnsureArgsCount(*node, 2, ctx)) {
         return TStatus::Error;
@@ -4196,6 +4213,7 @@ public:
             TKqpIndexLookupJoin::CallableName(),
         }, Hndl(&AnnotateIndexLookupJoin));
         AddHandler({TKqpTxResultBinding::CallableName()}, Hndl(&AnnotateKqpTxResultBinding));
+        AddHandler({ "KqpChecksumTimestamp", "KqpPublishedChecksumCount", "KqpPublishedChecksumHash" }, Hndl(&AnnotateChecksumValue));
         AddHandler({TKqpTxInternalBinding::CallableName()}, Hndl(&AnnotateKqpTxInternalBinding));
         AddHandler({TKqpPhysicalTx::CallableName()}, Hndl(&AnnotateKqpPhysicalTx));
         AddHandler({TKqpPhysicalQuery::CallableName()}, HndlInt(&AnnotateKqpPhysicalQuery));

@@ -44,6 +44,9 @@ message TKqpPhyInternalBinding {
         PARAM_RANDOM_NUMBER = 5;
         PARAM_RANDOM = 6;
         PARAM_RANDOM_UUID = 7;
+        PARAM_CHECKSUM_TIMESTAMP = 8;
+        PARAM_PUBLISHED_CHECKSUM_COUNT = 9;
+        PARAM_PUBLISHED_CHECKSUM_HASH = 10;
     };
 
     EType Type = 1;
@@ -870,4 +873,11 @@ message TKqpPhyQuery {
     optional EIsolationLevel DefaultTxMode = 19;
     optional bool DisablePessimisticLocks = 20;
     optional uint64 MaxTasksPerStage = 21;
+    bool HasChecksumTable = 22;
+    message TChecksumPublication {
+        string Table = 1;
+        repeated string Changefeeds = 2;
+        optional string Algorithm = 3;
+    }
+    TChecksumPublication ChecksumPublication = 24;
 }

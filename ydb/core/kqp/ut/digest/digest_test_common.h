@@ -65,7 +65,7 @@ inline TDigestResult ReadDigest(const NYdb::TResultSet& result) {
 }
 
 inline TDigestResult ReadChecksum(const NYdb::TResultSet& result) {
-    UNIT_ASSERT_VALUES_EQUAL(result.ColumnsCount(), 4);
+    UNIT_ASSERT_VALUES_EQUAL(result.ColumnsCount(), 5);
     NYdb::TResultSetParser rows(result);
     UNIT_ASSERT(rows.TryNextRow());
     TDigestResult digest{

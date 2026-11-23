@@ -50,6 +50,15 @@ public:
     TKiSinkIntentDeterminationTransformer(TIntrusivePtr<TKikimrSessionContext> sessionCtx)
         : SessionCtx(sessionCtx) {}
 
+    TStatus DoTransform(TExprNode::TPtr input, TExprNode::TPtr& output, TExprContext& ctx) override {
+        if (input->IsCallable({ "KqpChecksumTimestamp", "KqpPublishedChecksumCount", "KqpPublishedChecksumHash" })) {
+            // Session-provided scalar values have no table access intents.
+            output = input;
+            return TStatus::Ok;
+        }
+        return TKiSinkVisitorTransformer::DoTransform(input, output, ctx);
+    }
+
 private:
     TStatus HandleWriteTable(TKiWriteTable node, TExprContext& ctx) override {
         Y_UNUSED(ctx);

@@ -7,9 +7,8 @@
 namespace NKikimr::NKqp::NOpt {
 
 const std::unordered_set<std::string_view>& GetNonDeterministicFunctions() {
-    static const std::unordered_set<std::string_view> functions = {
-        "RandomNumber", "Random", "RandomUuid", "Now", "CurrentUtcDate", "CurrentUtcDatetime", "CurrentUtcTimestamp"
-    };
+    static const std::unordered_set<std::string_view> functions = { "RandomNumber", "Random", "RandomUuid", "Now", "CurrentUtcDate",
+        "CurrentUtcDatetime", "CurrentUtcTimestamp", "KqpChecksumTimestamp", "KqpPublishedChecksumCount", "KqpPublishedChecksumHash" };
     return functions;
 }
 

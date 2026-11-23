@@ -98,8 +98,9 @@ bool NeedSnapshot(const TKqpTransactionContext& txCtx, const NYql::TKikimrConfig
 
     if (rollbackTx)
         return false;
-    if (!commitTx)
+    if (!commitTx || physicalQuery.GetHasChecksumTable()) {
         return true;
+    }
 
     size_t readPhases = 0;
     bool hasEffects = false;

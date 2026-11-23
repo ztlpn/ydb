@@ -215,7 +215,24 @@ Y_UNIT_TEST_SUITE(Digest) {
             UNIT_ASSERT_C(enabled.IsSuccess(), enabled.GetIssues().ToString());
 
             auto enabledScan = tableClient.StreamExecuteScanQuery(query).GetValueSync();
-            CompareYson(FormatResultSetYson(enabled.GetResultSet(0)), StreamResultToYson(enabledScan));
+            // Separate executions can read different MVCC snapshots of the same data.
+            const auto checkDigest = [&](const TResultSet& result) {
+                AssertDigest(query == aggregate ? ReadDigest(result) : ReadChecksum(result), ExpectedDigest(NDigest::EAlgorithm::CityHash64));
+            };
+            checkDigest(enabled.GetResultSet(0));
+            ui64 rows = 0;
+            for (;;) {
+                auto part = enabledScan.ReadNext().GetValueSync();
+                if (!part.IsSuccess()) {
+                    UNIT_ASSERT_C(part.EOS(), part.GetIssues().ToString());
+                    break;
+                }
+                if (part.HasResultSet() && part.GetResultSet().RowsCount()) {
+                    checkDigest(part.GetResultSet());
+                    rows += part.GetResultSet().RowsCount();
+                }
+            }
+            UNIT_ASSERT_VALUES_EQUAL(rows, 1);
 
             flags.SetEnableChecksumTable(false);
             appData.UpdateRuntimeFlags(flags);
@@ -481,6 +498,48 @@ Y_UNIT_TEST_SUITE(Digest) {
         }
     }
 
+    Y_UNIT_TEST(PublicationIsCheckedAtExecution) {
+        TKikimrRunner kikimr(ChecksumTableSettings());
+        auto session = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+        PrepareTables(session);
+        const TString sql = "CHECKSUM TABLE digest_a WITH (PUBLISH_TO_CHANGEFEEDS = ('feed'))";
+        UNIT_ASSERT(session.ExplainDataQuery(sql).GetValueSync().IsSuccess());
+        auto prepared = session.PrepareDataQuery(sql).GetValueSync();
+        UNIT_ASSERT_C(prepared.IsSuccess(), prepared.GetIssues().ToString());
+        auto result = prepared.GetQuery().Execute(TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL(result.GetStatus(), NYdb::EStatus::PRECONDITION_FAILED);
+        UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(), "CDC checksums are disabled");
+        auto ordinary =
+            session.ExecuteDataQuery("CHECKSUM TABLE digest_a WITH (ALGORITHM = 'Sha256')", TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(ordinary.IsSuccess(), ordinary.GetIssues().ToString());
+        AssertDigest(ReadChecksum(ordinary.GetResultSet(0)), ExpectedDigest(NDigest::EAlgorithm::Sha256));
+
+        auto& appData = kikimr.GetTestServer().GetRuntime()->GetAppData();
+        NKikimrConfig::TFeatureFlags flags = appData.FeatureFlags;
+        flags.SetEnableAsyncReplicationChecksumCheck(true);
+        flags.SetEnableChecksumTable(false);
+        appData.UpdateRuntimeFlags(flags);
+        auto disabled = prepared.GetQuery().Execute(TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL(disabled.GetStatus(), NYdb::EStatus::PRECONDITION_FAILED);
+        UNIT_ASSERT_STRING_CONTAINS(disabled.GetIssues().ToString(), "CHECKSUM TABLE is disabled");
+    }
+
+    Y_UNIT_TEST(TransactionLocalWritesHaveNoChecksumTimestamp) {
+        TKikimrRunner kikimr(ChecksumTableSettings());
+        auto session = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+        PrepareTables(session);
+        auto write = session.ExecuteDataQuery("UPSERT INTO digest_a (key, value) VALUES (5, 'local'u)", TTxControl::BeginTx()).GetValueSync();
+        UNIT_ASSERT_C(write.IsSuccess(), write.GetIssues().ToString());
+        auto read = session.ExecuteDataQuery("CHECKSUM TABLE digest_a", TTxControl::Tx(*write.GetTransaction()).CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(read.IsSuccess(), read.GetIssues().ToString());
+        NYdb::TResultSetParser rows(read.GetResultSet(0));
+        UNIT_ASSERT(rows.TryNextRow());
+        UNIT_ASSERT_VALUES_EQUAL(rows.ColumnParser("count").GetUint64(), 4);
+        auto& stamp = rows.ColumnParser("mvcc_timestamp");
+        stamp.OpenOptional();
+        UNIT_ASSERT(stamp.IsNull());
+    }
+
     Y_UNIT_TEST(CommandSnapshotRemainsStableAcrossWrites) {
         TKikimrRunner kikimr(ChecksumTableSettings());
         auto session =
@@ -510,18 +569,41 @@ Y_UNIT_TEST_SUITE(Digest) {
                      ExpectedDigest(NDigest::EAlgorithm::Sha256));
         AssertDigest(ReadChecksum(second.GetResultSet(0)),
                      ExpectedDigest(NDigest::EAlgorithm::Sha256));
+        auto version = [](const auto& result) {
+            NYdb::TResultSetParser parser(result.GetResultSet(0));
+            UNIT_ASSERT(parser.TryNextRow());
+            auto& stamp = parser.ColumnParser("mvcc_timestamp");
+            stamp.OpenOptional();
+            UNIT_ASSERT(!stamp.IsNull());
+            stamp.OpenStruct();
+            std::pair<ui64, ui64> value{};
+            while (stamp.TryNextMember()) {
+                if (stamp.GetMemberName() == "plan_step") {
+                    value.first = stamp.GetUint64();
+                } else {
+                    UNIT_ASSERT_VALUES_EQUAL(stamp.GetMemberName(), "tx_id");
+                    value.second = stamp.GetUint64();
+                }
+            }
+            UNIT_ASSERT(value.first);
+            return value;
+        };
+        UNIT_ASSERT(version(first) == version(second));
         const auto latest = QueryChecksum(session, "digest_a", "Sha256");
         UNIT_ASSERT(ReadChecksum(latest.GetResultSet(0)).Hash !=
                     ReadChecksum(first.GetResultSet(0)).Hash);
     }
 
     Y_UNIT_TEST(CommandRequiresTableReadPermission) {
-        TKikimrRunner kikimr(
-            ChecksumTableSettings().SetAuthToken(
-                "root@builtin"));
+        auto settings = ChecksumTableSettings().SetAuthToken("root@builtin");
+        settings.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        TKikimrRunner kikimr(settings);
         auto session =
             kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
         PrepareTables(session);
+        auto feed =
+            session.ExecuteSchemeQuery("ALTER TABLE digest_a ADD CHANGEFEED feed WITH (FORMAT = 'JSON', MODE = 'UPDATES')").GetValueSync();
+        UNIT_ASSERT_C(feed.IsSuccess(), feed.GetIssues().ToString());
         const TString subject = "checksum_reader@builtin";
         const auto connect =
             kikimr.GetSchemeClient()
@@ -561,8 +643,14 @@ Y_UNIT_TEST_SUITE(Digest) {
         Tests::TClient::RefreshPathCache(kikimr.GetTestServer().GetRuntime(),
                                          "/Root/digest_a");
         const auto allowed = QueryChecksum(reader, "digest_a");
-        AssertDigest(ReadChecksum(allowed.GetResultSet(0)),
-                     ExpectedDigest(NDigest::EAlgorithm::CityHash64));
+        AssertDigest(ReadChecksum(allowed.GetResultSet(0)), ExpectedDigest(NDigest::EAlgorithm::CityHash64));
+
+        const TString publish = "CHECKSUM TABLE digest_a WITH (PUBLISH_TO_CHANGEFEEDS = ('feed'))";
+        const auto denied = reader.ExecuteDataQuery(publish, TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(denied.GetStatus() == EStatus::UNAUTHORIZED || denied.GetStatus() == EStatus::SCHEME_ERROR, denied.GetIssues().ToString());
+        const auto published = kikimr.GetQueryClient().ExecuteQuery(publish, NYdb::NQuery::TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(published.IsSuccess(), published.GetIssues().ToString());
+        AssertDigest(ReadChecksum(published.GetResultSet(0)), ExpectedDigest(NDigest::EAlgorithm::CityHash64));
     }
 } // Y_UNIT_TEST_SUITE(Digest)
 
