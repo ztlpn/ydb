@@ -6,6 +6,7 @@ import "ydb/public/api/protos/ydb_issue_message.proto";
 import "ydb/public/api/protos/ydb_common.proto";
 import "ydb/public/api/protos/ydb_operation.proto";
 import "ydb/public/api/protos/ydb_scheme.proto";
+import "ydb/public/api/protos/ydb_status_codes.proto";
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
@@ -25,6 +26,13 @@ message DescribeReplicationRequest {
 message DescribeReplicationResponse {
     // Result of request will be inside operation.
     Ydb.Operations.Operation operation = 1;
+}
+
+message TableChecksum {
+    uint64 row_count = 1;
+    // Uppercase hexadecimal hash with 16 (CityHash64), 32 (CityHash128), or 64 (Sha256) digits.
+    // An empty table has a zero in every digit.
+    string hash = 2;
 }
 
 message ConnectionParams {
@@ -92,6 +100,22 @@ message DescribeReplicationResult {
         // Issues reported for this item. An item can carry issues while the replication
         // itself still reports running.
         repeated Ydb.Issue.IssueMessage issues = 6;
+
+        message ChecksumStatus {
+            message Result {
+                TableChecksum source = 1;
+                TableChecksum destination = 2;
+                bool matches = 3;
+                google.protobuf.Timestamp finished_at = 4;
+            }
+            // Latest attempt; unspecified status until complete. A mismatch is SUCCESS with matches=false.
+            Ydb.StatusIds.StatusCode status = 1;
+            repeated Ydb.Issue.IssueMessage issues = 2;
+            google.protobuf.Timestamp finished_at = 3;
+            // Preserved when a later attempt fails.
+            Result last_result = 4;
+        }
+        ChecksumStatus checksum_status = 7;
     }
 
     message RunningState {

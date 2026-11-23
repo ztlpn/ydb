@@ -1,3 +1,5 @@
+* Added draft replication item checksum status and the last completed source/destination comparison for CityHash64, CityHash128, and Sha256.
+
 ## v3.28.0
 
 * Fixed endpoint pessimization percentages so unhealthy endpoint pools trigger discovery correctly, including pools with more than 100 endpoints.

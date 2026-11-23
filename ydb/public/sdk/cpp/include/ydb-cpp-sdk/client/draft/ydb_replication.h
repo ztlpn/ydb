@@ -16,6 +16,7 @@ namespace Ydb::Replication {
     class DescribeReplicationResult_Stats;
     class DescribeTransferResult;
     class DescribeTransferResult_Stats;
+    class DescribeReplicationResult_Item_ChecksumStatus;
 }
 
 namespace NYdb::inline Dev::NDraft {
@@ -32,7 +33,29 @@ struct TDescribeReplicationSettings: public TOperationRequestSettings<TDescribeR
     FLUENT_SETTING_DEFAULT(bool, IncludeStats, false);
 };
 
-struct TDescribeTransferSettings: public TDescribeReplicationSettings {
+struct TDescribeTransferSettings: public TDescribeReplicationSettings {};
+
+struct TTableChecksum {
+    uint64_t RowCount = 0;
+    // Uppercase hexadecimal hash with 16 (CityHash64), 32 (CityHash128), or 64 (Sha256) digits.
+    // An empty table has a zero in every digit.
+    std::string Hash;
+};
+
+struct TChecksumStatus {
+    struct TResult {
+        TTableChecksum Source;
+        TTableChecksum Destination;
+        bool Matches = false;
+        TInstant FinishedAt;
+    };
+
+    EStatus Status;
+    NYdb::NIssue::TIssues Issues;
+    TInstant FinishedAt;
+    std::optional<TResult> LastResult;
+
+    explicit TChecksumStatus(const Ydb::Replication::DescribeReplicationResult_Item_ChecksumStatus& proto);
 };
 
 struct TStaticCredentials {
@@ -145,6 +168,7 @@ public:
         std::optional<std::string> SrcChangefeedName;
         // Issues reported for this item.
         NYdb::NIssue::TIssues Issues;
+        std::optional<TChecksumStatus> ChecksumStatus;
     };
 
     enum class EConsistencyLevel {

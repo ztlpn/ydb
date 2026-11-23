@@ -15,6 +15,41 @@ Y_UNIT_TEST_SUITE(ReplicationDescription) {
         UNIT_ASSERT(!desc.GetAvailabilityPeriod());
     }
 
+    Y_UNIT_TEST(ChecksumPresenceAndRetainedComparison) {
+        Ydb::Replication::DescribeReplicationResult proto;
+        auto* item = proto.add_items();
+        UNIT_ASSERT(!TDescription(proto).GetItems().at(0).ChecksumStatus);
+
+        auto* status = item->mutable_checksum_status();
+        const auto pending = TDescription(proto).GetItems().at(0).ChecksumStatus;
+        UNIT_ASSERT(pending);
+        UNIT_ASSERT(!pending->LastResult);
+
+        status->set_status(Ydb::StatusIds::TIMEOUT);
+        status->add_issues()->set_message("Source result did not arrive");
+        status->mutable_finished_at()->set_seconds(10);
+        auto* result = status->mutable_last_result();
+        result->mutable_finished_at()->set_seconds(5);
+        result->mutable_source()->set_row_count(3);
+        result->mutable_source()->set_hash("0000000000000001");
+        result->mutable_destination()->set_row_count(2);
+        result->mutable_destination()->set_hash("0000000000000002");
+        result->set_matches(false);
+
+        const auto parsed = TDescription(proto).GetItems().at(0).ChecksumStatus;
+        UNIT_ASSERT(parsed);
+        UNIT_ASSERT_VALUES_EQUAL(parsed->Status, EStatus::TIMEOUT);
+        UNIT_ASSERT_VALUES_EQUAL(parsed->FinishedAt, TInstant::Seconds(10));
+        UNIT_ASSERT_STRING_CONTAINS(parsed->Issues.ToString(), "Source result did not arrive");
+        UNIT_ASSERT(parsed->LastResult);
+        UNIT_ASSERT_VALUES_EQUAL(parsed->LastResult->FinishedAt, TInstant::Seconds(5));
+        UNIT_ASSERT_VALUES_EQUAL(parsed->LastResult->Source.RowCount, 3);
+        UNIT_ASSERT_VALUES_EQUAL(parsed->LastResult->Destination.RowCount, 2);
+        UNIT_ASSERT_VALUES_EQUAL(parsed->LastResult->Source.Hash, "0000000000000001");
+        UNIT_ASSERT_VALUES_EQUAL(parsed->LastResult->Destination.Hash, "0000000000000002");
+        UNIT_ASSERT(!parsed->LastResult->Matches);
+    }
+
     Y_UNIT_TEST(AvailabilityPeriodUnlimited) {
         Ydb::Replication::DescribeReplicationResult proto;
         proto.mutable_availability_period()->mutable_unlimited();
