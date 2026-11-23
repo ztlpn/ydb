@@ -34,7 +34,10 @@ public:
             return ESchemaChangeResult::Error;
         }
 
-        if (jsonRecord.GetKind() != NChangeExchange::IChangeRecord::EKind::CdcSchemaChange) {
+        const auto kind = jsonRecord.GetKind();
+        if (kind != NChangeExchange::IChangeRecord::EKind::CdcSchemaChange &&
+            kind != NChangeExchange::IChangeRecord::EKind::CdcChecksumCheckpoint &&
+            kind != NChangeExchange::IChangeRecord::EKind::CdcChecksumResult) {
             return ESchemaChangeResult::NotSchemaChange;
         }
 

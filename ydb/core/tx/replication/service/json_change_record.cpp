@@ -1,3 +1,4 @@
+#include <ydb/core/change_exchange/cdc_checksum.h>
 #include "json_change_record.h"
 
 #include <ydb/core/io_formats/cell_maker/cell_maker.h>
@@ -248,6 +249,10 @@ ui64 TChangeRecord::GetStep() const {
         case EKind::CdcDataChange: return NService::GetStep(JsonBody, "ts");
         case EKind::CdcHeartbeat: return NService::GetStep(JsonBody, "resolved");
         case EKind::CdcSchemaChange: return NService::GetStep(JsonBody, "ts");
+        case EKind::CdcChecksumCheckpoint:
+            return NService::GetStep(JsonBody["checksum_checkpoint"], "ts");
+        case EKind::CdcChecksumResult:
+            return NService::GetStep(JsonBody["checksum_result"], "ts");
         default: Y_ABORT("unreachable");
     }
 }
@@ -257,6 +262,10 @@ ui64 TChangeRecord::GetTxId() const {
         case EKind::CdcDataChange: return NService::GetTxId(JsonBody, "ts");
         case EKind::CdcHeartbeat: return NService::GetTxId(JsonBody, "resolved");
         case EKind::CdcSchemaChange: return NService::GetTxId(JsonBody, "ts");
+        case EKind::CdcChecksumCheckpoint:
+            return NService::GetTxId(JsonBody["checksum_checkpoint"], "ts");
+        case EKind::CdcChecksumResult:
+            return NService::GetTxId(JsonBody["checksum_result"], "ts");
         default: Y_ABORT("unreachable");
     }
 }
@@ -270,6 +279,12 @@ bool TChangeRecord::IsValidJson(TString& error) const {
 }
 
 NChangeExchange::IChangeRecord::EKind TChangeRecord::GetKind() const {
+    if (JsonBody.Has("checksum_checkpoint")) {
+        return EKind::CdcChecksumCheckpoint;
+    }
+    if (JsonBody.Has("checksum_result")) {
+        return EKind::CdcChecksumResult;
+    }
     if (JsonBody.Has("resolved")) {
         return EKind::CdcHeartbeat;
     }
@@ -421,6 +436,16 @@ bool TChangeRecord::TryGetSchemaChange(NKikimrReplication::TSchemaChange& schema
         return false;
     }
 
+    if (NChangeExchange::IsCdcChecksum(JsonBody)) {
+        schema.Clear();
+        if (!NChangeExchange::ParseCdcChecksum(JsonBody, *schema.MutableChecksum(), error)) {
+            return false;
+        }
+        TRowVersion(schema.GetChecksum().GetSnapshotStep(), schema.GetChecksum().GetSnapshotTxId())
+            .ToProto(schema.MutableVersion());
+        schema.SetSourceSchemaVersion(1);
+        return true;
+    }
     if (GetKind() != EKind::CdcSchemaChange) {
         error = "record is not a schema change";
         return false;

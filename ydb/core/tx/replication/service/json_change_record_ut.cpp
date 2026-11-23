@@ -1,4 +1,5 @@
 #include "json_change_record.h"
+#include <ydb/core/change_exchange/cdc_checksum.h>
 
 #include <ydb/core/io_formats/json/json.h>
 #include <ydb/core/protos/base.pb.h>
@@ -11,6 +12,7 @@
 #include <ydb/core/tx/datashard/change_record_cdc_serializer.h>
 #include <ydb/library/aclib/user_context.h>
 #include <ydb/library/testlib/helpers.h>
+#include <ydb/public/api/protos/draft/ydb_replication.pb.h>
 
 #include <contrib/libs/zstd/include/zstd.h>
 
@@ -561,6 +563,169 @@ Y_UNIT_TEST_SUITE(JsonChangeRecord) {
         UNIT_ASSERT_VALUES_EQUAL(record->GetKind(), TChangeRecord::EKind::CdcHeartbeat);
         UNIT_ASSERT_VALUES_EQUAL(record->GetStep(), 10);
         UNIT_ASSERT_VALUES_EQUAL(record->GetTxId(), 20);
+    }
+
+    Y_UNIT_TEST(ChecksumControlRoundTrip) {
+        NKikimrChangeExchange::TCdcChecksum control;
+        control.SetProtocolVersion(1);
+        control.MutableTableId()->SetOwnerId(42);
+        control.MutableTableId()->SetLocalId(17);
+        control.SetSnapshotStep(100);
+        control.SetSnapshotTxId(20);
+        control.SetAlgorithm("CityHash64");
+        control.SetAlgorithmVersion(1);
+        control.AddExpectedPartitions(0);
+        control.AddExpectedPartitions(8);
+        for (const bool result : {false, true}) {
+            control.SetResult(result);
+            if (result) {
+                control.SetStatus(Ydb::StatusIds::SUCCESS);
+                control.MutableChecksum()->set_row_count(7);
+                control.MutableChecksum()->set_hash("0123456789ABCDEF");
+            }
+            const auto json = NChangeExchange::SerializeCdcChecksum(control);
+            const auto& value = json[result ? "checksum_result" : "checksum_checkpoint"];
+            for (const auto* removed : { "id", "table", "schema", "snapshot" }) {
+                UNIT_ASSERT(!value.Has(removed));
+            }
+            UNIT_ASSERT_VALUES_EQUAL(value["ts"][0].GetUInteger(), 100);
+            UNIT_ASSERT_VALUES_EQUAL(value["ts"][1].GetUInteger(), 20);
+            auto record = TChangeRecordBuilder().WithBody(NJson::WriteJson(json)).Build();
+            UNIT_ASSERT_VALUES_EQUAL(record->GetKind(), result
+                ? TChangeRecord::EKind::CdcChecksumResult : TChangeRecord::EKind::CdcChecksumCheckpoint);
+            UNIT_ASSERT_VALUES_EQUAL(record->GetStep(), 100);
+            UNIT_ASSERT_VALUES_EQUAL(record->GetTxId(), 20);
+            NKikimrReplication::TSchemaChange parsed;
+            TString error;
+            UNIT_ASSERT_C(record->TryGetSchemaChange(parsed, error), error);
+            UNIT_ASSERT(parsed.HasChecksum());
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetChecksum().ExpectedPartitionsSize(), 2);
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetChecksum().GetExpectedPartitions(0), 0);
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetChecksum().GetExpectedPartitions(1), 8);
+            UNIT_ASSERT(!parsed.GetChecksum().HasTableId());
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetChecksum().GetResult(), result);
+            if (result) {
+                UNIT_ASSERT_VALUES_EQUAL(value["status"].GetString(), "SUCCESS");
+                UNIT_ASSERT_VALUES_EQUAL(parsed.GetChecksum().GetChecksum().SerializeAsString(),
+                    control.GetChecksum().SerializeAsString());
+            }
+        }
+    }
+
+    Y_UNIT_TEST(RejectMalformedChecksumControls) {
+        NKikimrChangeExchange::TCdcChecksum control;
+        control.SetSnapshotStep(100);
+        control.SetSnapshotTxId(20);
+        control.AddExpectedPartitions(0);
+        control.SetResult(true);
+        control.SetStatus(Ydb::StatusIds::SUCCESS);
+        control.MutableChecksum()->set_hash("0123456789ABCDEF");
+        const auto valid = NChangeExchange::SerializeCdcChecksum(control);
+        for (ui32 mutation = 0; mutation < 18; ++mutation) {
+            auto json = valid;
+            auto& value = json["checksum_result"];
+            switch (mutation) {
+            case 0: value["version"] = 2; break;
+            case 1:
+                value["ts"] = "100:20";
+                break;
+            case 2: value["hash"] = "0123456789abcdef"; break;
+            case 3: value["row_count"] = -1; break;
+            case 4: json["checksum_checkpoint"] = value; break;
+            case 5:
+                value["status"] = "STATUS_CODE_UNSPECIFIED";
+                break;
+            case 6:
+                value["status"] = 400000;
+                break;
+            case 7:
+                value["partitions"].AppendValue(-1);
+                break;
+            case 8:
+                value["partitions"].AppendValue(3);
+                value["partitions"].AppendValue(3);
+                break;
+            case 9:
+                value["partitions"].AppendValue(0x100000000ull);
+                break;
+            case 10:
+                value["status"] = "UNKNOWN_STATUS";
+                break;
+            case 11:
+                value["ts"][0] = 0;
+                break;
+            case 12:
+                value["ts"][1] = -1;
+                break;
+            case 13:
+                value["algorithm"] = "UnknownHash";
+                break;
+            case 14:
+                value["algorithm_version"] = 2;
+                break;
+            case 15:
+                value.EraseValue("partitions");
+                break;
+            case 16:
+                value["partitions"].EraseValue(size_t{0});
+                break;
+            case 17:
+                value["algorithm"] = "CityHash128"; // The hash is only 16 digits.
+                break;
+            }
+            auto record = TChangeRecordBuilder().WithBody(NJson::WriteJson(json)).Build();
+            NKikimrReplication::TSchemaChange parsed;
+            TString error;
+            UNIT_ASSERT(!record->TryGetSchemaChange(parsed, error));
+            UNIT_ASSERT(!error.empty());
+        }
+    }
+
+    Y_UNIT_TEST(ChecksumFailureStatuses) {
+        for (const auto status : { Ydb::StatusIds::ABORTED, Ydb::StatusIds::CANCELLED, Ydb::StatusIds::TIMEOUT, Ydb::StatusIds::UNAVAILABLE,
+                 Ydb::StatusIds::PRECONDITION_FAILED }) {
+            NKikimrChangeExchange::TCdcChecksum control;
+            control.SetSnapshotStep(Max<ui64>());
+            control.SetSnapshotTxId(Max<ui64>());
+            control.AddExpectedPartitions(0);
+            control.SetResult(true);
+            control.SetStatus(status);
+            control.AddIssues()->set_message("Source checksum failed");
+            const auto json = NChangeExchange::SerializeCdcChecksum(control);
+            const auto& value = json["checksum_result"];
+            UNIT_ASSERT_VALUES_EQUAL(value["status"].GetString(), Ydb::StatusIds::StatusCode_Name(status));
+            UNIT_ASSERT(!value.Has("hash"));
+            UNIT_ASSERT(!value.Has("row_count"));
+            NKikimrChangeExchange::TCdcChecksum parsed;
+            TString error;
+            UNIT_ASSERT_C(NChangeExchange::ParseCdcChecksum(json, parsed, error), error);
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetStatus(), status);
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetSnapshotStep(), Max<ui64>());
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetSnapshotTxId(), Max<ui64>());
+            UNIT_ASSERT_VALUES_EQUAL(parsed.GetIssues(0).message(), "Source checksum failed");
+        }
+    }
+
+    Y_UNIT_TEST(ChecksumResultUsesStableSinglePartitionRouting) {
+        using TSourceRecord = NDataShard::TChangeRecord;
+        NKikimrChangeExchange::TCdcChecksum control;
+        control.SetSnapshotStep(100);
+        control.SetSnapshotTxId(20);
+        control.AddExpectedPartitions(0);
+        const auto checkpoint =
+            NDataShard::TChangeRecordBuilder(TSourceRecord::EKind::CdcChecksumCheckpoint).WithBody(control.SerializeAsString()).Build();
+        UNIT_ASSERT(checkpoint->IsBroadcast());
+
+        control.SetResult(true);
+        control.SetStatus(Ydb::StatusIds::SUCCESS);
+        control.MutableChecksum()->set_hash("0000000000000000");
+        const auto result =
+            NDataShard::TChangeRecordBuilder(TSourceRecord::EKind::CdcChecksumResult).WithOrder(1).WithBody(control.SerializeAsString()).Build();
+        const auto retry =
+            NDataShard::TChangeRecordBuilder(TSourceRecord::EKind::CdcChecksumResult).WithOrder(1).WithBody(control.SerializeAsString()).Build();
+        UNIT_ASSERT(!result->IsBroadcast());
+        UNIT_ASSERT_VALUES_EQUAL(result->GetPartitionKey().size(), 32);
+        UNIT_ASSERT_VALUES_EQUAL(result->GetPartitionKey(), retry->GetPartitionKey());
     }
 
     Y_UNIT_TEST(SchemaChange) {

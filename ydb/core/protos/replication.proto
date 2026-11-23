@@ -1,8 +1,10 @@
+import "ydb/core/protos/change_exchange.proto";
 import "ydb/core/scheme/protos/pathid.proto";
 import "ydb/core/protos/base.proto";
 import "ydb/core/protos/metrics_config.proto";
 import "ydb/public/api/protos/annotations/sensitive.proto";
 import "ydb/public/api/protos/ydb_issue_message.proto";
+import "ydb/public/api/protos/ydb_status_codes.proto";
 import "ydb/public/api/protos/draft/ydb_replication.proto";
 
 import "google/protobuf/duration.proto";
@@ -117,6 +119,7 @@ message TReplicationConfig {
             optional uint32 LagMilliSeconds = 5;
             optional float InitialScanProgress = 6; // pencentage
             repeated Ydb.Issue.IssueMessage Issues = 7;
+            optional Ydb.Replication.DescribeReplicationResult.Item.ChecksumStatus ChecksumStatus = 8;
         }
 
         repeated TTarget Targets = 1;
@@ -590,6 +593,8 @@ message TSchemaChange {
     repeated TFamily Families = 5;
     // Presence distinguishes a known empty set from legacy snapshots.
     optional TIndexes Indexes = 6;
+    // Shares only the durable worker barrier handshake with schema changes.
+    optional NKikimrChangeExchange.TCdcChecksum Checksum = 7;
 }
 
 message TEvSchemaChangeReport {
@@ -612,4 +617,25 @@ message TEvSchemaChangeResult {
     optional bool Applied = 4 [default = false];
     optional bool Completed = 5 [default = false];
     optional uint64 Offset = 6;
+}
+
+// Durable destination join state. A stored snapshot must never be replaced after
+// releasing workers, including after controller recovery.
+message TCdcChecksumAttempt {
+    optional NKikimrChangeExchange.TCdcChecksum Checkpoint = 1;
+    optional NKikimrChangeExchange.TCdcChecksum SourceResult = 2;
+    optional NKikimrProto.TRowVersion DestinationSnapshot = 3;
+    optional Ydb.Replication.TableChecksum DestinationChecksum = 4;
+    optional Ydb.StatusIds.StatusCode LocalStatus = 5;
+    repeated Ydb.Issue.IssueMessage Issues = 6;
+    optional uint64 DeadlineUs = 7;
+    optional uint64 FinishedAtUs = 9;
+}
+
+message TCdcChecksumState {
+    repeated TCdcChecksumAttempt Attempts = 1;
+    optional Ydb.Replication.DescribeReplicationResult.Item.ChecksumStatus Status = 2;
+    optional NKikimrProto.TRowVersion Latest = 3;
+    // Independent of the latest attempt: earlier comparisons can finish later.
+    optional NKikimrProto.TRowVersion LastCompared = 4;
 }

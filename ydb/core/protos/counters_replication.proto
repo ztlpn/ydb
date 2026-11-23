@@ -21,6 +21,8 @@ enum ESimpleCounters {
     COUNTER_UNRESOLVED_DATABASE_REPLICATIONS = 11 [(CounterOpts) = {Name: "UnresolvedDatabaseReplications"}];
     // Includes every replication whose aggregate lag is unavailable, regardless of state.
     COUNTER_DATA_LAG_UNAVAILABLE_REPLICATIONS = 12 [(CounterOpts) = {Name: "DataLagUnavailableReplications"}];
+    COUNTER_CHECKSUM_MISMATCH = 13 [(CounterOpts) = {Name: "ChecksumMismatch"}];
+    COUNTER_CHECKSUM_ACTIVE = 14 [(CounterOpts) = {Name: "ChecksumActive"}];
 }
 
 enum ECumulativeCounters {
@@ -30,6 +32,8 @@ enum ECumulativeCounters {
     COUNTER_TOO_MANY_OPEN_TX_IDS = 3 [(CounterOpts) = {Name: "TooManyOpenTxIds"}];
     COUNTER_TX_IDS_EXHAUSTED = 4 [(CounterOpts) = {Name: "TxIdsExhausted"}];
     COUNTER_ERROR_COMMITTING_CHANGES = 5 [(CounterOpts) = {Name: "ErrorCommittingChanges"}];
+    COUNTER_CHECKSUM_FAILURES = 6 [(CounterOpts) = {Name: "ChecksumFailures"}];
+    COUNTER_CHECKSUM_TIMEOUTS = 7 [(CounterOpts) = {Name: "ChecksumTimeouts"}];
 }
 
 enum EPercentileCounters {
@@ -39,6 +43,15 @@ enum EPercentileCounters {
     };
 
     COUNTER_PERCENTILE_IGNORE = 0;
+    COUNTER_CHECKSUM_BARRIER_DURATION_MS = 1 [(CounterOpts) = {
+        Name: "ChecksumBarrierDurationMs"
+        Ranges { Value: 10 Name: "10 ms" }
+        Ranges { Value: 100 Name: "100 ms" }
+        Ranges { Value: 1000 Name: "1 s" }
+        Ranges { Value: 10000 Name: "10 s" }
+        Ranges { Value: 60000 Name: "1 min" }
+        Ranges { Value: 3600000 Name: "1 hour" }
+    }];
 }
 
 enum ETxTypes {
@@ -69,4 +82,5 @@ enum ETxTypes {
     TXTYPE_PREPARE_ATTACH_DST_DEPRECATED = 24 [deprecated = true];
     TXTYPE_INDEX_BUILD = 25 [(TxTypeOpts) = {Name: "TxIndexBuild"}];
     TXTYPE_SOURCE_OFFSET_REPORT = 26 [(TxTypeOpts) = {Name: "TxSourceOffsetReport"}];
+    TXTYPE_CHECKSUM = 27 [(TxTypeOpts) = {Name: "TxChecksum"}];
 }

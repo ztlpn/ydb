@@ -74,6 +74,9 @@ STFUNC(TController::StateWork) {
     YDB_LOG_CREATE_CONTEXT(LogPrefix,
         {"actorState", "StateWork"});
     switch (ev->GetTypeRewrite()) {
+        HFunc(NChecksum::TEvSnapshot, Handle);
+        HFunc(NChecksum::TEvResult, Handle);
+        HFunc(TEvents::TEvWakeup, Handle);
         HFunc(TEvController::TEvCreateReplication, Handle);
         HFunc(TEvController::TEvAlterReplication, Handle);
         HFunc(TEvController::TEvDropReplication, Handle);
@@ -133,6 +136,10 @@ void TController::Cleanup(const TActorContext& ctx) {
         Send(actorId, new TEvents::TEvPoison());
     }
     SchemaChangeDstAlterers.clear();
+    for (const auto& [actor, _] : ChecksumQueries) {
+        Send(actor, new TEvents::TEvPoison());
+    }
+    ChecksumQueries.clear();
     for (const auto& [_, actorId] : IndexReadyActors) {
         Send(actorId, new TEvents::TEvPoison());
     }
@@ -202,6 +209,7 @@ void TController::SwitchToWork(const TActorContext& ctx) {
             StartSchemaChangeDstAlter(key, ctx);
         }
     }
+    ProgressChecksums(ctx);
     RunTxIndexBuild(ctx);
     for (const auto replicationId : DeferredAlters) {
         if (!HasPendingAlter(replicationId)) {
@@ -233,6 +241,7 @@ void TController::Reset() {
     WorkersByHeartbeat.clear();
     CompleteWorkerSets.clear();
     SchemaBarriers.clear();
+    ChecksumStates.clear();
     DeferredAlters.clear();
     SchemaTargetFlushes.clear();
     ActiveSchemaTargetFlush.reset();
@@ -253,7 +262,9 @@ bool TController::HasActiveSchemaBarrier(ui64 replicationId) const {
 }
 
 bool TController::HasPendingAlter(ui64 replicationId) const {
-    if (HasActiveSchemaBarrier(replicationId)) {
+    if (HasActiveSchemaBarrier(replicationId) || AnyOf(ChecksumStates, [this, replicationId](const auto& item) {
+        return item.first.first == replicationId && HasChecksumReads(item.first);
+    })) {
         return true;
     }
 

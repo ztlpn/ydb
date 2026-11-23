@@ -147,6 +147,10 @@ class TController::TTxInit: public TTxBase {
             if (workerSetComplete) {
                 Self->CompleteWorkerSets.insert({rid, tid});
             }
+            const auto checksum = rowset.GetValueOrDefault<Schema::Targets::CdcChecksum>(TString());
+            if (!checksum.empty()) {
+                Y_ENSURE(Self->ChecksumStates[std::make_pair(rid, tid)].ParseFromString(checksum));
+            }
             const auto barrierPhase = rowset.GetValueOrDefault<Schema::Targets::SchemaBarrierPhase>(0);
             if (barrierPhase) {
                 auto& barrier = Self->SchemaBarriers[{rid, tid}];
@@ -350,11 +354,6 @@ class TController::TTxInit: public TTxBase {
             && LoadProcessedSourceOffsets(db);
     }
 
-    inline bool Load(NTable::TDatabase& toughDb) {
-        NIceDb::TNiceDb db(toughDb);
-        return Load(db);
-    }
-
 public:
     explicit TTxInit(TSelf* self)
         : TTxBase("TxInit", self)
@@ -368,7 +367,8 @@ public:
     bool Execute(TTransactionContext& txc, const TActorContext& ctx) override {
         YDB_LOG_CREATE_CONTEXT(TxLogPrefix);
         YDB_LOG_DEBUG_CTX(ctx, "Execute");
-        return Load(txc.DB);
+        NIceDb::TNiceDb db(txc.DB);
+        return Load(db);
     }
 
     void Complete(const TActorContext& ctx) override {

@@ -3,6 +3,8 @@
 #include "replication.h"
 
 #include <ydb/core/base/defs.h>
+#include <ydb/core/base/row_version.h>
+#include <ydb/public/api/protos/ydb_status_codes.pb.h>
 #include <ydb/core/base/events.h>
 #include <ydb/core/scheme/scheme_pathid.h>
 #include <ydb/core/protos/flat_tx_scheme.pb.h>
@@ -251,6 +253,8 @@ struct TEvPrivate {
     {
         const ui64 DstAlterTxId;
         bool RequiresTargetFlush = false;
+        TRowVersion ChecksumSnapshot;
+        Ydb::StatusIds::StatusCode ChecksumSnapshotStatus = Ydb::StatusIds::STATUS_CODE_UNSPECIFIED;
 
         explicit TEvSchemaChangeDstAlterResult(ui64 rid, ui64 tid, ui64 dstAlterTxId,
             NKikimrScheme::EStatus status = NKikimrScheme::StatusSuccess, const TString& error = {});

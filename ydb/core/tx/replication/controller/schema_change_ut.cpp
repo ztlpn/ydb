@@ -1,5 +1,5 @@
-#include "controller_impl.h"
 #include "controller.h"
+#include "controller_impl.h"
 #include "dst_alterer.h"
 #include "dst_creator.h"
 #include "dst_schema_changer.h"
@@ -9,28 +9,36 @@
 
 #include <ydb/core/base/path.h>
 #include <ydb/core/base/tablet_pipecache.h>
+#include <ydb/core/change_exchange/cdc_checksum.h>
+#include <ydb/core/change_exchange/change_exchange.h>
+#include <ydb/core/persqueue/events/internal.h>
+#include <ydb/core/protos/change_exchange.pb.h>
+#include <ydb/core/protos/grpc_pq_old.pb.h>
+#include <ydb/core/protos/schemeshard/operations.pb.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/tablet_helpers.h>
 #include <ydb/core/testlib/tx_helpers.h>
-#include <ydb/core/protos/schemeshard/operations.pb.h>
-#include <ydb/core/tx/scheme_cache/scheme_cache.h>
 #include <ydb/core/tx/replication/service/service.h>
-#include <ydb/core/tx/tx_proxy/proxy.h>
 #include <ydb/core/tx/replication/ut_helpers/mock_service.h>
 #include <ydb/core/tx/replication/ut_helpers/test_env.h>
 #include <ydb/core/tx/replication/ut_helpers/test_table.h>
+#include <ydb/core/tx/scheme_cache/scheme_cache.h>
+#include <ydb/core/tx/tx_proxy/proxy.h>
+
 #include <ydb/library/actors/core/actor_bootstrapped.h>
 #include <ydb/library/actors/core/executor_pool_base.h>
 #include <ydb/library/mkql_proto/protos/minikql.pb.h>
 #include <ydb/library/testlib/helpers.h>
-#include <library/cpp/testing/unittest/registar.h>
 
+#include <library/cpp/json/json_reader.h>
+#include <library/cpp/testing/unittest/registar.h>
+#include <util/datetime/base.h>
 #include <util/generic/algorithm.h>
 #include <util/generic/scope.h>
 #include <util/string/builder.h>
+#include <util/string/escape.h>
 #include <util/string/join.h>
 #include <util/string/printf.h>
-#include <util/datetime/base.h>
 
 #include <atomic>
 #include <functional>
@@ -573,7 +581,7 @@ struct TReplicationTestInfo {
     ui32 Generation = 0;
 };
 
-void CreateSourceTable(TTestEnv& env, const TString& name) {
+void CreateSourceTable(TTestEnv& env, const TString& name, TMaybe<ui32> partitions = Nothing()) {
     env.CreateTable("/Root", *NTestHelpers::MakeTableDescription(NTestHelpers::TTestTableDescription{
         .Name = name,
         .KeyColumns = {"key"},
@@ -582,6 +590,7 @@ void CreateSourceTable(TTestEnv& env, const TString& name) {
             {.Name = "value", .Type = "Utf8"},
         },
         .ReplicationConfig = Nothing(),
+        .UniformPartitions = partitions,
     }));
 }
 
@@ -664,7 +673,9 @@ TReplicationTestInfo StartReplication(
         bool globalConsistency = false, bool withIndex = false,
         NKikimrSchemeOp::EIndexType indexType = NKikimrSchemeOp::EIndexTypeGlobal, bool mockService = true,
         TMaybe<bool> initialScan = Nothing(),
-        std::shared_ptr<std::atomic<ui32>> workerStarts = {})
+        std::shared_ptr<std::atomic<ui32>> workerStarts = {},
+        TMaybe<ui32> sourcePartitions = Nothing(),
+        TDuration commitInterval = TDuration::Seconds(10))
 {
     NYdb::NTable::TTableClient client(env.GetDriver(), NYdb::NTable::TClientSettings()
         .DiscoveryEndpoint(env.GetEndpoint())
@@ -686,7 +697,7 @@ TReplicationTestInfo StartReplication(
             });
             UNIT_ASSERT_C(status.IsSuccess(), status.GetIssues().ToString());
         } else {
-            CreateSourceTable(env, Sprintf("table%i", i));
+            CreateSourceTable(env, Sprintf("table%i", i), sourcePartitions);
         }
     }
 
@@ -710,7 +721,7 @@ TReplicationTestInfo StartReplication(
     }
     if (globalConsistency) {
         params.push_back(R"(CONSISTENCY_LEVEL = "GLOBAL")");
-        params.push_back(R"(COMMIT_INTERVAL = Interval("PT10S"))");
+        params.push_back(Sprintf(R"(COMMIT_INTERVAL = Interval("PT%luS"))", commitInterval.Seconds()));
     }
     if (initialScan) {
         params.push_back(TStringBuilder() << "INITIAL_SCAN = " << (*initialScan ? "TRUE" : "FALSE"));
@@ -3532,6 +3543,497 @@ Y_UNIT_TEST_SUITE(AttachmentLifecycle) {
         }
     }
 
+}
+
+Y_UNIT_TEST_SUITE(ChecksumBarrier) {
+    using namespace NTestHelpers;
+
+    NKikimrReplication::TSchemaChange Checkpoint(ui64 step = 100, ui64 txId = 10) {
+        NKikimrReplication::TSchemaChange control;
+        control.MutableVersion()->SetStep(step);
+        control.MutableVersion()->SetTxId(txId);
+        control.SetSourceSchemaVersion(1);
+        auto* checksum = control.MutableChecksum();
+        checksum->SetProtocolVersion(1);
+        checksum->SetSnapshotStep(step);
+        checksum->SetSnapshotTxId(txId);
+        return control;
+    }
+
+    NKikimrReplication::TCdcChecksumState ReadChecksumState(TTestEnv & env, ui64 controllerId, const TWorkerId& worker) {
+        NKikimrMiniKQL::TResult result;
+        const auto status = LocalQuery(env.GetRuntime(), controllerId, Sprintf(R"((
+            (let key '('('ReplicationId (Uint64 '%lu)) '('Id (Uint64 '%lu))))
+            (return (AsList (SetResult 'Checksum (SelectRow 'Targets key '('CdcChecksum)))))
+        ))", worker.ReplicationId(), worker.TargetId()), result);
+        UNIT_ASSERT_VALUES_EQUAL(status, NKikimrProto::OK);
+        const auto& row = result.GetValue().GetStruct(0).GetOptional();
+        UNIT_ASSERT_C(row.HasOptional(), result.DebugString());
+        const auto& value = row.GetOptional().GetStruct(0);
+        NKikimrReplication::TCdcChecksumState state;
+        if (value.HasOptional()) {
+            UNIT_ASSERT(state.ParseFromString(value.GetOptional().GetBytes()));
+        }
+        return state;
+    }
+
+    TRowVersion Publish(NYdb::NTable::TSession& session, TStringBuf path, TStringBuf feed, ui64 count, TStringBuf algorithm = {}) {
+        TStringBuilder sql;
+        sql << "CHECKSUM TABLE `" << path << "` WITH (";
+        if (!algorithm.empty()) {
+            sql << "ALGORITHM = '" << algorithm << "', ";
+        }
+        sql << "PUBLISH_TO_CHANGEFEEDS = (\"" << EscapeC(TString(feed)) << "\"))";
+        const auto result = session.ExecuteDataQuery(sql, NYdb::NTable::TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        const auto& row = result.GetResultSet(0);
+        UNIT_ASSERT_VALUES_EQUAL(row.ColumnsCount(), 5);
+        NYdb::TResultSetParser parser(row);
+        UNIT_ASSERT(parser.TryNextRow());
+        UNIT_ASSERT_VALUES_EQUAL(parser.ColumnParser("count").GetUint64(), count);
+        UNIT_ASSERT_VALUES_EQUAL(parser.ColumnParser("algorithm").GetUtf8(), algorithm.empty() ? TStringBuf("CityHash64") : algorithm);
+        auto& timestamp = parser.ColumnParser("mvcc_timestamp");
+        timestamp.OpenOptional();
+        UNIT_ASSERT(!timestamp.IsNull());
+        timestamp.OpenStruct();
+        TRowVersion version{};
+        while (timestamp.TryNextMember()) {
+            if (timestamp.GetMemberName() == "plan_step") {
+                version.Step = timestamp.GetUint64();
+            } else {
+                UNIT_ASSERT_VALUES_EQUAL(timestamp.GetMemberName(), "tx_id");
+                version.TxId = timestamp.GetUint64();
+            }
+        }
+        UNIT_ASSERT(version.Step && version.TxId);
+        return version;
+    }
+
+    Y_UNIT_TEST(PublishOnAnOrdinaryJsonFeed) {
+        TFeatureFlags flags;
+        flags.FeatureFlags.SetEnableChecksumTable(true);
+        flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        TEnv env(flags);
+        CreateSourceTable(env, "source");
+        auto client = CreateTableClient(env);
+        auto session = CreateTableSession(env, client);
+
+        const auto altered = session.AlterTable("/Root/source", NYdb::NTable::TAlterTableSettings()
+            .AppendAddChangefeeds(NYdb::NTable::TChangefeedDescription("feed",
+                NYdb::NTable::EChangefeedMode::Updates, NYdb::NTable::EChangefeedFormat::Json))).GetValueSync();
+        UNIT_ASSERT_C(altered.IsSuccess(), altered.GetIssues().ToString());
+        const auto first = Publish(session, "/Root/source", "feed", 0);
+        UNIT_ASSERT(first < Publish(session, "/Root/source", "feed", 0));
+        const TString sql = "CHECKSUM TABLE source WITH (PUBLISH_TO_CHANGEFEEDS = ('feed'))";
+        const auto denied = session.ExecuteDataQuery(sql, NYdb::NTable::TTxControl::BeginTx()).GetValueSync();
+        UNIT_ASSERT_VALUES_EQUAL_C(denied.GetStatus(), NYdb::EStatus::BAD_REQUEST, denied.GetIssues().ToString());
+        const auto multi = session.ExecuteDataQuery("SELECT 1; " + sql, NYdb::NTable::TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT(!multi.IsSuccess());
+        auto another = CreateTableSession(env, client);
+        auto a = session.ExecuteDataQuery(sql, NYdb::NTable::TTxControl::BeginTx().CommitTx());
+        auto b = another.ExecuteDataQuery(sql, NYdb::NTable::TTxControl::BeginTx().CommitTx());
+        const auto firstResult = a.GetValueSync();
+        const auto secondResult = b.GetValueSync();
+        UNIT_ASSERT_C(firstResult.IsSuccess(), firstResult.GetIssues().ToString());
+        UNIT_ASSERT_C(secondResult.IsSuccess(), secondResult.GetIssues().ToString());
+    }
+
+    Y_UNIT_TEST(SelectsOnlyNamedChangefeeds) {
+        TEnv env(true, ERuntimeMode::Simulated);
+        auto& runtime = env.GetRuntime();
+        runtime.GetAppData().FeatureFlags.SetEnableChecksumTable(true);
+        runtime.GetAppData().FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        runtime.GetAppData().FeatureFlags.SetEnableChangefeedDebeziumJsonFormat(true);
+        CreateSourceTable(env, "source");
+        auto client = CreateTableClient(env);
+        auto session = CreateTableSession(env, client);
+        auto addFeed = [&](const TString& name, NYdb::NTable::EChangefeedFormat format) {
+            const auto created = env.RunCall([&] {
+                return session
+                    .AlterTable("/Root/source", NYdb::NTable::TAlterTableSettings().AppendAddChangefeeds(
+                                                    NYdb::NTable::TChangefeedDescription(name, NYdb::NTable::EChangefeedMode::NewImage, format)))
+                    .GetValueSync();
+            });
+            UNIT_ASSERT_C(created.IsSuccess(), created.GetIssues().ToString());
+        };
+        for (const TString name : { "audit,EU", "orders", "untouched" }) {
+            addFeed(name, NYdb::NTable::EChangefeedFormat::Json);
+        }
+        addFeed("debezium", NYdb::NTable::EChangefeedFormat::DebeziumJson);
+
+        TVector<NKikimrChangeExchange::TCdcChecksum> proposals;
+        auto observed = runtime.AddObserver<TEvTxUserProxy::TEvProposeTransaction>([&](TEvTxUserProxy::TEvProposeTransaction::TPtr& ev) {
+            const auto& tx = ev->Get()->Record.GetTransaction().GetCreateVolatileSnapshot();
+            if (tx.HasPublishChecksum()) {
+                proposals.push_back(tx.GetPublishChecksum());
+            }
+        });
+        auto publish = [&](const TString& feeds) {
+            return env.RunCall([&] {
+                return session
+                    .ExecuteDataQuery(
+                        "CHECKSUM TABLE source WITH (PUBLISH_TO_CHANGEFEEDS = (" + feeds + "))", NYdb::NTable::TTxControl::BeginTx().CommitTx())
+                    .GetValueSync();
+            });
+        };
+        for (const TString list : { "'orders', 'missing'", "'audit,eu'", "'orders', 'debezium'" }) {
+            const auto rejected = publish(list);
+            UNIT_ASSERT_C(!rejected.IsSuccess(), list);
+            UNIT_ASSERT(proposals.empty());
+        }
+        const auto published = publish("'orders', 'audit,EU'");
+        UNIT_ASSERT_C(published.IsSuccess(), published.GetIssues().ToString());
+        UNIT_ASSERT_VALUES_EQUAL(proposals.size(), 2);
+        UNIT_ASSERT(!proposals[0].GetResult());
+        UNIT_ASSERT(proposals[1].GetResult());
+        for (const auto& proposal : proposals) {
+            THashSet<TString> names;
+            for (const auto& feed : proposal.GetStreams()) {
+                names.insert(feed.GetName());
+            }
+            UNIT_ASSERT_VALUES_EQUAL(proposal.StreamsSize(), 2);
+            UNIT_ASSERT(names.contains("audit,EU") && names.contains("orders"));
+        }
+    }
+
+    Y_UNIT_TEST(ResultIsDeliveredToOnePartition) {
+        TEnv env(true, ERuntimeMode::Simulated);
+        auto& runtime = env.GetRuntime();
+        runtime.GetAppData().FeatureFlags.SetEnableChecksumTable(true);
+        runtime.GetAppData().FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        CreateSourceTable(env, "source", 2);
+        auto client = CreateTableClient(env);
+        auto session = CreateTableSession(env, client);
+        const auto altered = env.RunCall([&] {
+            return session
+                .AlterTable("/Root/source", NYdb::NTable::TAlterTableSettings().AppendAddChangefeeds(NYdb::NTable::TChangefeedDescription(
+                                                "feed", NYdb::NTable::EChangefeedMode::Updates, NYdb::NTable::EChangefeedFormat::Json)))
+                .GetValueSync();
+        });
+        UNIT_ASSERT_C(altered.IsSuccess(), altered.GetIssues().ToString());
+
+        THashSet<TActorId> checkpointPartitions;
+        THashSet<TActorId> resultPartitions;
+        TMaybe<ui64> resultOrder;
+        bool resultRemoved = false;
+        auto writes = runtime.AddObserver<TEvPQ::TEvWrite>([&](TEvPQ::TEvWrite::TPtr& ev) {
+            for (const auto& msg : ev->Get()->Msgs) {
+                NKikimrPQClient::TDataChunk chunk;
+                NJson::TJsonValue json;
+                if (!chunk.ParseFromString(msg.Data) || !NJson::ReadJsonTree(chunk.GetData(), &json) || !NChangeExchange::IsCdcChecksum(json)) {
+                    continue;
+                }
+                if (json.Has("checksum_checkpoint")) {
+                    UNIT_ASSERT(msg.SchemaChangeVersion);
+                    checkpointPartitions.insert(ev->GetRecipientRewrite());
+                } else {
+                    UNIT_ASSERT(!msg.SchemaChangeVersion);
+                    resultPartitions.insert(ev->GetRecipientRewrite());
+                    resultOrder = msg.SeqNo;
+                }
+            }
+        });
+        auto removed = runtime.AddObserver<NChangeExchange::TEvChangeExchange::TEvRemoveRecords>([&](auto& ev) {
+            if (resultOrder && Find(ev->Get()->Records, *resultOrder) != ev->Get()->Records.end()) {
+                resultRemoved = true;
+            }
+        });
+        env.RunCall([&] {
+            return Publish(session, "/Root/source", "feed", 0);
+        });
+        runtime.WaitFor("checksum result acknowledgement", [&] {
+            return resultRemoved;
+        }, TDuration::Seconds(30));
+        UNIT_ASSERT_VALUES_EQUAL(checkpointPartitions.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(resultPartitions.size(), 1);
+        UNIT_ASSERT(checkpointPartitions.contains(*resultPartitions.begin()));
+    }
+
+    Y_UNIT_TEST(FailureAfterCheckpointPublishesTerminalStatus) {
+        TEnv env(true, ERuntimeMode::Simulated);
+        auto& runtime = env.GetRuntime();
+        runtime.GetAppData().FeatureFlags.SetEnableChecksumTable(true);
+        runtime.GetAppData().FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        CreateSourceTable(env, "source");
+        auto client = CreateTableClient(env);
+        auto session = CreateTableSession(env, client);
+        const auto altered = env.RunCall([&] {
+            return session
+                .AlterTable("/Root/source", NYdb::NTable::TAlterTableSettings().AppendAddChangefeeds(NYdb::NTable::TChangefeedDescription(
+                                                "feed", NYdb::NTable::EChangefeedMode::Updates, NYdb::NTable::EChangefeedFormat::Json)))
+                .GetValueSync();
+        });
+        UNIT_ASSERT_C(altered.IsSuccess(), altered.GetIssues().ToString());
+
+        for (const bool cancel : { true, false }) {
+            NChecksum::TSettings settings;
+            settings.Database = "/Root";
+            settings.Path = "/Root/source";
+            settings.Deadline = runtime.GetCurrentTime() + TDuration::Hours(1);
+            const auto publisher = runtime.Register(NChecksum::PublishChecksum(env.GetSender(), std::move(settings), { "feed" }));
+            NChecksum::TEvSnapshot::TPtr checkpoint;
+            auto paused = runtime.AddObserver<NChecksum::TEvSnapshot>([&](NChecksum::TEvSnapshot::TPtr& ev) {
+                if (ev->Recipient == publisher) {
+                    checkpoint = ev.Release();
+                }
+            });
+            NKikimrChangeExchange::TCdcChecksum terminal;
+            auto proposals = runtime.AddObserver<TEvTxUserProxy::TEvProposeTransaction>([&](TEvTxUserProxy::TEvProposeTransaction::TPtr& ev) {
+                const auto& control = ev->Get()->Record.GetTransaction().GetCreateVolatileSnapshot().GetPublishChecksum();
+                if (control.GetResult()) {
+                    terminal = control;
+                }
+            });
+            runtime.WaitFor("published checkpoint", [&] {
+                return bool(checkpoint);
+            }, TDuration::Seconds(30));
+            UNIT_ASSERT_VALUES_EQUAL(checkpoint->Get()->Status, Ydb::StatusIds::SUCCESS);
+            const auto snapshot = checkpoint->Get()->Snapshot;
+            if (cancel) {
+                runtime.Send(new IEventHandle(publisher, env.GetSender(), new TEvents::TEvPoison()));
+            } else {
+                const auto ddl = env.RunCall([&] {
+                    return session.ExecuteSchemeQuery("ALTER TABLE source ADD COLUMN added Uint64").GetValueSync();
+                });
+                UNIT_ASSERT_C(ddl.IsSuccess(), ddl.GetIssues().ToString());
+            }
+            paused.Remove();
+            runtime.Send(checkpoint.Release());
+            auto result = runtime.GrabEdgeEvent<NChecksum::TEvResult>(env.GetSender());
+            const auto status = cancel ? Ydb::StatusIds::CANCELLED : Ydb::StatusIds::PRECONDITION_FAILED;
+            UNIT_ASSERT_VALUES_EQUAL_C(result->Get()->Status, status, result->Get()->Issues.ToString());
+            UNIT_ASSERT_VALUES_EQUAL(terminal.GetStatus(), status);
+            UNIT_ASSERT_VALUES_EQUAL(terminal.GetSnapshotStep(), snapshot.Step);
+            UNIT_ASSERT_VALUES_EQUAL(terminal.GetSnapshotTxId(), snapshot.TxId);
+            UNIT_ASSERT(!terminal.HasChecksum());
+        }
+    }
+
+    Y_UNIT_TEST(PartitionMismatchReleasesWorkerWithoutComparison) {
+        TFeatureFlags flags;
+        flags.FeatureFlags.SetEnableChecksumTable(true);
+        flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        TEnv env(flags);
+        const auto info = StartReplication(env);
+        const auto run = env.GetRuntime().GrabEdgeEvent<TEvService::TEvRunWorker>(env.GetSender());
+        const auto worker = TWorkerId::Parse(run->Get()->Record.GetWorker());
+        AttachWorkers(env, info.ControllerId, { worker });
+        auto control = Checkpoint();
+        control.MutableChecksum()->AddExpectedPartitions(worker.WorkerId());
+        control.MutableChecksum()->AddExpectedPartitions(worker.WorkerId() + 1);
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, control));
+        env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, worker, control);
+        const auto described = DescribeReplication(env, info);
+        const auto& result = described->Get()->Record.GetTargets(0).GetChecksumStatus();
+        UNIT_ASSERT_VALUES_EQUAL(result.status(), Ydb::StatusIds::PRECONDITION_FAILED);
+        UNIT_ASSERT(!result.has_last_result());
+    }
+
+    Y_UNIT_TEST(DisabledControlsAdvanceWithoutAlteringSchema) {
+        TEnv env;
+        const auto info = StartReplication(env);
+        const auto run = env.GetRuntime().GrabEdgeEvent<TEvService::TEvRunWorker>(env.GetSender());
+        const auto worker = TWorkerId::Parse(run->Get()->Record.GetWorker());
+        AttachWorkers(env, info.ControllerId, {worker});
+        auto control = Checkpoint();
+        control.MutableChecksum()->AddExpectedPartitions(worker.WorkerId());
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, control));
+        env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, worker, control);
+        control.MutableChecksum()->SetResult(true);
+        control.MutableChecksum()->SetStatus(Ydb::StatusIds::CANCELLED);
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, control));
+        env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, worker, control);
+        UNIT_ASSERT_VALUES_EQUAL(env.GetDescription("/Root/replica1").GetPathDescription().GetTable().ColumnsSize(), 2);
+        const auto described = DescribeReplication(env, info);
+        UNIT_ASSERT(!described->Get()->Record.GetState().HasError());
+        UNIT_ASSERT_VALUES_EQUAL(described->Get()->Record.GetTargets(0).GetChecksumStatus().status(), Ydb::StatusIds::UNSUPPORTED);
+    }
+
+    Y_UNIT_TEST(RowEmptyComparison) {
+        TFeatureFlags flags;
+        flags.FeatureFlags.SetEnableChecksumTable(true);
+        flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        TEnv env(flags);
+        const auto info = StartReplication(env);
+        const auto run = env.GetRuntime().GrabEdgeEvent<TEvService::TEvRunWorker>(env.GetSender());
+        const auto worker = TWorkerId::Parse(run->Get()->Record.GetWorker());
+        AttachWorkers(env, info.ControllerId, {worker});
+        auto control = Checkpoint();
+        control.MutableChecksum()->AddExpectedPartitions(worker.WorkerId());
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, control));
+        env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, worker, control);
+        // A new attempt may reach the destination before an earlier result.
+        // It owns the latest status, but must not hide a completed comparison.
+        // Distinct checkpoints can share a plan step; the transaction ID is part of the identity.
+        auto next = Checkpoint(100, 20);
+        next.MutableChecksum()->AddExpectedPartitions(worker.WorkerId());
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, next));
+        env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, worker, next);
+        // Deliver the source result after workers are released. The local read
+        // is free to finish on either side of this arrival.
+        auto result = control;
+        result.MutableChecksum()->SetResult(true);
+        result.MutableChecksum()->SetStatus(Ydb::StatusIds::SUCCESS);
+        result.MutableChecksum()->MutableChecksum()->set_row_count(0);
+        result.MutableChecksum()->MutableChecksum()->set_hash("0000000000000000");
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, result));
+        env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, worker, result);
+        UNIT_ASSERT(WaitFor([&] {
+            const auto description = DescribeReplication(env, info);
+            const auto& status = description->Get()->Record.GetTargets(0).GetChecksumStatus();
+            if (!status.has_last_result()) {
+                UNIT_ASSERT_C(status.status() == Ydb::StatusIds::STATUS_CODE_UNSPECIFIED, status.DebugString());
+                return false;
+            }
+            UNIT_ASSERT(status.last_result().matches());
+            const auto state = ReadChecksumState(env, info.ControllerId, worker);
+            UNIT_ASSERT(TRowVersion::FromProto(state.GetLastCompared()) == TRowVersion(100, 10));
+            UNIT_ASSERT(TRowVersion::FromProto(state.GetLatest()) == TRowVersion(100, 20));
+            UNIT_ASSERT_VALUES_EQUAL(status.status(), Ydb::StatusIds::STATUS_CODE_UNSPECIFIED);
+            return true;
+        }));
+        auto failure = next;
+        failure.MutableChecksum()->SetResult(true);
+        failure.MutableChecksum()->SetStatus(Ydb::StatusIds::ABORTED);
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, failure));
+        env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, worker, failure);
+        // Offset replay of the old result cannot replace a newer failure or
+        // erase the last completed comparison.
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, result));
+        env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, worker, result);
+        const auto description = DescribeReplication(env, info);
+        const auto& status = description->Get()->Record.GetTargets(0).GetChecksumStatus();
+        UNIT_ASSERT_VALUES_EQUAL(status.status(), Ydb::StatusIds::ABORTED);
+        const auto state = ReadChecksumState(env, info.ControllerId, worker);
+        UNIT_ASSERT(TRowVersion::FromProto(state.GetLatest()) == TRowVersion(100, 20));
+        UNIT_ASSERT(TRowVersion::FromProto(state.GetLastCompared()) == TRowVersion(100, 10));
+        UNIT_ASSERT(status.last_result().matches());
+        UNIT_ASSERT_VALUES_EQUAL(env.GetDescription("/Root/replica1").GetPathDescription().GetTable().ColumnsSize(), 2);
+    }
+
+    Y_UNIT_TEST(MissingSnapshotTableReportsSchemeError) {
+        TEnv env;
+        env.GetRuntime().Register(NChecksum::CreateSnapshot(env.GetSender(), "/Root", "/Root/missing",
+            TInstant::Now() + TDuration::Minutes(1)));
+        const auto result = env.GetRuntime().GrabEdgeEvent<NChecksum::TEvSnapshot>(env.GetSender());
+        UNIT_ASSERT_VALUES_EQUAL(result->Get()->Status, Ydb::StatusIds::SCHEME_ERROR);
+    }
+
+    void CheckCdcPublicationWithData(bool global) {
+        TFeatureFlags flags;
+        flags.FeatureFlags.SetEnableChecksumTable(true);
+        flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        flags.FeatureFlags.SetEnableTopicAutopartitioningForReplication(false);
+        TEnv env(flags);
+        const auto info =
+            StartReplication(env, 2, "root@builtin", global, false, NKikimrSchemeOp::EIndexTypeGlobal, false, true, {}, 2, TDuration::Hours(1));
+        auto client = CreateTableClient(env);
+        auto session = CreateTableSession(env, client);
+        TString feed;
+        UNIT_ASSERT_C(WaitFor([&] {
+            const auto description = DescribeReplication(env, info);
+            UNIT_ASSERT_C(!description->Get()->Record.GetState().HasError(), description->Get()->Record.DebugString());
+            UNIT_ASSERT(!description->Get()->Record.GetState().HasPaused());
+            if (description->Get()->Record.TargetsSize() != 2 ||
+                env.GetDescription("/Root/replica1").GetSchemeStatus() != NKikimrScheme::StatusSuccess ||
+                env.GetDescription("/Root/replica2").GetSchemeStatus() != NKikimrScheme::StatusSuccess) {
+                return false;
+            }
+            for (const auto& item : description->Get()->Record.GetTargets()) {
+                if (item.GetSrcPath() == "/Root/table1") {
+                    feed = item.GetSrcStreamName();
+                }
+                const auto stream = env.GetDescription(item.GetSrcPath() + "/" + item.GetSrcStreamName());
+                if (stream.GetPathDescription().GetCdcStreamDescription().GetState() != NKikimrSchemeOp::ECdcStreamStateReady) {
+                    return false;
+                }
+            }
+            return true;
+        }, 600), "Replication destinations and initial scans were not ready");
+
+        const auto write = [&](ui32 key, const char* value) {
+            // Touch both source shards and both tables in one transaction.
+            const auto query = Sprintf(R"(
+                UPSERT INTO `/Root/table1` (key, value) VALUES (%uu, '%s'), (%uu, '%s');
+                UPSERT INTO `/Root/table2` (key, value) VALUES (%uu, '%s'), (%uu, '%s');
+            )", key, value, Max<ui32>() - key, value, key, value, Max<ui32>() - key, value);
+            UNIT_ASSERT_C(WaitFor([&] {
+                const auto result = session.ExecuteDataQuery(query,
+                    NYdb::NTable::TTxControl::BeginTx().CommitTx()).GetValueSync();
+                if (result.IsSuccess()) {
+                    return true;
+                }
+                UNIT_ASSERT_C(result.GetStatus() == NYdb::EStatus::ABORTED ||
+                    result.GetStatus() == NYdb::EStatus::OVERLOADED, result.GetIssues().ToString());
+                return false;
+            }, 600), "Source transaction failed");
+        };
+
+        for (ui32 round = 1; round <= 2; ++round) {
+            write(round, "before");
+            const auto sourceSnapshot = Publish(session, "/Root/table1", feed, round * 2, round == 1 ? "CityHash128" : "Sha256");
+
+            // Later writes must not enter the retained destination snapshot.
+            write(round + 1, "after");
+            UNIT_ASSERT_C(WaitFor([&] {
+                const auto description = DescribeReplication(env, info);
+                UNIT_ASSERT_C(!description->Get()->Record.GetState().HasError(), description->Get()->Record.DebugString());
+                bool finished = false;
+                for (const auto& item : description->Get()->Record.GetTargets()) {
+                    if (item.GetDstPath() == "/Root/replica2") {
+                        UNIT_ASSERT(!item.HasChecksumStatus());
+                        continue;
+                    }
+                    const auto& status = item.GetChecksumStatus();
+                    const auto state = ReadChecksumState(env, info.ControllerId, TWorkerId(1, item.GetId(), 0));
+                    if (!state.HasLatest() || TRowVersion::FromProto(state.GetLatest()) != sourceSnapshot) {
+                        continue;
+                    }
+                    if (global) {
+                        UNIT_ASSERT_VALUES_EQUAL_C(status.status(), Ydb::StatusIds::UNSUPPORTED, status.DebugString());
+                        UNIT_ASSERT(!status.has_last_result());
+                        UNIT_ASSERT_STRING_CONTAINS(status.DebugString(), "GLOBAL");
+                        finished = true;
+                        continue;
+                    }
+                    UNIT_ASSERT_C(status.status() == Ydb::StatusIds::STATUS_CODE_UNSPECIFIED ||
+                        status.status() == Ydb::StatusIds::SUCCESS, status.DebugString());
+                    if (status.has_last_result() && state.HasLastCompared() &&
+                        TRowVersion::FromProto(state.GetLastCompared()) == sourceSnapshot) {
+                        UNIT_ASSERT_C(status.last_result().matches(), status.DebugString());
+                        UNIT_ASSERT_VALUES_EQUAL(status.last_result().destination().row_count(), round * 2);
+                        UNIT_ASSERT_VALUES_EQUAL(status.last_result().destination().hash().size(), round == 1 ? 32 : 64);
+                        finished = true;
+                    }
+                }
+                return finished;
+            }, 600), "CDC checkpoint did not finish: " << DescribeReplication(env, info)->Get()->Record.DebugString());
+            if (global) {
+                const auto read = session
+                                      .ExecuteDataQuery("SELECT key FROM replica1; SELECT key FROM replica2;",
+                                          NYdb::NTable::TTxControl::BeginTx(NYdb::NTable::TTxSettings::SnapshotRO()).CommitTx())
+                                      .GetValueSync();
+                UNIT_ASSERT_C(read.IsSuccess(), read.GetIssues().ToString());
+                UNIT_ASSERT_VALUES_EQUAL(read.GetResultSet(0).RowsCount(), read.GetResultSet(1).RowsCount());
+            }
+        }
+    }
+
+    Y_UNIT_TEST(RowCdcPublicationWithData) {
+        CheckCdcPublicationWithData(false);
+    }
+
+    Y_UNIT_TEST(GlobalSkipsPublishedChecksumsWithData) {
+        CheckCdcPublicationWithData(true);
+    }
 }
 
 Y_UNIT_TEST_SUITE(SchemaChangeBarrier) {
