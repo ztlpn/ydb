@@ -1,3 +1,4 @@
+* `ydb scheme describe` now displays async replication checksum status, issues, completion times, and the last comparison's match result, row counts, and hashes in pretty output.
 
 ## 2.36.0 ##
 

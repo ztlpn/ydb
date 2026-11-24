@@ -1093,6 +1093,32 @@ int TDescribeLogic::PrintReplicationResponsePretty(const NYdb::NReplication::TDe
             }
         }
         Out << Endl << "Items:" << Endl << table;
+
+        for (const auto& item : items) {
+            if (!item.ChecksumStatus) {
+                continue;
+            }
+            const auto& status = *item.ChecksumStatus;
+            Out << Endl << "Checksum for item #" << item.Id << ":" << Endl;
+            Out << "  Latest attempt: " << (status.Status == EStatus::STATUS_UNDEFINED ? "Pending" : ToString(status.Status)) << Endl;
+            if (status.FinishedAt) {
+                Out << "  Finished at: " << FormatTime(status.FinishedAt) << Endl;
+            }
+            if (!status.Issues.Empty()) {
+                Out << "  Issues: " << status.Issues.ToOneLineString() << Endl;
+            }
+            if (status.LastResult) {
+                const auto& comparison = *status.LastResult;
+                Out << "  Last comparison: " << (comparison.Matches ? "MATCH" : "MISMATCH") << Endl;
+                if (comparison.FinishedAt) {
+                    Out << "  Compared at: " << FormatTime(comparison.FinishedAt) << Endl;
+                }
+                TPrettyTable checksums({ "", "Rows", "Hash" });
+                checksums.AddRow().Column(0, "Source").Column(1, comparison.Source.RowCount).Column(2, comparison.Source.Hash);
+                checksums.AddRow().Column(0, "Destination").Column(1, comparison.Destination.RowCount).Column(2, comparison.Destination.Hash);
+                Out << checksums;
+            }
+        }
     }
 
     Out << Endl;
