@@ -280,15 +280,26 @@ class TController::TTxSchemaChangeReport: public TTxBase {
             TSchemaBarrier barrier;
             barrier.Schema.CopyFrom(schema);
 
-            // Snapshot the complete current target membership before recording
-            // the first report. It is persisted in this same transaction, so
-            // recovery cannot observe a partially collected barrier.
-            for (const auto& [workerId, _] : Self->Workers) {
-                if (workerId.ReplicationId() != id.ReplicationId() || workerId.TargetId() != id.TargetId()) {
-                    continue;
+            // A checksum describes a historical cut, independent of the current
+            // worker roster. Descendants may start only after their parents drain.
+            if (schema.HasChecksum()) {
+                for (ui32 partition : schema.GetChecksum().GetExpectedPartitions()) {
+                    barrier.ExpectedWorkers.emplace(id.ReplicationId(), id.TargetId(), partition);
                 }
+            } else {
+                for (const auto& [workerId, _] : Self->Workers) {
+                    if (workerId.ReplicationId() == id.ReplicationId() && workerId.TargetId() == id.TargetId()) {
+                        barrier.ExpectedWorkers.insert(workerId);
+                    }
+                }
+            }
+            if (!barrier.ExpectedWorkers.contains(id)) {
+                YDB_LOG_ERROR_CTX(ctx, "Cannot establish schema barrier membership",
+                    {"worker", id});
+                return nullptr;
+            }
 
-                barrier.ExpectedWorkers.insert(workerId);
+            for (const auto& workerId : barrier.ExpectedWorkers) {
                 db.Table<Schema::SchemaBarrierWorkers>()
                     .Key(workerId.ReplicationId(), workerId.TargetId(), workerId.WorkerId())
                     .Update(
@@ -297,12 +308,6 @@ class TController::TTxSchemaChangeReport: public TTxBase {
                         NIceDb::TUpdate<Schema::SchemaBarrierWorkers::Completed>(false),
                         NIceDb::TUpdate<Schema::SchemaBarrierWorkers::Offset>(0),
                         NIceDb::TUpdate<Schema::SchemaBarrierWorkers::IndexMetadata>(false));
-            }
-
-            if (barrier.ExpectedWorkers.empty() || !barrier.ExpectedWorkers.contains(id)) {
-                YDB_LOG_ERROR_CTX(ctx, "Cannot establish schema barrier membership",
-                    {"worker", id});
-                return nullptr;
             }
 
             db.Table<Schema::Targets>().Key(key.first, key.second).Update(
@@ -699,10 +704,9 @@ public:
                 : record.GetApplied() ? EReporterReply::Applied : EReporterReply::Release;
             return true;
         }
-        // Start the checksum deadline at its first arrival, even if the worker
-        // roster is still being recovered. Only a complete roster can park a
-        // table; results and terminal attempts need no quorum.
-        if (!Self->CompleteWorkerSets.contains(key)) {
+        // Schema changes need the complete current roster. Checksums carry
+        // their own membership; some of those workers may not have started yet.
+        if (!schema.HasChecksum() && !Self->CompleteWorkerSets.contains(key)) {
             YDB_LOG_NOTICE_CTX(ctx, "Schema report before complete worker set is ready",
                 {"worker", id});
             return true;

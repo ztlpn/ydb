@@ -382,7 +382,7 @@ public:
         SelectedCoordinator = SelectCoordinator(msg->FindDomainInfo(), ctx);
 
         if (params.HasPublishChecksum() && params.GetPublishChecksum().GetResult()) {
-            // One producer broadcasts the terminal record to every partition.
+            // One producer routes the terminal record to one partition per feed.
             PerShardStates.erase(std::next(PerShardStates.begin()), PerShardStates.end());
         }
 

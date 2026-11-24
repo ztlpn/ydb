@@ -764,6 +764,7 @@ void TPartition::AddMetaKey(TEvKeyValue::TEvRequest* request) {
     meta.SetSubDomainOutOfSpace(SubDomainOutOfSpace);
     meta.SetEndWriteTimestamp(PendingWriteTimestamp.MilliSeconds());
     meta.SetNextMessageIdDeduplicatorWAL(MessageIdDeduplicator.NextMessageIdDeduplicatorWAL);
+    LastEmittedSchemaChange.ToProto(meta.MutableLastEmittedSchemaChange());
     if (!LastEmittedHeartbeat.IsMin()) {
         LastEmittedHeartbeat.ToProto(meta.MutableLastEmittedHeartbeat());
     }
@@ -2262,6 +2263,7 @@ void TPartition::Handle(TEvPQ::TEvGetMaxSeqNoRequest::TPtr& ev, const TActorCont
 
     auto& result = *resp.MutablePartitionResponse()->MutableCmdGetMaxSeqNoResult();
     result.SetIsPartitionActive(IsActive());
+    DurableSchemaChange.ToProto(result.MutableLastEmittedSchemaChange());
     for (const auto& sourceId : ev->Get()->SourceIds) {
         auto& protoInfo = *result.AddSourceIdInfo();
         protoInfo.SetSourceId(sourceId);

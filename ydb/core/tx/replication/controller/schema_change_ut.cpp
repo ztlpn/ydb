@@ -11,7 +11,9 @@
 #include <ydb/core/base/tablet_pipecache.h>
 #include <ydb/core/change_exchange/cdc_checksum.h>
 #include <ydb/core/change_exchange/change_exchange.h>
+#include <ydb/core/persqueue/events/global.h>
 #include <ydb/core/persqueue/events/internal.h>
+#include <ydb/core/persqueue/writer/writer.h>
 #include <ydb/core/protos/change_exchange.pb.h>
 #include <ydb/core/protos/grpc_pq_old.pb.h>
 #include <ydb/core/protos/schemeshard/operations.pb.h>
@@ -3809,7 +3811,241 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
         }
     }
 
-    Y_UNIT_TEST(PartitionMismatchReleasesWorkerWithoutComparison) {
+    void SplitChecksumTopic(TTestEnv & env, const TString& streamPath) {
+        auto split = MakeHolder<TEvTxUserProxy::TEvProposeTransaction>();
+        auto& modify = *split->Record.MutableTransaction()->MutableModifyScheme();
+        modify.SetOperationType(NKikimrSchemeOp::ESchemeOpAlterPersQueueGroup);
+        modify.SetWorkingDir(streamPath);
+        modify.SetAllowAccessToPrivatePaths(true);
+        modify.MutableAlterPersQueueGroup()->SetName("streamImpl");
+        auto& part = *modify.MutableAlterPersQueueGroup()->AddSplit();
+        part.SetPartition(0);
+        part.SetSplitBoundary(TString(1, '\x40'));
+        const auto response = env.Send<TEvTxUserProxy::TEvProposeTransactionStatus>(MakeTxProxyID(), split.Release());
+        UNIT_ASSERT_VALUES_EQUAL_C(
+            response->Get()->Record.GetStatus(), NTxProxy::TResultStatus::ExecInProgress, response->Get()->Record.DebugString());
+        env.Send<NSchemeShard::TEvSchemeShard::TEvNotifyTxCompletionResult>(
+            env.GetSchemeshardId(streamPath), new NSchemeShard::TEvSchemeShard::TEvNotifyTxCompletion(response->Get()->Record.GetTxId()));
+    }
+
+    enum class ESplitCheckpointStage {
+        Captured,
+        Delivering,
+        Published,
+        LostAcknowledgement,
+    };
+
+    void CheckPartitionSplit(ESplitCheckpointStage stage) {
+        TEnv env(true, ERuntimeMode::Simulated);
+        auto& runtime = env.GetRuntime();
+        runtime.GetAppData().FeatureFlags.SetEnableChecksumTable(true);
+        runtime.GetAppData().FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        CreateSourceTable(env, "source", 2);
+        auto client = CreateTableClient(env);
+        auto session = CreateTableSession(env, client);
+        const auto created = env.RunCall([&] {
+            return session
+                .AlterTable("/Root/source", NYdb::NTable::TAlterTableSettings().AppendAddChangefeeds(
+                                                NYdb::NTable::TChangefeedDescription(
+                                                    "feed", NYdb::NTable::EChangefeedMode::Updates, NYdb::NTable::EChangefeedFormat::Json)
+                                                    .AddAttribute("__async_replication", R"({"supports_topic_autopartitioning":true})")))
+                .GetValueSync();
+        });
+        UNIT_ASSERT_C(created.IsSuccess(), created.GetIssues().ToString());
+        const auto original = env.GetDescription("/Root/source/feed/streamImpl").GetPathDescription().GetPersQueueGroup();
+        UNIT_ASSERT_VALUES_EQUAL(original.PartitionsSize(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<int>(original.GetPQTabletConfig().GetPartitionStrategy().GetPartitionStrategyType()),
+            static_cast<int>(NKikimrPQ::TPQTabletConfig::CAN_SPLIT));
+
+        THashSet<ui64> checkpointOrders;
+        THashSet<ui64> removedOrders;
+        THashSet<ui32> resultPartitions;
+        THashMap<std::pair<TActorId, ui64>, ui32> resultWrites;
+        TVector<Ydb::StatusIds::StatusCode> statuses;
+        TMaybe<ui64> resultOrder;
+        auto writes = runtime.AddObserver<TEvPQ::TEvWrite>([&](TEvPQ::TEvWrite::TPtr& ev) {
+            for (const auto& msg : ev->Get()->Msgs) {
+                NKikimrPQClient::TDataChunk chunk;
+                NJson::TJsonValue json;
+                if (!chunk.ParseFromString(msg.Data) || !NJson::ReadJsonTree(chunk.GetData(), &json) || !NChangeExchange::IsCdcChecksum(json)) {
+                    continue;
+                }
+                if (json.Has("checksum_checkpoint")) {
+                    checkpointOrders.insert(msg.SeqNo);
+                } else {
+                    const auto& result = json["checksum_result"];
+                    Ydb::StatusIds::StatusCode status;
+                    UNIT_ASSERT(Ydb::StatusIds::StatusCode_Parse(result["status"].GetString(), &status));
+                    statuses.push_back(status);
+                    if (!msg.SchemaChangeVersion && status == Ydb::StatusIds::SUCCESS) {
+                        resultOrder = msg.SeqNo;
+                    }
+                }
+            }
+        });
+        auto removed = runtime.AddObserver<NChangeExchange::TEvChangeExchange::TEvRemoveRecords>([&](auto& ev) {
+            removedOrders.insert(ev->Get()->Records.begin(), ev->Get()->Records.end());
+        });
+        auto resultRequests = runtime.AddObserver<TEvPersQueue::TEvRequest>([&](auto& ev) {
+            const auto& request = ev->Get()->Record.GetPartitionRequest();
+            for (const auto& cmd : request.GetCmdWrite()) {
+                NKikimrPQClient::TDataChunk chunk;
+                NJson::TJsonValue json;
+                if (cmd.HasData() && chunk.ParseFromString(cmd.GetData()) && NJson::ReadJsonTree(chunk.GetData(), &json) &&
+                    json.Has("checksum_result") && json["checksum_result"]["status"].GetString() == "SUCCESS") {
+                    resultWrites[{ ev->Sender, request.GetCookie() }] = request.GetPartition();
+                }
+            }
+        });
+        auto resultAcks = runtime.AddObserver<TEvPersQueue::TEvResponse>([&](auto& ev) {
+            const auto& response = ev->Get()->Record.GetPartitionResponse();
+            const auto it = resultWrites.find(std::make_pair(ev->GetRecipientRewrite(), response.GetCookie()));
+            if (it != resultWrites.end() && response.CmdWriteResultSize()) {
+                resultPartitions.insert(it->second);
+            }
+        });
+        TEvTxUserProxy::TEvProposeTransaction::TPtr captured;
+        auto capture = runtime.AddObserver<TEvTxUserProxy::TEvProposeTransaction>([&](TEvTxUserProxy::TEvProposeTransaction::TPtr& ev) {
+            const auto& tx = ev->Get()->Record.GetTransaction().GetCreateVolatileSnapshot();
+            if (stage == ESplitCheckpointStage::Captured && tx.HasPublishChecksum() && !tx.GetPublishChecksum().GetResult()) {
+                captured = ev.Release();
+            }
+        });
+        TVector<TEvPersQueue::TEvRequest::TPtr> delayedWrites;
+        auto delay = runtime.AddObserver<TEvPersQueue::TEvRequest>([&](TEvPersQueue::TEvRequest::TPtr& ev) {
+            const auto& part = ev->Get()->Record.GetPartitionRequest();
+            if (stage == ESplitCheckpointStage::Delivering && part.GetPartition() == 0 && AnyOf(part.GetCmdWrite(), [](const auto& cmd) {
+                    return cmd.HasSchemaChange();
+                })) {
+                delayedWrites.emplace_back(ev.Release());
+            }
+        });
+        TVector<NPQ::TEvPartitionWriter::TEvWriteResponse::TPtr> lostAcks;
+        THashSet<TActorId> checkpointAcknowledgements;
+        auto loseAck = runtime.AddObserver<NPQ::TEvPartitionWriter::TEvWriteResponse>([&](auto& ev) {
+            const auto& part = ev->Get()->Record.GetPartitionResponse();
+            if (ev->Get()->IsSuccess() && AnyOf(part.GetCmdWriteResult(), [&](const auto& result) {
+                    return checkpointOrders.contains(result.GetSeqNo());
+                })) {
+                checkpointAcknowledgements.insert(ev->Recipient);
+                if (stage == ESplitCheckpointStage::LostAcknowledgement) {
+                    lostAcks.emplace_back(ev.Release());
+                }
+            }
+        });
+
+        NChecksum::TSettings settings;
+        settings.Database = "/Root";
+        settings.Path = "/Root/source";
+        settings.Deadline = runtime.GetCurrentTime() + TDuration::Hours(1);
+        const auto publisher = runtime.Register(NChecksum::PublishChecksum(env.GetSender(), std::move(settings), { "feed" }));
+        NChecksum::TEvSnapshot::TPtr snapshot;
+        auto pauseScan = runtime.AddObserver<NChecksum::TEvSnapshot>([&](NChecksum::TEvSnapshot::TPtr& ev) {
+            if (ev->Recipient == publisher) {
+                snapshot = ev.Release();
+            }
+        });
+        runtime.WaitFor("checkpoint split stage", [&] {
+            switch (stage) {
+                case ESplitCheckpointStage::Captured:
+                    return bool(captured);
+                case ESplitCheckpointStage::Delivering:
+                    return snapshot && !delayedWrites.empty() && !checkpointOrders.empty();
+                case ESplitCheckpointStage::Published:
+                    return snapshot && checkpointAcknowledgements.size() == 4;
+                case ESplitCheckpointStage::LostAcknowledgement:
+                    return snapshot && lostAcks.size() == 4;
+            }
+            return false;
+        }, TDuration::Seconds(30));
+
+        const bool published = stage == ESplitCheckpointStage::Published || stage == ESplitCheckpointStage::LostAcknowledgement;
+        auto watermark = [&](const auto& partition) {
+            auto request = MakeHolder<TEvPersQueue::TEvRequest>();
+            request->Record.MutablePartitionRequest()->SetPartition(partition.GetPartitionId());
+            request->Record.MutablePartitionRequest()->MutableCmdGetMaxSeqNo();
+            const auto response = env.Send<TEvPersQueue::TEvResponse>(partition.GetTabletId(), request.Release());
+            const auto& result = response->Get()->Record.GetPartitionResponse().GetCmdGetMaxSeqNoResult();
+            UNIT_ASSERT_C(result.HasLastEmittedSchemaChange(), response->Get()->Record.DebugString());
+            return TRowVersion::FromProto(result.GetLastEmittedSchemaChange());
+        };
+        if (published) {
+            for (const auto& partition : original.GetPartitions()) {
+                UNIT_ASSERT_VALUES_EQUAL(watermark(partition), snapshot->Get()->Snapshot);
+            }
+        }
+        SplitChecksumTopic(env, "/Root/source/feed");
+        UNIT_ASSERT_VALUES_EQUAL(
+            env.GetDescription("/Root/source/feed/streamImpl").GetPathDescription().GetPersQueueGroup().PartitionsSize(), 4);
+
+        if (stage == ESplitCheckpointStage::LostAcknowledgement) {
+            THashSet<ui64> tablets;
+            for (const auto& partition : original.GetPartitions()) {
+                if (tablets.insert(partition.GetTabletId()).second) {
+                    RebootTablet(runtime, partition.GetTabletId(), env.GetSender());
+                }
+                UNIT_ASSERT_VALUES_EQUAL(watermark(partition), snapshot->Get()->Snapshot);
+            }
+            loseAck.Remove();
+            for (const auto& ack : lostAcks) {
+                // Force retry without delivering the lost success acknowledgement.
+                runtime.Send(new IEventHandle(ack->Recipient, ack->Sender,
+                    new NPQ::TEvPartitionWriter::TEvWriteResponse(
+                        "", "", NPQ::TEvPartitionWriter::TEvWriteResponse::EErrorCode::PartitionDisconnected, "test restart", {})));
+            }
+        }
+        capture.Remove();
+        delay.Remove();
+        if (captured) {
+            runtime.Send(captured.Release());
+        }
+        for (auto& write : delayedWrites) {
+            runtime.Send(write.Release());
+        }
+        runtime.WaitFor("source snapshot enqueue", [&] {
+            return bool(snapshot);
+        }, TDuration::Seconds(30));
+        pauseScan.Remove();
+        runtime.Send(snapshot.Release());
+        const auto result = runtime.GrabEdgeEvent<NChecksum::TEvResult>(env.GetSender());
+        UNIT_ASSERT_VALUES_EQUAL_C(result->Get()->Status, Ydb::StatusIds::SUCCESS, result->Get()->Issues.ToString());
+        runtime.WaitFor("terminal result delivered after split", [&] {
+            return resultOrder && removedOrders.contains(*resultOrder);
+        }, TDuration::Seconds(30));
+        UNIT_ASSERT_VALUES_EQUAL(resultPartitions.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(Find(statuses, Ydb::StatusIds::PRECONDITION_FAILED) == statuses.end(), published);
+
+        // A later attempt captures the children and completes normally.
+        statuses.clear();
+        resultPartitions.clear();
+        resultWrites.clear();
+        resultOrder.Clear();
+        env.RunCall([&] {
+            return Publish(session, "/Root/source", "feed", 0);
+        });
+        runtime.WaitFor("next checksum result", [&] {
+            return resultOrder && removedOrders.contains(*resultOrder);
+        }, TDuration::Seconds(30));
+        UNIT_ASSERT_VALUES_EQUAL(resultPartitions.size(), 1);
+        UNIT_ASSERT(AllOf(statuses, [](auto status) {
+            return status == Ydb::StatusIds::SUCCESS;
+        }));
+    }
+
+    Y_UNIT_TEST(SplitAfterMembershipCapture) {
+        CheckPartitionSplit(ESplitCheckpointStage::Captured);
+    }
+    Y_UNIT_TEST(SplitDuringCheckpointDelivery) {
+        CheckPartitionSplit(ESplitCheckpointStage::Delivering);
+    }
+    Y_UNIT_TEST(SplitAfterCheckpointPublication) {
+        CheckPartitionSplit(ESplitCheckpointStage::Published);
+    }
+    Y_UNIT_TEST(SplitAfterLostCheckpointAcknowledgement) {
+        CheckPartitionSplit(ESplitCheckpointStage::LostAcknowledgement);
+    }
+
+    Y_UNIT_TEST(CheckpointWaitsForFutureWorkers) {
         TFeatureFlags flags;
         flags.FeatureFlags.SetEnableChecksumTable(true);
         flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
@@ -3822,12 +4058,63 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
         control.MutableChecksum()->AddExpectedPartitions(worker.WorkerId());
         control.MutableChecksum()->AddExpectedPartitions(worker.WorkerId() + 1);
         env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, control));
+        const auto pending = DescribeReplication(env, info);
+        UNIT_ASSERT_VALUES_EQUAL(pending->Get()->Record.GetTargets(0).GetChecksumStatus().status(), Ydb::StatusIds::STATUS_CODE_UNSPECIFIED);
+        // A missing worker is not a failed comparison. A terminal source failure
+        // must still release the worker that has already reached the checkpoint.
+        auto failure = control;
+        failure.MutableChecksum()->SetResult(true);
+        failure.MutableChecksum()->SetStatus(Ydb::StatusIds::PRECONDITION_FAILED);
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, failure));
         env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
         CompleteSchemaChange(env, info.ControllerId, worker, control);
         const auto described = DescribeReplication(env, info);
         const auto& result = described->Get()->Record.GetTargets(0).GetChecksumStatus();
         UNIT_ASSERT_VALUES_EQUAL(result.status(), Ydb::StatusIds::PRECONDITION_FAILED);
         UNIT_ASSERT(!result.has_last_result());
+    }
+
+    Y_UNIT_TEST(CheckpointCompletesWhenFutureWorkerRegisters) {
+        TFeatureFlags flags;
+        flags.FeatureFlags.SetEnableChecksumTable(true);
+        flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
+        TEnv env(flags);
+        const auto info = StartReplication(env);
+        const auto run = env.GetRuntime().GrabEdgeEvent<TEvService::TEvRunWorker>(env.GetSender());
+        const auto first = TWorkerId::Parse(run->Get()->Record.GetWorker());
+        AttachWorkers(env, info.ControllerId, { first });
+        auto checkpoint = Checkpoint();
+        checkpoint.MutableChecksum()->AddExpectedPartitions(first.WorkerId());
+        checkpoint.MutableChecksum()->AddExpectedPartitions(first.WorkerId() + 1);
+        auto result = checkpoint;
+        result.MutableChecksum()->SetResult(true);
+        result.MutableChecksum()->SetStatus(Ydb::StatusIds::SUCCESS);
+        result.MutableChecksum()->MutableChecksum()->set_row_count(0);
+        result.MutableChecksum()->MutableChecksum()->set_hash("0000000000000000");
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(first, checkpoint));
+        const auto pending = DescribeReplication(env, info);
+        UNIT_ASSERT_VALUES_EQUAL(pending->Get()->Record.GetTargets(0).GetChecksumStatus().status(), Ydb::StatusIds::STATUS_CODE_UNSPECIFIED);
+
+        const auto second = RegisterSecondWorkerAndCompleteSet(env, info.ControllerId, first);
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(second, checkpoint));
+        for (const auto& worker : { first, second }) {
+            env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+            CompleteSchemaChange(env, info.ControllerId, worker, checkpoint);
+        }
+        env.SendAsync(info.ControllerId, MakeSchemaChangeReport(second, result));
+        env.GetRuntime().GrabEdgeEvent<TEvService::TEvSchemaChangeResult>(env.GetSender());
+        CompleteSchemaChange(env, info.ControllerId, second, result);
+        UNIT_ASSERT(WaitFor([&] {
+            const auto description = DescribeReplication(env, info);
+            const auto& status = description->Get()->Record.GetTargets(0).GetChecksumStatus();
+            if (!status.has_last_result()) {
+                UNIT_ASSERT_VALUES_EQUAL(status.status(), Ydb::StatusIds::STATUS_CODE_UNSPECIFIED);
+                return false;
+            }
+            UNIT_ASSERT_VALUES_EQUAL(status.status(), Ydb::StatusIds::SUCCESS);
+            UNIT_ASSERT(status.last_result().matches());
+            return true;
+        }));
     }
 
     Y_UNIT_TEST(DisabledControlsAdvanceWithoutAlteringSchema) {
@@ -3860,7 +4147,7 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
         const auto info = StartReplication(env);
         const auto run = env.GetRuntime().GrabEdgeEvent<TEvService::TEvRunWorker>(env.GetSender());
         const auto worker = TWorkerId::Parse(run->Get()->Record.GetWorker());
-        AttachWorkers(env, info.ControllerId, {worker});
+        RegisterSecondWorkerAndCompleteSet(env, info.ControllerId, worker);
         auto control = Checkpoint();
         control.MutableChecksum()->AddExpectedPartitions(worker.WorkerId());
         env.SendAsync(info.ControllerId, MakeSchemaChangeReport(worker, control));
@@ -3927,11 +4214,12 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
         UNIT_ASSERT_VALUES_EQUAL(result->Get()->Status, Ydb::StatusIds::SCHEME_ERROR);
     }
 
-    void CheckCdcPublicationWithData(bool global) {
+    void CheckCdcPublicationWithData(bool global, bool autoPartition = false) {
         TFeatureFlags flags;
         flags.FeatureFlags.SetEnableChecksumTable(true);
         flags.FeatureFlags.SetEnableAsyncReplicationChecksumCheck(true);
-        flags.FeatureFlags.SetEnableTopicAutopartitioningForReplication(false);
+        flags.FeatureFlags.SetEnableTopicAutopartitioningForReplication(autoPartition);
+        flags.FeatureFlags.SetEnableAsyncReplicationSchemaChanges(false);
         TEnv env(flags);
         const auto info =
             StartReplication(env, 2, "root@builtin", global, false, NKikimrSchemeOp::EIndexTypeGlobal, false, true, {}, 2, TDuration::Hours(1));
@@ -3958,6 +4246,10 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
             }
             return true;
         }, 600), "Replication destinations and initial scans were not ready");
+
+        const auto topic = env.GetDescription("/Root/table1/" + feed + "/streamImpl").GetPathDescription().GetPersQueueGroup();
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<int>(topic.GetPQTabletConfig().GetPartitionStrategy().GetPartitionStrategyType()),
+            static_cast<int>(autoPartition ? NKikimrPQ::TPQTabletConfig::CAN_SPLIT : NKikimrPQ::TPQTabletConfig::DISABLED));
 
         const auto write = [&](ui32 key, const char* value) {
             // Touch both source shards and both tables in one transaction.
@@ -4024,11 +4316,18 @@ Y_UNIT_TEST_SUITE(ChecksumBarrier) {
                 UNIT_ASSERT_C(read.IsSuccess(), read.GetIssues().ToString());
                 UNIT_ASSERT_VALUES_EQUAL(read.GetResultSet(0).RowsCount(), read.GetResultSet(1).RowsCount());
             }
+            if (autoPartition && round == 1) {
+                SplitChecksumTopic(env, "/Root/table1/" + feed);
+            }
         }
     }
 
     Y_UNIT_TEST(RowCdcPublicationWithData) {
         CheckCdcPublicationWithData(false);
+    }
+
+    Y_UNIT_TEST(RowAutoPartitionedCdcPublicationWithData) {
+        CheckCdcPublicationWithData(false, true);
     }
 
     Y_UNIT_TEST(GlobalSkipsPublishedChecksumsWithData) {

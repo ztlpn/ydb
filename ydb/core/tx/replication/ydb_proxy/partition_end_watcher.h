@@ -31,9 +31,9 @@ public:
     inline void UpdatePendingCommittedOffset(const NYdb::NTopic::TReadSessionEvent::TDataReceivedEvent& event) {
         if (event.GetMessagesCount()) {
             if (event.HasCompressedMessages()) {
-                PendingCommittedOffset = event.GetCompressedMessages().back().GetOffset();
+                PendingCommittedOffset = event.GetCompressedMessages().back().GetOffset() + 1;
             } else {
-                PendingCommittedOffset = event.GetMessages().back().GetOffset();
+                PendingCommittedOffset = event.GetMessages().back().GetOffset() + 1;
             }
         }
     }
@@ -51,6 +51,7 @@ public:
 
 private:
     IActorOps* const ActorOps;
+    // Exclusive offsets, as in session-start and commit notifications.
     ui64 PendingCommittedOffset = 0;
     ui64 CommittedOffset = 0;
     TMaybe<TReadSessionEvent::TEndPartitionSessionEvent> EndPartitionSessionEvent;

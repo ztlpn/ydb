@@ -53,16 +53,6 @@ void TController::UpdateChecksumStatus(const TKey& key, TInstant now) {
         if (attempt.HasFinishedAtUs()) {
             continue;
         }
-        const auto& partitions = attempt.GetCheckpoint().GetExpectedPartitions();
-        if (!global && CompleteWorkerSets.contains(key)) {
-            if (auto* target = FindTarget(TWorkerId(key.first, key.second, 0))) {
-                auto workers = target->GetWorkers();
-                Sort(workers);
-                if (!std::equal(partitions.begin(), partitions.end(), workers.begin(), workers.end())) {
-                    Fail(attempt, Ydb::StatusIds::PRECONDITION_FAILED, "Changefeed partition membership changed");
-                }
-            }
-        }
         const auto& source = attempt.GetSourceResult();
         if (global) {
             Fail(attempt, Ydb::StatusIds::UNSUPPORTED, "Destination checksum comparisons are unsupported for GLOBAL replication");
@@ -74,7 +64,7 @@ void TController::UpdateChecksumStatus(const TKey& key, TInstant now) {
         }
         const auto localStatus = attempt.GetLocalStatus();
         const bool failed = localStatus != Ydb::StatusIds::STATUS_CODE_UNSPECIFIED && localStatus != Ydb::StatusIds::SUCCESS;
-        const bool completed = localStatus == Ydb::StatusIds::SUCCESS && attempt.HasSourceResult() && CompleteWorkerSets.contains(key);
+        const bool completed = localStatus == Ydb::StatusIds::SUCCESS && attempt.HasSourceResult();
         if (failed || completed) {
             attempt.SetFinishedAtUs(now.MicroSeconds());
             if (failed) {

@@ -218,7 +218,7 @@ class TTopicReader: public TBaseProxyActor<TTopicReader> {
         Y_UNUSED(consumerName);
         Y_UNUSED(settings);
 
-        PartitionEndWatcher.SetCommittedOffset(offset - 1, Client);
+        PartitionEndWatcher.SetCommittedOffset(offset, Client);
     }
 
     void WaitEvent() {
@@ -301,7 +301,7 @@ class TTopicReader: public TBaseProxyActor<TTopicReader> {
             ReadRequest.reset();
             return (void)Send(sender, response.Release(), 0, cookie);
         } else if (auto* x = std::get_if<TReadSessionEvent::TCommitOffsetAcknowledgementEvent>(&*event)) {
-            PartitionEndWatcher.SetCommittedOffset(x->GetCommittedOffset() - 1, Client);
+            PartitionEndWatcher.SetCommittedOffset(x->GetCommittedOffset(), Client);
             return ContinueWaiting();
         } else if (auto* x = std::get_if<TReadSessionEvent::TPartitionSessionStatusEvent>(&*event)) {
             if (StatusRequestPending && PartitionSession == x->GetPartitionSession()) {

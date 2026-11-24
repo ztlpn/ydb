@@ -5,9 +5,12 @@
 #include "change_record_cdc_serializer.h"
 #include "datashard_user_table.h"
 
+#include <ydb/core/base/tablet_pipe.h>
 #include <ydb/core/change_exchange/change_sender.h>
 #include <ydb/core/change_exchange/change_sender_monitoring.h>
 #include <ydb/core/change_exchange/util.h>
+#include <ydb/core/persqueue/events/global.h>
+#include <ydb/core/persqueue/writer/common.h>
 #include <ydb/core/persqueue/writer/source_id_encoding.h>
 #include <ydb/core/persqueue/writer/writer.h>
 #include <ydb/core/protos/change_exchange.pb.h>
@@ -46,6 +49,99 @@ static THolder<IChangeRecordSerializer> CreateCdcStreamSerializer(const TUserTab
         .CompressionLevel = stream.CompressionLevel,
     }));
 }
+
+// Layout refresh can race with an already emitted checkpoint and its lost ACK.
+// Inspect the original partitions (including inactive parents), never child state.
+struct TEvCheckpointPublished: TEventLocal<TEvCheckpointPublished, EventSpaceBegin(TEvents::ES_PRIVATE) + 512> {
+    TMaybe<bool> Published;
+
+    explicit TEvCheckpointPublished(TMaybe<bool> published)
+        : Published(published)
+    {
+    }
+};
+
+class TCheckpointPublicationChecker: public TActorBootstrapped<TCheckpointPublicationChecker> {
+    const TActorId Parent;
+    const TRowVersion Version;
+    const TVector<std::pair<ui32, ui64>> Partitions;
+    TVector<TActorId> Pipes;
+    THashSet<ui64> Pending;
+
+    void Finish(TMaybe<bool> published) {
+        Send(Parent, new TEvCheckpointPublished(published));
+        PassAway();
+    }
+
+    void PassAway() override {
+        for (const auto& pipe : Pipes) {
+            NTabletPipe::CloseClient(SelfId(), pipe);
+        }
+        TActorBootstrapped::PassAway();
+    }
+
+    void Handle(TEvPersQueue::TEvResponse::TPtr& ev) {
+        const auto& response = ev->Get()->Record;
+        TString error;
+        if (!BasicCheck(response, error) || !response.GetPartitionResponse().HasCmdGetMaxSeqNoResult()) {
+            return Finish(Nothing());
+        }
+        if (!Pending.erase(response.GetPartitionResponse().GetCookie())) {
+            return;
+        }
+        const auto& result = response.GetPartitionResponse().GetCmdGetMaxSeqNoResult();
+        if (!result.HasLastEmittedSchemaChange()) {
+            return Finish(Nothing());
+        }
+        if (TRowVersion::FromProto(result.GetLastEmittedSchemaChange()) < Version) {
+            return Finish(false);
+        }
+        if (Pending.empty()) {
+            Finish(true);
+        }
+    }
+
+public:
+    TCheckpointPublicationChecker(TActorId parent, TRowVersion version, TVector<std::pair<ui32, ui64>> partitions)
+        : Parent(parent)
+        , Version(version)
+        , Partitions(std::move(partitions))
+    {
+    }
+
+    void Bootstrap() {
+        Become(&TThis::StateWork);
+        for (const auto& [partition, tablet] : Partitions) {
+            if (!tablet) {
+                return Finish(false);
+            }
+            NTabletPipe::TClientConfig config;
+            config.RetryPolicy = NTabletPipe::TClientRetryPolicy::WithRetries();
+            const auto pipe = Register(NTabletPipe::CreateClient(SelfId(), tablet, config));
+            Pipes.push_back(pipe);
+            auto request = MakeHolder<TEvPersQueue::TEvRequest>();
+            auto& params = *request->Record.MutablePartitionRequest();
+            params.SetPartition(partition);
+            params.SetCookie(ui64(partition) + 1);
+            params.MutableCmdGetMaxSeqNo();
+            Pending.insert(ui64(partition) + 1);
+            NTabletPipe::SendData(SelfId(), pipe, request.Release());
+        }
+        Schedule(TDuration::Seconds(10), new TEvents::TEvWakeup());
+    }
+
+    STATEFN(StateWork) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvPersQueue::TEvResponse, Handle);
+            cFunc(TEvents::TEvWakeup::EventType, Timeout);
+            cFunc(TEvents::TEvPoison::EventType, PassAway);
+        }
+    }
+
+    void Timeout() {
+        Finish(Nothing());
+    }
+};
 
 class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderPartition> {
 
@@ -113,6 +209,7 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
         switch (ev->GetTypeRewrite()) {
             hFunc(NChangeExchange::TEvChangeExchange::TEvRecords, Handle);
             hFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, Handle);
+            hFunc(TEvCheckpointPublished, Handle);
             sFunc(TEvPartitionWriter::TEvWriteResponse, Lost);
         default:
             return StateBase(ev);
@@ -153,17 +250,60 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
             }
         }
         Sort(active);
-        const bool fixed = desc.GetPQTabletConfig().GetPartitionStrategy().GetPartitionStrategyType() == NKikimrPQ::TPQTabletConfig::DISABLED;
-        WriteRecords(std::exchange(PendingLayoutRecords, {}), active, fixed);
+        ActivePartitions = std::move(active);
+        PublishedCheckpointOrder.Clear();
+        for (const auto& record : PendingLayoutRecords) {
+            if (record->GetKind() != TChangeRecord::EKind::CdcChecksumCheckpoint) {
+                continue;
+            }
+            NKikimrChangeExchange::TCdcChecksum control;
+            Y_ENSURE(control.ParseFromString(record->GetBody()));
+            if (control.StreamsSize() != 1 || TPathId::FromProto(control.GetStreams(0).GetTopicId()) != TopicId) {
+                continue;
+            }
+            const auto& frozen = control.GetExpectedPartitions();
+            if (!std::equal(ActivePartitions.begin(), ActivePartitions.end(), frozen.begin(), frozen.end())) {
+                TVector<std::pair<ui32, ui64>> partitions;
+                for (ui32 id : frozen) {
+                    ui64 tablet = 0;
+                    for (const auto& partition : desc.GetPartitions()) {
+                        if (partition.GetPartitionId() == id) {
+                            tablet = partition.GetTabletId();
+                            break;
+                        }
+                    }
+                    partitions.emplace_back(id, tablet);
+                }
+                CheckingCheckpointOrder = record->GetOrder();
+                PublicationChecker = Register(new TCheckpointPublicationChecker(
+                    SelfId(), TRowVersion(control.GetSnapshotStep(), control.GetSnapshotTxId()), std::move(partitions)));
+                return;
+            }
+        }
+        WriteRecords(std::exchange(PendingLayoutRecords, {}), ActivePartitions);
     }
 
-    void WriteRecords(const TVector<NChangeExchange::IChangeRecord::TPtr>& records, const TVector<ui32>& active = {}, bool fixed = true) {
+    void Handle(TEvCheckpointPublished::TPtr& ev) {
+        if (ev->Sender != PublicationChecker) {
+            return;
+        }
+        PublicationChecker = {};
+        if (!ev->Get()->Published) {
+            return Leave();   // Unavailable is not evidence of a layout failure.
+        }
+        if (*ev->Get()->Published) {
+            PublishedCheckpointOrder = CheckingCheckpointOrder;
+        }
+        WriteRecords(std::exchange(PendingLayoutRecords, {}), ActivePartitions);
+    }
+
+    void WriteRecords(const TVector<NChangeExchange::IChangeRecord::TPtr>& records, const TVector<ui32>& active = {}) {
         NKikimrClient::TPersQueueRequest request;
         for (const auto& recordPtr : records) {
             const auto& record = *recordPtr;
             const auto seqNo = static_cast<i64>(record.GetOrder());
 
-            if (seqNo <= MaxSeqNo) {
+            if (seqNo <= MaxSeqNo || (PublishedCheckpointOrder && record.GetOrder() == *PublishedCheckpointOrder)) {
                 continue;
             }
 
@@ -176,8 +316,9 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
                 NKikimrChangeExchange::TCdcChecksum control;
                 Y_ENSURE(control.ParseFromString(record.GetBody()));
                 const auto& frozen = control.GetExpectedPartitions();
-                if (!fixed || !std::equal(active.begin(), active.end(), frozen.begin(), frozen.end()) ||
-                        control.StreamsSize() != 1 || TPathId::FromProto(control.GetStreams(0).GetTopicId()) != TopicId) {
+                if (control.StreamsSize() != 1 || TPathId::FromProto(control.GetStreams(0).GetTopicId()) != TopicId ||
+                    (record.GetKind() == EKind::CdcChecksumCheckpoint &&
+                        !std::equal(active.begin(), active.end(), frozen.begin(), frozen.end()))) {
                     control.SetResult(true);
                     control.ClearChecksum();
                     control.SetStatus(Ydb::StatusIds::PRECONDITION_FAILED);
@@ -341,6 +482,9 @@ class TCdcChangeSenderPartition: public TActorBootstrapped<TCdcChangeSenderParti
 
     void PassAway() override {
         CloseWriter();
+        if (PublicationChecker) {
+            Send(PublicationChecker, new TEvents::TEvPoison());
+        }
         TActorBootstrapped::PassAway();
     }
 
@@ -387,6 +531,10 @@ private:
     const TString SourceId;
     THolder<IChangeRecordSerializer> Serializer;
 
+    TActorId PublicationChecker;
+    TVector<ui32> ActivePartitions;
+    ui64 CheckingCheckpointOrder = 0;
+    TMaybe<ui64> PublishedCheckpointOrder;
     TActorId Writer;
     i64 MaxSeqNo = 0;
     TVector<i64> Pending;

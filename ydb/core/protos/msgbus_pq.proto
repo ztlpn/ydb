@@ -1,3 +1,4 @@
+import "ydb/core/protos/base.proto";
 import "ydb/core/protos/pqconfig.proto";
 import "ydb/core/protos/pqdata_transaction.proto";
 import "ydb/public/api/protos/annotations/sensitive.proto";
@@ -508,6 +509,8 @@ message TPersQueuePartitionResponse {
         }
         repeated TSourceIdInfo SourceIdInfo = 2;
         optional bool IsPartitionActive = 3;
+        // Durable barrier emission, including on inactive parent partitions.
+        optional NKikimrProto.TRowVersion LastEmittedSchemaChange = 4;
     }
 
     message TCmdGetClientOffsetResult {

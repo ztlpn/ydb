@@ -574,6 +574,7 @@ void TPartition::SyncMemoryStateWithKVState(const TActorContext& ctx) {
 void TPartition::OnHandleWriteResponse(const TActorContext& ctx)
 {
     KVWriteInProgress = false;
+    DurableSchemaChange = LastEmittedSchemaChange;
 
     FlushStaleTxMetaDone(ctx);
 

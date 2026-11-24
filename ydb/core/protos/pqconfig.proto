@@ -35,6 +35,7 @@ message TPartitionMeta {
     optional uint64 FirstUncompactedOffset = 6; //deprecated
     optional uint64 NextMessageIdDeduplicatorWAL = 7 [default = 1];
     optional NKikimrProto.TRowVersion LastEmittedHeartbeat = 9;
+    optional NKikimrProto.TRowVersion LastEmittedSchemaChange = 10;
 }
 
 message TPartitionTxMeta {

@@ -1213,6 +1213,7 @@ private:
 
     TRowVersion LastEmittedHeartbeat;
     TRowVersion LastEmittedSchemaChange;
+    TRowVersion DurableSchemaChange = TRowVersion::Min();
     TMessageQueue PendingSchemaChangeResponses;
 
     const NKikimrPQ::TPQTabletConfig::TPartition* GetPartitionConfig(const NKikimrPQ::TPQTabletConfig& config);

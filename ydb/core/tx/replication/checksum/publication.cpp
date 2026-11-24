@@ -102,11 +102,6 @@ class TPublication: public TActorBootstrapped<TPublication> {
                     return Fail(Ydb::StatusIds::PRECONDITION_FAILED, "Selected changefeed topic disappeared");
                 }
                 const auto& desc = entry.PQGroupInfo->Description;
-                const auto& config = desc.GetPQTabletConfig();
-                if (config.HasPartitionStrategy() &&
-                    config.GetPartitionStrategy().GetPartitionStrategyType() != NKikimrPQ::TPQTabletConfig::DISABLED) {
-                    return Fail(Ydb::StatusIds::PRECONDITION_FAILED, "Checksum publication requires fixed topic partitions");
-                }
                 TVector<ui32> ids;
                 for (const auto& partition : desc.GetPartitions()) {
                     if (partition.GetStatus() == NKikimrPQ::ETopicPartitionStatus::Active) {
@@ -114,13 +109,13 @@ class TPublication: public TActorBootstrapped<TPublication> {
                     }
                 }
                 Sort(ids);
-                if (ids.empty() || (Control.GetResult() && (TPathId::FromProto(stream.GetTopicId()) != entry.TableId.PathId ||
-                                                               !std::equal(ids.begin(), ids.end(), stream.GetPartitionIds().begin(),
-                                                                   stream.GetPartitionIds().end())))) {
-                    return Fail(Ydb::StatusIds::PRECONDITION_FAILED, "Selected changefeed partition layout changed");
+                if (ids.empty() || (Control.GetResult() && TPathId::FromProto(stream.GetTopicId()) != entry.TableId.PathId)) {
+                    return Fail(Ydb::StatusIds::PRECONDITION_FAILED, "Selected changefeed topic changed");
                 }
-                entry.TableId.PathId.ToProto(stream.MutableTopicId());
-                stream.MutablePartitionIds()->Assign(ids.begin(), ids.end());
+                if (!Control.GetResult()) {
+                    entry.TableId.PathId.ToProto(stream.MutableTopicId());
+                    stream.MutablePartitionIds()->Assign(ids.begin(), ids.end());
+                }
             }
             return Propose();
         }
